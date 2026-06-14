@@ -1,0 +1,9 @@
+target/
+**/target/
+.git/
+*.log
+.env
+client-config.json
+agent.json
+client_identity.json
+keys/

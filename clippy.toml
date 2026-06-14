@@ -1,0 +1,29 @@
+# Clippy configuration for RivetLink
+
+# Cognitive complexity threshold — flag overly complex functions
+cognitive-complexity-threshold = 25
+
+# Max function lines before lint
+too-many-lines-threshold = 100
+
+# Max arguments before lint
+too-many-arguments-threshold = 6
+
+# Max struct fields before lint
+max-struct-bools = 3
+
+# Tests can use unwrap/expect/panic — production code cannot
+allow-unwrap-in-tests = true
+allow-expect-in-tests = true
+allow-panic-in-tests = true
+allow-dbg-in-tests = true
+
+# Disallow certain types in public APIs
+disallowed-types = [
+    { path = "std::collections::HashMap", reason = "Use IndexMap or specify hasher for deterministic behavior" },
+]
+
+# Disallow certain methods
+disallowed-methods = [
+    { path = "std::env::var", reason = "Use typed config struct instead of reading env vars directly" },
+]

@@ -1,0 +1,67 @@
+//! Command-line interface for the host agent.
+
+use clap::{Parser, Subcommand};
+use std::path::PathBuf;
+
+/// RivetLink Host Agent — runs on the controlled machine.
+#[derive(Debug, Parser)]
+#[command(name = "rivet-agent", version, about)]
+pub struct Cli {
+    /// Path to the agent's configuration file.
+    #[arg(long, default_value = "config.json")]
+    pub config: PathBuf,
+
+    #[command(subcommand)]
+    pub command: Option<Command>,
+}
+
+/// Supported subcommands.
+#[derive(Debug, Subcommand)]
+pub enum Command {
+    /// Generate or refresh the keystore and write a starter config file.
+    Init {
+        /// Relay server WebSocket URL.
+        #[arg(long, default_value = "ws://127.0.0.1:8080/ws")]
+        relay_url: String,
+
+        /// Relay server HTTP base URL for REST calls (register etc.).
+        #[arg(long, default_value = "http://127.0.0.1:8080")]
+        relay_http_url: String,
+
+        /// Device display name reported to the relay.
+        #[arg(long)]
+        device_name: String,
+
+        /// Keystore directory.
+        #[arg(long, default_value = "keys")]
+        keystore_path: PathBuf,
+    },
+
+    /// Enroll this agent as a device on the relay.
+    ///
+    /// Performs a one-shot REST call against `/devices/register` using the
+    /// supplied user JWT. The returned `device_id` is persisted into the
+    /// agent's config file so that subsequent `run` invocations can
+    /// authenticate via DEVICE_HELLO / DEVICE_AUTH.
+    Register {
+        /// User access token used to authorize the registration request.
+        #[arg(long)]
+        token: String,
+
+        /// Optional platform string (`linux`, `macos`, `windows`).
+        #[arg(long)]
+        platform: Option<String>,
+    },
+
+    /// Connect to the relay and run until disconnected (device auth).
+    ///
+    /// The agent must have been registered first — `device_id` is read
+    /// from the config file and the agent's stored Ed25519 key signs the
+    /// challenge.
+    Run {
+        /// Auto-accept (and trust) any client without prompting. Unattended /
+        /// testing only — bypasses the operator consent prompt.
+        #[arg(long)]
+        auto_accept: bool,
+    },
+}

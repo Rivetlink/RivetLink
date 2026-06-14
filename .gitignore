@@ -1,0 +1,46 @@
+# Rust
+/target
+**/*.rs.bk
+# Cargo.lock IS committed — this is a binary/app workspace (reproducible builds + CI cache).
+
+# IDE
+.idea/
+.vscode/
+*.swp
+*.swo
+
+# Environment
+.env
+.env.local
+
+# Runtime identity & key material — NEVER commit (private ed25519/x25519 keys live here)
+agent.json
+client_identity.json
+client-config.json
+keys/
+trusted_clients.json
+*.identity.json
+
+# OS
+.DS_Store
+Thumbs.db
+
+# Node (JS SDK)
+sdk/js/node_modules/
+sdk/js/dist/
+
+# Database
+*.db
+sqlx-data.json
+
+# Coverage reports
+lcov.info
+tarpaulin-report.html
+target/llvm-cov/
+
+# Docker volumes
+docker/postgres_data/
+docker/redis_data/
+
+# Logs
+*.log

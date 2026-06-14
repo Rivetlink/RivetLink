@@ -1,0 +1,31 @@
+[package]
+name = "rivetlink-crypto"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[features]
+default = ["post-quantum"]
+post-quantum = ["dep:ml-kem", "dep:ml-dsa"]
+
+[dependencies]
+rivetlink-core = { workspace = true }
+ed25519-dalek = { workspace = true }
+x25519-dalek = { workspace = true }
+chacha20poly1305 = { workspace = true }
+rand_08 = { workspace = true }
+rand = { workspace = true }
+zeroize = { workspace = true }
+thiserror = { workspace = true }
+serde = { workspace = true }
+dashmap = { workspace = true }
+# Always needed for HKDF key derivation (SealedChannel) + hashing.
+hkdf = { workspace = true }
+sha2 = { workspace = true }
+
+# Post-quantum (optional)
+ml-kem = { workspace = true, optional = true }
+ml-dsa = { workspace = true, optional = true }
+
+[lints]
+workspace = true

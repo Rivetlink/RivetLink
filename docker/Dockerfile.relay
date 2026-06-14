@@ -1,0 +1,32 @@
+# Multi-stage build for the RivetLink relay server.
+#
+# Stage 1 compiles the workspace; stage 2 ships a slim runtime image with just
+# the `rivet-relay` binary and the migrations it applies on startup.
+
+FROM rust:1-bookworm AS builder
+WORKDIR /build
+
+# Copy the whole workspace (a .dockerignore keeps target/ out).
+COPY . .
+# Cap parallelism so constrained build hosts don't exhaust memory.
+ARG CARGO_BUILD_JOBS=4
+RUN cargo build --release --bin rivet-relay
+
+FROM debian:bookworm-slim AS runtime
+RUN apt-get update \
+    && apt-get install -y --no-install-recommends ca-certificates libssl3 \
+    && rm -rf /var/lib/apt/lists/*
+
+WORKDIR /app
+COPY --from=builder /build/target/release/rivet-relay /usr/local/bin/rivet-relay
+# Migrations are embedded via sqlx::migrate! at compile time, but keep a copy
+# for reference / manual inspection.
+COPY --from=builder /build/migrations /app/migrations
+
+# Defaults; override via compose `environment:` or `-e`.
+ENV BIND_ADDR=0.0.0.0:8080
+ENV RUST_LOG=info
+
+EXPOSE 8080
+ENTRYPOINT ["rivet-relay"]
+CMD ["serve"]

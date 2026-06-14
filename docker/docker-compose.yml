@@ -1,0 +1,57 @@
+version: "3.9"
+
+services:
+  postgres:
+    image: postgres:16
+    container_name: rivet-postgres
+    restart: "no"
+    environment:
+      POSTGRES_USER: rivet
+      POSTGRES_PASSWORD: rivet_dev
+      POSTGRES_DB: rivet
+    ports:
+      - "5432:5432"
+    volumes:
+      - postgres_data:/var/lib/postgresql/data
+
+  redis:
+    image: redis:7-alpine
+    container_name: rivet-redis
+    restart: "no"
+    ports:
+      - "6379:6379"
+
+  # The relay/signaling server. Build with the `relay` profile so the default
+  # `docker compose up -d postgres redis` (used in dev/tests) stays lightweight:
+  #   docker compose --profile relay up -d --build
+  relay:
+    build:
+      context: ..
+      dockerfile: docker/Dockerfile.relay
+    container_name: rivet-relay
+    profiles: ["relay"]
+    restart: unless-stopped
+    depends_on:
+      - postgres
+      - redis
+    environment:
+      DATABASE_URL: postgres://rivet:rivet_dev@postgres/rivet
+      REDIS_URL: redis://redis:6379
+      # CHANGE THIS for any non-local deployment. Generate with:
+      #   rivet-relay init   (prints a random 32-byte base64 secret into .env)
+      JWT_SECRET: ${JWT_SECRET:-change-this-to-a-random-32-character-secret}
+      BIND_ADDR: 0.0.0.0:8080
+      RUST_LOG: info
+    ports:
+      - "8080:8080"
+
+  coturn:
+    image: coturn/coturn:latest
+    container_name: rivet-coturn
+    restart: unless-stopped
+    network_mode: host
+    volumes:
+      - ./coturn/turnserver.conf:/etc/coturn/turnserver.conf:ro
+
+volumes:
+  postgres_data:
