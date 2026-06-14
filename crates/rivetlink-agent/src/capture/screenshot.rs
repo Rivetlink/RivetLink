@@ -21,14 +21,23 @@ pub async fn capture_png() -> AgentResult<Vec<u8>> {
         return Ok(synthetic_blob(size));
     }
 
-    // Native desktop-portal capture first (Wayland + X11, no external tools).
-    // Fall back to CLI tools only if the portal is unavailable.
+    // Native capture, no external tools:
+    //  1. ScreenCast portal + PipeWire — one user-picked screen (preferred).
+    //  2. Screenshot portal — whole desktop (fallback).
+    //  3. CLI tools — last resort (headless X11 / minimal wlroots).
     #[cfg(target_os = "linux")]
     {
+        match tokio::task::spawn_blocking(super::screencast::capture_png_blocking).await {
+            Ok(Ok(bytes)) => return Ok(bytes),
+            Ok(Err(e)) => {
+                tracing::debug!(error = %e, "screencast capture failed, trying portal screenshot");
+            },
+            Err(e) => tracing::debug!(error = %e, "screencast task join failed"),
+        }
         match super::portal::capture_png().await {
             Ok(bytes) => return Ok(bytes),
             Err(e) => {
-                tracing::debug!(error = %e, "desktop portal capture unavailable, trying CLI tools");
+                tracing::debug!(error = %e, "portal screenshot unavailable, trying CLI tools");
             },
         }
     }

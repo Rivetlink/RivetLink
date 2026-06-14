@@ -15,6 +15,10 @@ pub mod screenshot;
 #[cfg(target_os = "linux")]
 pub mod portal;
 
+// Native single-screen capture (ScreenCast portal + PipeWire), Linux only.
+#[cfg(target_os = "linux")]
+pub mod screencast;
+
 /// A single captured frame as raw, owned pixel data plus its dimensions.
 #[derive(Debug, Clone)]
 pub struct CapturedFrame {
