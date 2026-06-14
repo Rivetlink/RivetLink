@@ -11,10 +11,10 @@ use rand_08::RngCore;
 use serde::{Deserialize, Serialize};
 use std::path::{Path, PathBuf};
 
-use crate::error::{ClientError, ClientResult};
+use crate::error::{SdkError, SdkResult};
 
 /// A loaded client identity.
-pub struct ClientIdentity {
+pub struct Identity {
     signing_key: SigningKey,
 }
 
@@ -23,26 +23,26 @@ struct StoredIdentity {
     secret_b64: String,
 }
 
-impl std::fmt::Debug for ClientIdentity {
+impl std::fmt::Debug for Identity {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        f.debug_struct("ClientIdentity")
+        f.debug_struct("Identity")
             .field("public_key", &self.public_key_b64())
             .finish_non_exhaustive()
     }
 }
 
-impl ClientIdentity {
+impl Identity {
     /// Load the identity from `path`, generating and persisting a new one if
     /// the file does not yet exist.
-    pub fn load_or_create(path: &Path) -> ClientResult<Self> {
+    pub fn load_or_create(path: &Path) -> SdkResult<Self> {
         if path.exists() {
             let body = std::fs::read_to_string(path)?;
             let stored: StoredIdentity = serde_json::from_str(&body)?;
             let raw = base64::engine::general_purpose::STANDARD
                 .decode(&stored.secret_b64)
-                .map_err(|e| ClientError::Base64(e.to_string()))?;
+                .map_err(|e| SdkError::Base64(e.to_string()))?;
             if raw.len() != 32 {
-                return Err(ClientError::Identity("stored key wrong length".to_string()));
+                return Err(SdkError::Identity("stored key wrong length".to_string()));
             }
             let mut seed = [0u8; 32];
             seed.copy_from_slice(&raw);
@@ -89,7 +89,7 @@ mod tests {
 
     fn tmp(name: &str) -> PathBuf {
         let mut p = std::env::temp_dir();
-        p.push(format!("rivet-client-id-{}-{name}.json", uuid::Uuid::now_v7().simple()));
+        p.push(format!("rivet-sdk-id-{}-{name}.json", uuid::Uuid::now_v7().simple()));
         p
     }
 
@@ -98,10 +98,10 @@ mod tests {
         let path = tmp("stable");
         let _ = std::fs::remove_file(&path);
 
-        let a = ClientIdentity::load_or_create(&path).unwrap();
+        let a = Identity::load_or_create(&path).unwrap();
         let pk_a = a.public_key_b64();
 
-        let b = ClientIdentity::load_or_create(&path).unwrap();
+        let b = Identity::load_or_create(&path).unwrap();
         assert_eq!(pk_a, b.public_key_b64(), "reload must yield same key");
 
         let _ = std::fs::remove_file(&path);
@@ -111,8 +111,8 @@ mod tests {
     fn distinct_paths_distinct_keys() {
         let p1 = tmp("one");
         let p2 = tmp("two");
-        let a = ClientIdentity::load_or_create(&p1).unwrap();
-        let b = ClientIdentity::load_or_create(&p2).unwrap();
+        let a = Identity::load_or_create(&p1).unwrap();
+        let b = Identity::load_or_create(&p2).unwrap();
         assert_ne!(a.public_key_b64(), b.public_key_b64());
         let _ = std::fs::remove_file(&p1);
         let _ = std::fs::remove_file(&p2);
@@ -121,7 +121,7 @@ mod tests {
     #[test]
     fn public_key_is_32_bytes() {
         let path = tmp("len");
-        let id = ClientIdentity::load_or_create(&path).unwrap();
+        let id = Identity::load_or_create(&path).unwrap();
         let raw = base64::engine::general_purpose::STANDARD
             .decode(id.public_key_b64())
             .unwrap();

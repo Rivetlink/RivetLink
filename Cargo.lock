@@ -1986,22 +1986,11 @@ dependencies = [
 name = "rivetlink-client"
 version = "0.1.0"
 dependencies = [
- "base64",
  "clap",
- "ed25519-dalek",
- "futures-util",
- "rand 0.8.6",
- "rivetlink-core",
- "rivetlink-crypto",
- "rivetlink-protocol",
- "serde",
- "serde_json",
- "thiserror 2.0.18",
+ "rivetlink-sdk",
  "tokio",
- "tokio-tungstenite",
  "tracing",
  "tracing-subscriber",
- "uuid",
 ]
 
 [[package]]
@@ -2052,6 +2041,10 @@ dependencies = [
 name = "rivetlink-sdk"
 version = "0.1.0"
 dependencies = [
+ "base64",
+ "ed25519-dalek",
+ "futures-util",
+ "rand 0.8.6",
  "rivetlink-core",
  "rivetlink-crypto",
  "rivetlink-protocol",
@@ -2059,7 +2052,9 @@ dependencies = [
  "serde_json",
  "thiserror 2.0.18",
  "tokio",
+ "tokio-tungstenite",
  "tracing",
+ "uuid",
 ]
 
 [[package]]

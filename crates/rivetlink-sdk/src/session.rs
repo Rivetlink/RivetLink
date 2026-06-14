@@ -21,15 +21,15 @@ use std::path::PathBuf;
 use tokio_tungstenite::tungstenite::Message;
 use uuid::Uuid;
 
-use crate::error::{ClientError, ClientResult};
-use crate::identity::ClientIdentity;
+use crate::error::{SdkError, SdkResult};
+use crate::identity::Identity;
 
-/// Inputs for a screenshot session.
+/// Inputs for a single screenshot session.
 #[derive(Debug)]
-pub struct SessionRequest<'a> {
+pub struct CaptureParams<'a> {
     pub relay_ws_url: &'a str,
     pub token: &'a str,
-    pub identity: &'a ClientIdentity,
+    pub identity: &'a Identity,
     pub device_id: Uuid,
     /// Base64 Ed25519 identity key of the host, from the authenticated REST API.
     pub host_public_key_b64: &'a str,
@@ -37,19 +37,19 @@ pub struct SessionRequest<'a> {
 }
 
 /// Run a single screenshot session end to end. Returns the path written.
-pub async fn capture_screenshot(req: SessionRequest<'_>) -> ClientResult<PathBuf> {
+pub async fn capture_screenshot(req: CaptureParams<'_>) -> SdkResult<PathBuf> {
     let host_identity = parse_identity(req.host_public_key_b64)?;
 
     let (mut ws, _resp) = tokio_tungstenite::connect_async(req.relay_ws_url)
         .await
-        .map_err(|e| ClientError::Relay(format!("connect failed: {e}")))?;
+        .map_err(|e| SdkError::Relay(format!("connect failed: {e}")))?;
 
     // 1. User auth.
     send(&mut ws, &serde_json::json!({"type": "AUTH", "token": req.token})).await?;
     let ack = recv_text(&mut ws).await?;
     let ack_json: serde_json::Value = serde_json::from_str(&ack)?;
     if ack_json.get("type").and_then(|v| v.as_str()) != Some("AUTHENTICATED") {
-        return Err(ClientError::Auth(format!("unexpected auth response: {ack}")));
+        return Err(SdkError::Auth(format!("unexpected auth response: {ack}")));
     }
 
     // 2. Session request with our identity key.
@@ -82,7 +82,7 @@ pub async fn capture_screenshot(req: SessionRequest<'_>) -> ClientResult<PathBuf
                 local_kex = Some(kex);
             },
             SignalPacket::SessionRejected { reason, .. } => {
-                return Err(ClientError::SessionRejected(reason));
+                return Err(SdkError::SessionRejected(reason));
             },
             SignalPacket::SessionKeyExchange {
                 session_id: sid,
@@ -93,18 +93,18 @@ pub async fn capture_screenshot(req: SessionRequest<'_>) -> ClientResult<PathBuf
                 // Pin host identity: the asserted identity must equal the key
                 // we fetched over the authenticated REST channel.
                 if identity_public_key.trim() != req.host_public_key_b64.trim() {
-                    return Err(ClientError::Crypto(
+                    return Err(SdkError::Crypto(
                         "host identity key mismatch — possible MITM".to_string(),
                     ));
                 }
                 let peer_eph = decode_32(&ephemeral_public_key)?;
                 let peer_sig = decode_64(&signature)?;
                 handshake::verify_peer(&host_identity, &peer_eph, &peer_sig)
-                    .map_err(|e| ClientError::Crypto(format!("host key exchange invalid: {e}")))?;
+                    .map_err(|e| SdkError::Crypto(format!("host key exchange invalid: {e}")))?;
 
                 let kex = local_kex
                     .take()
-                    .ok_or_else(|| ClientError::Crypto("host key exchange arrived before accept".to_string()))?;
+                    .ok_or_else(|| SdkError::Crypto("host key exchange arrived before accept".to_string()))?;
                 channel = Some(kex.into_channel(&peer_eph));
                 session_id = Some(sid);
 
@@ -123,7 +123,7 @@ pub async fn capture_screenshot(req: SessionRequest<'_>) -> ClientResult<PathBuf
                 if last || chunks.len() >= total as usize {
                     let channel = channel
                         .as_ref()
-                        .ok_or_else(|| ClientError::Crypto("data before key exchange".to_string()))?;
+                        .ok_or_else(|| SdkError::Crypto("data before key exchange".to_string()))?;
                     let path = finalize(&mut chunks, Some(total), channel, &req.output_path)?;
                     // Politely close the session.
                     if let Some(sid) = session_id {
@@ -134,7 +134,7 @@ pub async fn capture_screenshot(req: SessionRequest<'_>) -> ClientResult<PathBuf
                 }
             },
             SignalPacket::SessionClosed { .. } => {
-                return Err(ClientError::Relay("host closed the session".to_string()));
+                return Err(SdkError::Relay("host closed the session".to_string()));
             },
             _ => {},
         }
@@ -147,10 +147,10 @@ fn finalize(
     total: Option<u32>,
     channel: &SealedChannel,
     output_path: &PathBuf,
-) -> ClientResult<PathBuf> {
+) -> SdkResult<PathBuf> {
     if let Some(total) = total {
         if chunks.len() != total as usize {
-            return Err(ClientError::Relay(format!(
+            return Err(SdkError::Relay(format!(
                 "incomplete capture: {} of {total} chunks",
                 chunks.len()
             )));
@@ -165,10 +165,10 @@ fn finalize(
 
     let sealed = base64::engine::general_purpose::STANDARD
         .decode(b64.as_bytes())
-        .map_err(|e| ClientError::Base64(e.to_string()))?;
+        .map_err(|e| SdkError::Base64(e.to_string()))?;
     let image = channel
         .open(&sealed)
-        .map_err(|e| ClientError::Crypto(format!("decrypt failed: {e}")))?;
+        .map_err(|e| SdkError::Crypto(format!("decrypt failed: {e}")))?;
 
     std::fs::write(output_path, &image)?;
     Ok(output_path.clone())
@@ -177,7 +177,7 @@ fn finalize(
 /// Build a `SessionKeyExchange` packet from our local exchange state.
 fn key_exchange_packet(
     session_id: SessionId,
-    identity: &ClientIdentity,
+    identity: &Identity,
     kex: &LocalKeyExchange,
 ) -> SignalPacket {
     let std = base64::engine::general_purpose::STANDARD;
@@ -189,29 +189,29 @@ fn key_exchange_packet(
     }
 }
 
-fn parse_identity(b64: &str) -> ClientResult<VerifyingKey> {
+fn parse_identity(b64: &str) -> SdkResult<VerifyingKey> {
     let raw = decode_32(b64)?;
-    VerifyingKey::from_bytes(&raw).map_err(|e| ClientError::Crypto(format!("bad host key: {e}")))
+    VerifyingKey::from_bytes(&raw).map_err(|e| SdkError::Crypto(format!("bad host key: {e}")))
 }
 
-fn decode_32(b64: &str) -> ClientResult<[u8; 32]> {
+fn decode_32(b64: &str) -> SdkResult<[u8; 32]> {
     let raw = base64::engine::general_purpose::STANDARD
         .decode(b64.trim())
-        .map_err(|e| ClientError::Base64(e.to_string()))?;
+        .map_err(|e| SdkError::Base64(e.to_string()))?;
     if raw.len() != 32 {
-        return Err(ClientError::Crypto(format!("expected 32 bytes, got {}", raw.len())));
+        return Err(SdkError::Crypto(format!("expected 32 bytes, got {}", raw.len())));
     }
     let mut out = [0u8; 32];
     out.copy_from_slice(&raw);
     Ok(out)
 }
 
-fn decode_64(b64: &str) -> ClientResult<[u8; 64]> {
+fn decode_64(b64: &str) -> SdkResult<[u8; 64]> {
     let raw = base64::engine::general_purpose::STANDARD
         .decode(b64.trim())
-        .map_err(|e| ClientError::Base64(e.to_string()))?;
+        .map_err(|e| SdkError::Base64(e.to_string()))?;
     if raw.len() != 64 {
-        return Err(ClientError::Crypto(format!("expected 64 bytes, got {}", raw.len())));
+        return Err(SdkError::Crypto(format!("expected 64 bytes, got {}", raw.len())));
     }
     let mut out = [0u8; 64];
     out.copy_from_slice(&raw);
@@ -221,31 +221,31 @@ fn decode_64(b64: &str) -> ClientResult<[u8; 64]> {
 async fn send(
     ws: &mut (impl SinkExt<Message, Error = tokio_tungstenite::tungstenite::Error> + Unpin),
     value: &serde_json::Value,
-) -> ClientResult<()> {
+) -> SdkResult<()> {
     ws.send(Message::Text(value.to_string()))
         .await
-        .map_err(|e| ClientError::WebSocket(e.to_string()))
+        .map_err(|e| SdkError::WebSocket(e.to_string()))
 }
 
 async fn send_packet(
     ws: &mut (impl SinkExt<Message, Error = tokio_tungstenite::tungstenite::Error> + Unpin),
     packet: &SignalPacket,
-) -> ClientResult<()> {
+) -> SdkResult<()> {
     let json = serde_json::to_string(packet)?;
     ws.send(Message::Text(json))
         .await
-        .map_err(|e| ClientError::WebSocket(e.to_string()))
+        .map_err(|e| SdkError::WebSocket(e.to_string()))
 }
 
 async fn recv_text(
     ws: &mut (impl StreamExt<Item = Result<Message, tokio_tungstenite::tungstenite::Error>> + Unpin),
-) -> ClientResult<String> {
+) -> SdkResult<String> {
     while let Some(msg) = ws.next().await {
-        match msg.map_err(|e| ClientError::WebSocket(e.to_string()))? {
+        match msg.map_err(|e| SdkError::WebSocket(e.to_string()))? {
             Message::Text(t) => return Ok(t),
-            Message::Close(_) => return Err(ClientError::Relay("connection closed".to_string())),
+            Message::Close(_) => return Err(SdkError::Relay("connection closed".to_string())),
             _ => continue,
         }
     }
-    Err(ClientError::Relay("stream ended".to_string()))
+    Err(SdkError::Relay("stream ended".to_string()))
 }

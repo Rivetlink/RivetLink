@@ -1,10 +1,10 @@
-//! Client error types.
+//! SDK error types.
 
 use thiserror::Error;
 
-/// Errors emitted by the client.
+/// Errors emitted by the SDK.
 #[derive(Debug, Error)]
-pub enum ClientError {
+pub enum SdkError {
     #[error("config error: {0}")]
     Config(String),
 
@@ -13,6 +13,9 @@ pub enum ClientError {
 
     #[error("http error: {0}")]
     Http(String),
+
+    #[error("not authenticated — call login() first")]
+    NotAuthenticated,
 
     #[error("authentication failed: {0}")]
     Auth(String),
@@ -39,5 +42,5 @@ pub enum ClientError {
     Base64(String),
 }
 
-/// Result alias used throughout the client.
-pub type ClientResult<T> = Result<T, ClientError>;
+/// Result alias used throughout the SDK.
+pub type SdkResult<T> = Result<T, SdkError>;

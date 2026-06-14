@@ -10,11 +10,11 @@ use std::net::ToSocketAddrs;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::TcpStream;
 
-use crate::error::{ClientError, ClientResult};
+use crate::error::{SdkError, SdkResult};
 
 /// A device as returned by `GET /devices`.
 #[derive(Debug, Clone, Deserialize)]
-pub struct DeviceSummary {
+pub struct Device {
     pub id: String,
     pub hostname: Option<String>,
     pub platform: Option<String>,
@@ -24,19 +24,19 @@ pub struct DeviceSummary {
 }
 
 /// Log in and return the access token.
-pub async fn login(base_url: &str, email: &str, password: &str) -> ClientResult<String> {
+pub async fn login(base_url: &str, email: &str, password: &str) -> SdkResult<String> {
     let body = serde_json::json!({ "email": email, "password": password });
     let resp = request(base_url, "POST", "/auth/login", None, Some(&body)).await?;
     resp.get("access_token")
         .and_then(Value::as_str)
         .map(ToString::to_string)
-        .ok_or_else(|| ClientError::Auth("login response missing access_token".to_string()))
+        .ok_or_else(|| SdkError::Auth("login response missing access_token".to_string()))
 }
 
 /// List devices visible to the authenticated user.
-pub async fn list_devices(base_url: &str, token: &str) -> ClientResult<Vec<DeviceSummary>> {
+pub async fn list_devices(base_url: &str, token: &str) -> SdkResult<Vec<Device>> {
     let resp = request(base_url, "GET", "/devices", Some(token), None).await?;
-    let devices: Vec<DeviceSummary> = serde_json::from_value(resp)?;
+    let devices: Vec<Device> = serde_json::from_value(resp)?;
     Ok(devices)
 }
 
@@ -47,7 +47,7 @@ async fn request(
     path: &str,
     token: Option<&str>,
     body: Option<&Value>,
-) -> ClientResult<Value> {
+) -> SdkResult<Value> {
     let (host, port, prefix) = parse_base_url(base_url)?;
     let body_bytes = match body {
         Some(v) => serde_json::to_vec(v)?,
@@ -72,9 +72,9 @@ async fn request(
 
     let addr = (host.as_str(), port)
         .to_socket_addrs()
-        .map_err(|e| ClientError::Http(format!("resolve {host}: {e}")))?
+        .map_err(|e| SdkError::Http(format!("resolve {host}: {e}")))?
         .next()
-        .ok_or_else(|| ClientError::Http(format!("no addresses for {host}")))?;
+        .ok_or_else(|| SdkError::Http(format!("no addresses for {host}")))?;
 
     let mut stream = TcpStream::connect(addr).await?;
     stream.write_all(head.as_bytes()).await?;
@@ -89,23 +89,23 @@ async fn request(
     let status_line = text
         .lines()
         .next()
-        .ok_or_else(|| ClientError::Http("empty response".to_string()))?;
+        .ok_or_else(|| SdkError::Http("empty response".to_string()))?;
     if !status_line.contains(" 200 ") {
-        return Err(ClientError::Http(format!("request failed: {status_line}")));
+        return Err(SdkError::Http(format!("request failed: {status_line}")));
     }
 
     let body_start = text
         .find("\r\n\r\n")
-        .ok_or_else(|| ClientError::Http("malformed response".to_string()))?
+        .ok_or_else(|| SdkError::Http("malformed response".to_string()))?
         + 4;
     let parsed: Value = serde_json::from_str(text[body_start..].trim())?;
     Ok(parsed)
 }
 
 /// Parse `http://host[:port][/prefix]` into `(host, port, prefix)`.
-fn parse_base_url(base: &str) -> ClientResult<(String, u16, String)> {
+fn parse_base_url(base: &str) -> SdkResult<(String, u16, String)> {
     let rest = base.strip_prefix("http://").ok_or_else(|| {
-        ClientError::Config("relay_http_url must start with http:// (TLS via proxy)".to_string())
+        SdkError::Config("relay_http_url must start with http:// (TLS via proxy)".to_string())
     })?;
 
     let (host_port, prefix) = rest

@@ -3,7 +3,7 @@
 use serde::{Deserialize, Serialize};
 use std::path::{Path, PathBuf};
 
-use crate::error::{ClientError, ClientResult};
+use crate::error::{SdkError, SdkResult};
 
 /// Persisted client configuration.
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -18,16 +18,16 @@ pub struct ClientConfig {
 
 impl ClientConfig {
     /// Load configuration from a JSON file.
-    pub fn load(path: &Path) -> ClientResult<Self> {
+    pub fn load(path: &Path) -> SdkResult<Self> {
         let body = std::fs::read_to_string(path)
-            .map_err(|e| ClientError::Config(format!("read {}: {e}", path.display())))?;
+            .map_err(|e| SdkError::Config(format!("read {}: {e}", path.display())))?;
         let cfg: Self = serde_json::from_str(&body)?;
         cfg.validate()?;
         Ok(cfg)
     }
 
     /// Persist configuration as pretty JSON, creating parent dirs.
-    pub fn save(&self, path: &Path) -> ClientResult<()> {
+    pub fn save(&self, path: &Path) -> SdkResult<()> {
         if let Some(parent) = path.parent() {
             std::fs::create_dir_all(parent)?;
         }
@@ -36,16 +36,16 @@ impl ClientConfig {
     }
 
     /// Reject malformed URLs early.
-    pub fn validate(&self) -> ClientResult<()> {
+    pub fn validate(&self) -> SdkResult<()> {
         if !self.relay_ws_url.starts_with("ws://") && !self.relay_ws_url.starts_with("wss://") {
-            return Err(ClientError::Config(
+            return Err(SdkError::Config(
                 "relay_ws_url must start with ws:// or wss://".to_string(),
             ));
         }
         if !self.relay_http_url.starts_with("http://")
             && !self.relay_http_url.starts_with("https://")
         {
-            return Err(ClientError::Config(
+            return Err(SdkError::Config(
                 "relay_http_url must start with http:// or https://".to_string(),
             ));
         }
@@ -59,7 +59,7 @@ mod tests {
 
     fn tmp(name: &str) -> PathBuf {
         let mut p = std::env::temp_dir();
-        p.push(format!("rivet-client-cfg-{}-{name}.json", uuid::Uuid::now_v7().simple()));
+        p.push(format!("rivet-sdk-cfg-{}-{name}.json", uuid::Uuid::now_v7().simple()));
         p
     }
 

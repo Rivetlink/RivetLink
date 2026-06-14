@@ -1,11 +1,8 @@
-//! RivetLink Support Client library.
+//! RivetLink Support Client.
 //!
-//! Drives a support session against a host device through the relay: logs in,
-//! lists devices, and runs the encrypted screenshot handshake.
+//! A thin CLI over [`rivetlink_sdk`]: parses arguments and drives the SDK's
+//! `RivetClient` to log in, list devices, and run the encrypted screenshot
+//! handshake against a host device. All the protocol/crypto logic lives in
+//! the SDK so the desktop app and third-party integrators share one codebase.
 
 pub mod cli;
-pub mod config;
-pub mod error;
-pub mod identity;
-pub mod rest;
-pub mod session;
