@@ -313,17 +313,27 @@ pub async fn screenshot_key(
 }
 
 /// Like [`screenshot_key`], but takes the pinned host identity as base64 — so
-/// callers (e.g. the desktop app) don't need to depend on `ed25519-dalek`. An
-/// empty/`None` pin means trust-on-first-use.
+/// callers (e.g. the desktop app) don't need to depend on `ed25519-dalek`.
+///
+/// `None` means trust-on-first-use (no pin). A `Some(_)` is treated as an
+/// explicit intent to pin: an empty/whitespace or malformed value is an error,
+/// **never** a silent downgrade to TOFU — that would let a MITM strip the pin
+/// by feeding an empty string.
 pub async fn screenshot_key_pinned(
     addr: SocketAddr,
     identity: &Identity,
     pinned_host_b64: Option<&str>,
 ) -> SdkResult<Vec<u8>> {
     let pinned = match pinned_host_b64 {
-        Some(b64) if !b64.trim().is_empty() => {
+        Some(b64) => {
+            let trimmed = b64.trim();
+            if trimmed.is_empty() {
+                return Err(SdkError::Crypto(
+                    "empty pinned host key — pass None for trust-on-first-use".to_string(),
+                ));
+            }
             let raw = B64
-                .decode(b64.trim())
+                .decode(trimmed)
                 .map_err(|e| SdkError::Base64(e.to_string()))?;
             let bytes: [u8; 32] = raw
                 .as_slice()
@@ -334,7 +344,7 @@ pub async fn screenshot_key_pinned(
                     .map_err(|e| SdkError::Crypto(format!("bad host key: {e}")))?,
             )
         },
-        _ => None,
+        None => None,
     };
     screenshot_key(addr, identity, pinned).await
 }
