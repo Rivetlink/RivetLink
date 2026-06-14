@@ -66,7 +66,8 @@ pub enum Command {
     },
 
     /// Serve direct-LAN sessions: advertise on the local network and accept
-    /// connections without a relay. No registration needed — only the keystore.
+    /// connections without a relay. Standalone — no `init`/`register` or relay
+    /// config needed; the keystore is created on first run if absent.
     Lan {
         /// TCP port to listen on (0 = pick a free port, announced via mDNS).
         #[arg(long, default_value_t = 0)]
@@ -77,6 +78,14 @@ pub enum Command {
         /// trusted-clients store.
         #[arg(long)]
         pin: Option<String>,
+
+        /// Friendly name advertised on the network.
+        #[arg(long, default_value = "RivetLink Host")]
+        device_name: String,
+
+        /// Keystore directory (created if it does not exist).
+        #[arg(long, default_value = "keys")]
+        keystore_path: PathBuf,
 
         /// In key mode, auto-accept and trust any client without prompting.
         /// Unattended / testing only.

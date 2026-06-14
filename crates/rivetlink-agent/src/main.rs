@@ -38,8 +38,10 @@ async fn main() -> std::process::ExitCode {
         Some(Command::Lan {
             port,
             pin,
+            device_name,
+            keystore_path,
             auto_accept,
-        }) => lan(&cli.config, port, pin, auto_accept).await,
+        }) => lan(port, pin, device_name, keystore_path, auto_accept).await,
         None => {
             eprintln!("no subcommand given — use `rivet-agent --help`");
             return std::process::ExitCode::FAILURE;
@@ -171,34 +173,34 @@ async fn run(config_path: &std::path::Path, auto_accept: bool) -> AgentResult<()
     Ok(())
 }
 
-/// `lan` subcommand — serve direct-LAN sessions without a relay.
+/// `lan` subcommand — serve direct-LAN sessions without a relay. Standalone:
+/// no agent config required, only a keystore (created on first run).
 async fn lan(
-    config_path: &std::path::Path,
     port: u16,
     pin: Option<String>,
+    device_name: String,
+    keystore_path: std::path::PathBuf,
     auto_accept: bool,
 ) -> AgentResult<()> {
-    let cfg = AgentConfig::load(config_path)?;
-
-    let store = FileKeyStore::new(cfg.keystore_path.clone())?;
+    let store = FileKeyStore::new(keystore_path.clone())?;
     let signing = store.ensure_signing_key().await?;
     let signing_key = ed25519_signing_key(&signing)?;
 
     let auth = match pin {
         Some(pin) => {
             println!("Serving direct-LAN sessions with a PIN.");
-            println!("  device: {}", cfg.device_name);
+            println!("  device: {device_name}");
             println!("  pin:    {pin}");
             LanAuth::Password(pin)
         },
         None => {
-            let trusted_path = cfg.keystore_path.join("trusted_clients.json");
+            let trusted_path = keystore_path.join("trusted_clients.json");
             let trusted = TrustedClients::load_or_empty(&trusted_path)?;
             if auto_accept {
                 tracing::warn!("auto-accept enabled — all clients trusted without prompting");
             }
             println!("Serving direct-LAN sessions with key (TOFU) auth.");
-            println!("  device:  {}", cfg.device_name);
+            println!("  device:  {device_name}");
             println!("  trusted: {} client(s)", trusted.len());
             LanAuth::Key {
                 trusted,
@@ -207,7 +209,7 @@ async fn lan(
         },
     };
 
-    lan::serve(signing_key, cfg.device_name, port, auth).await
+    lan::serve(signing_key, device_name, port, auth).await
 }
 
 /// Convert the agent's stored signing key into an Ed25519 `SigningKey`.
