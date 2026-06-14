@@ -121,6 +121,9 @@ spake2 = "0.4"
 # Async utilities
 async-trait = "0.1"
 
+# mDNS service discovery — find/advertise hosts on the local network.
+mdns-sd = "0.11"
+
 # Concurrency
 dashmap = "6"
 

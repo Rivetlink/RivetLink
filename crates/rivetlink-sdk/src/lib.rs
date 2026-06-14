@@ -15,6 +15,7 @@ pub mod config;
 pub mod direct;
 pub mod error;
 pub mod identity;
+pub mod lan;
 pub mod rest;
 pub mod session;
 
@@ -24,6 +25,7 @@ pub use client::RivetClient;
 pub use config::ClientConfig;
 pub use error::{SdkError, SdkResult};
 pub use identity::Identity;
+pub use lan::{Advertiser, LanDevice, LanRequest, LanResponse};
 pub use rest::Device;
 
 // Re-export the wire vocabulary integrators may need without depending on the

@@ -25,6 +25,9 @@ pub enum AgentError {
 
     #[error("websocket error: {0}")]
     WebSocket(String),
+
+    #[error("direct-LAN error: {0}")]
+    Lan(String),
 }
 
 /// Result alias used throughout the agent.

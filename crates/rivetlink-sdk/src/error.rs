@@ -32,6 +32,9 @@ pub enum SdkError {
     #[error("crypto error: {0}")]
     Crypto(String),
 
+    #[error("discovery error: {0}")]
+    Discovery(String),
+
     #[error("io error: {0}")]
     Io(#[from] std::io::Error),
 

@@ -67,6 +67,13 @@ impl Identity {
         Ok(Self { signing_key })
     }
 
+    /// Wrap an existing Ed25519 signing key as an identity. Lets a host reuse
+    /// its keystore key for the direct-LAN key-mode handshake without round-
+    /// tripping through a file.
+    pub fn from_signing_key(signing_key: SigningKey) -> Self {
+        Self { signing_key }
+    }
+
     /// Reference to the signing key for the session handshake.
     pub fn signing_key(&self) -> &SigningKey {
         &self.signing_key

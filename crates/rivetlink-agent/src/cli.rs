@@ -64,4 +64,23 @@ pub enum Command {
         #[arg(long)]
         auto_accept: bool,
     },
+
+    /// Serve direct-LAN sessions: advertise on the local network and accept
+    /// connections without a relay. No registration needed — only the keystore.
+    Lan {
+        /// TCP port to listen on (0 = pick a free port, announced via mDNS).
+        #[arg(long, default_value_t = 0)]
+        port: u16,
+
+        /// Shared PIN for password (PAKE) auth. If set, clients authenticate
+        /// with this PIN. If omitted, key-mode (TOFU) auth is used against the
+        /// trusted-clients store.
+        #[arg(long)]
+        pin: Option<String>,
+
+        /// In key mode, auto-accept and trust any client without prompting.
+        /// Unattended / testing only.
+        #[arg(long)]
+        auto_accept: bool,
+    },
 }

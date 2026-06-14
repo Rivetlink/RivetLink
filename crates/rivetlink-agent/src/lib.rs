@@ -10,6 +10,7 @@ pub mod config;
 pub mod error;
 pub mod input;
 pub mod keystore;
+pub mod lan;
 pub mod registration;
 pub mod relay;
 pub mod session;

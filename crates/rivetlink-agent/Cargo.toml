@@ -16,6 +16,7 @@ path = "src/lib.rs"
 rivetlink-core = { workspace = true }
 rivetlink-protocol = { workspace = true }
 rivetlink-crypto = { workspace = true }
+rivetlink-sdk = { workspace = true }
 tokio = { workspace = true }
 serde = { workspace = true }
 serde_json = { workspace = true }
