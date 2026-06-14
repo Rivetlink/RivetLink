@@ -22,6 +22,8 @@ dashmap = { workspace = true }
 # Always needed for HKDF key derivation (SealedChannel) + hashing.
 hkdf = { workspace = true }
 sha2 = { workspace = true }
+# Password-authenticated key agreement (SPAKE2) for direct LAN sessions.
+spake2 = { workspace = true }
 
 # Post-quantum (optional)
 ml-kem = { workspace = true, optional = true }

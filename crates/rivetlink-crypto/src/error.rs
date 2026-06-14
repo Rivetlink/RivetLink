@@ -52,6 +52,11 @@ pub enum CryptoError {
     /// The requested cryptographic suite is not supported.
     #[error("crypto suite not supported: {0}")]
     UnsupportedSuite(String),
+
+    /// Password-authenticated key agreement (PAKE) failed. Deliberately gives
+    /// no detail (wrong password vs malformed message) to avoid an oracle.
+    #[error("password authentication failed")]
+    PakeFailed,
 }
 
 /// Convenience type alias for cryptographic operation results.

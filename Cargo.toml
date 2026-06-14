@@ -115,6 +115,8 @@ bytes = "1"
 # Auth & security
 argon2 = "0.5"
 jsonwebtoken = "9"
+# SPAKE2 balanced PAKE — password-authenticated key agreement for direct LAN.
+spake2 = "0.4"
 
 # Async utilities
 async-trait = "0.1"

@@ -8,6 +8,7 @@ pub mod challenge;
 pub mod error;
 pub mod handshake;
 pub mod identity;
+pub mod pake;
 pub mod sealed;
 pub mod session_keys;
 
