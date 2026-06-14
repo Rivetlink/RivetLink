@@ -9,15 +9,15 @@
 //! same capturer and keeps pulling frames.
 
 use jpeg_encoder::{ColorType, Encoder};
-use scap::capturer::{Capturer, Options};
+use scap::capturer::{Capturer, Options, Resolution};
 use scap::frame::{Frame, FrameType};
 use tokio::sync::mpsc::{error::TrySendError, Sender};
 
 use crate::error::{AgentError, AgentResult};
 
-/// Build a screen-cast capturer (BGRA frames at `fps`). Triggers the portal
-/// "pick a screen" dialog.
-fn build_capturer(fps: u16) -> AgentResult<Capturer> {
+/// Build a screen-cast capturer (BGRA frames at `fps`, scaled to `resolution`).
+/// Triggers the portal "pick a screen" dialog.
+fn build_capturer(fps: u16, resolution: Resolution) -> AgentResult<Capturer> {
     if !scap::is_supported() {
         return Err(AgentError::Lan("screen capture not supported here".to_string()));
     }
@@ -25,6 +25,7 @@ fn build_capturer(fps: u16) -> AgentResult<Capturer> {
         fps: u32::from(fps).max(1),
         show_cursor: true,
         output_type: FrameType::BGRAFrame,
+        output_resolution: resolution,
         ..Default::default()
     };
     Capturer::build(options).map_err(|e| AgentError::Lan(format!("screencast: {e}")))
@@ -38,7 +39,9 @@ fn build_capturer(fps: u16) -> AgentResult<Capturer> {
 /// channel, signalling the consumer that the stream has ended.
 #[allow(clippy::needless_pass_by_value)]
 pub fn stream_jpeg_blocking(fps: u16, quality: u8, tx: Sender<Vec<u8>>) -> AgentResult<()> {
-    let mut capturer = build_capturer(fps)?;
+    // Downscale to 1080p server-side: a single 4K/multi-mon source is far too
+    // much data for JPEG-over-the-wire. Real low-latency uses H.264 later.
+    let mut capturer = build_capturer(fps, Resolution::_1080p)?;
     capturer.start_capture();
     loop {
         let Ok(frame) = capturer.get_next_frame() else {
@@ -95,7 +98,8 @@ fn frame_to_jpeg(frame: Frame, quality: u8) -> AgentResult<Vec<u8>> {
 /// Blocking: the portal shows a "pick a screen" dialog and PipeWire delivery is
 /// synchronous. Call from `spawn_blocking`.
 pub fn capture_png_blocking() -> AgentResult<Vec<u8>> {
-    let mut capturer = build_capturer(30)?;
+    // Full native resolution for a crisp one-shot screenshot.
+    let mut capturer = build_capturer(30, Resolution::Captured)?;
     capturer.start_capture();
     // The first frame(s) after a portal start can be blank while the stream
     // warms up; take a few and keep the last good one.
