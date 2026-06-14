@@ -312,6 +312,33 @@ pub async fn screenshot_key(
     fetch_screenshot(&mut stream, &channel).await
 }
 
+/// Like [`screenshot_key`], but takes the pinned host identity as base64 — so
+/// callers (e.g. the desktop app) don't need to depend on `ed25519-dalek`. An
+/// empty/`None` pin means trust-on-first-use.
+pub async fn screenshot_key_pinned(
+    addr: SocketAddr,
+    identity: &Identity,
+    pinned_host_b64: Option<&str>,
+) -> SdkResult<Vec<u8>> {
+    let pinned = match pinned_host_b64 {
+        Some(b64) if !b64.trim().is_empty() => {
+            let raw = B64
+                .decode(b64.trim())
+                .map_err(|e| SdkError::Base64(e.to_string()))?;
+            let bytes: [u8; 32] = raw
+                .as_slice()
+                .try_into()
+                .map_err(|_| SdkError::Crypto("host key must be 32 bytes".to_string()))?;
+            Some(
+                VerifyingKey::from_bytes(&bytes)
+                    .map_err(|e| SdkError::Crypto(format!("bad host key: {e}")))?,
+            )
+        },
+        _ => None,
+    };
+    screenshot_key(addr, identity, pinned).await
+}
+
 async fn fetch_screenshot(stream: &mut TcpStream, channel: &SealedChannel) -> SdkResult<Vec<u8>> {
     send_request(stream, channel, &LanRequest::Screenshot).await?;
     match recv_response(stream, channel).await? {
@@ -359,6 +386,46 @@ mod tests {
             },
             other => panic!("unexpected: {other:?}"),
         }
+    }
+
+    #[tokio::test]
+    async fn screenshot_password_over_tcp_end_to_end() {
+        use tokio::net::TcpListener;
+
+        // A host that accepts a PIN-authenticated connection and answers one
+        // screenshot request with fake PNG bytes.
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let host = tokio::spawn(async move {
+            let (mut stream, _) = listener.accept().await.unwrap();
+            let channel = direct::host_accept_password(&mut stream, "1234").await.unwrap();
+            let req = recv_request(&mut stream, &channel).await.unwrap();
+            assert!(matches!(req, LanRequest::Screenshot));
+            send_response(&mut stream, &channel, &LanResponse::Screenshot {
+                png_b64: B64.encode(b"\x89PNG-fake"),
+            })
+            .await
+            .unwrap();
+        });
+
+        let png = screenshot_password(addr, "1234").await.unwrap();
+        host.await.unwrap();
+        assert_eq!(png, b"\x89PNG-fake");
+    }
+
+    #[tokio::test]
+    async fn screenshot_password_wrong_pin_fails() {
+        use tokio::net::TcpListener;
+
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let host = tokio::spawn(async move {
+            let (mut stream, _) = listener.accept().await.unwrap();
+            let _ = direct::host_accept_password(&mut stream, "1234").await;
+        });
+
+        assert!(screenshot_password(addr, "0000").await.is_err());
+        let _ = host.await;
     }
 
     #[test]
