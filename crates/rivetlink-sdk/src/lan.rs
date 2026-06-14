@@ -216,6 +216,10 @@ fn sanitize_hostname(name: &str) -> String {
 pub enum LanRequest {
     /// Ask the host for a single screenshot.
     Screenshot,
+    /// Start a live screen stream at up to `fps` frames per second. The host
+    /// replies with a continuous sequence of [`LanResponse::Frame`] until the
+    /// client disconnects.
+    StartStream { fps: u16 },
 }
 
 /// A host response.
@@ -224,6 +228,8 @@ pub enum LanRequest {
 pub enum LanResponse {
     /// A screenshot, as base64-encoded PNG bytes.
     Screenshot { png_b64: String },
+    /// One live frame, as base64-encoded JPEG bytes.
+    Frame { jpeg_b64: String },
     /// The host could not satisfy the request.
     Error { message: String },
 }
@@ -291,11 +297,34 @@ where
 
 // ---- High-level client helpers ---------------------------------------------
 
+/// Connect + handshake (PIN/PAKE), returning the raw stream and sealed channel
+/// so the caller can drive any request/response flow (screenshot or stream).
+pub async fn connect_password(
+    addr: SocketAddr,
+    password: &str,
+) -> SdkResult<(TcpStream, SealedChannel)> {
+    let mut stream = TcpStream::connect(addr).await?;
+    let channel = direct::client_connect_password(&mut stream, password).await?;
+    Ok((stream, channel))
+}
+
+/// Connect + handshake (key/TOFU), pinning the host to `pinned_host_b64` if
+/// given. See [`screenshot_key_pinned`] for the pinning rules.
+pub async fn connect_key_pinned(
+    addr: SocketAddr,
+    identity: &Identity,
+    pinned_host_b64: Option<&str>,
+) -> SdkResult<(TcpStream, SealedChannel)> {
+    let pinned = parse_pinned_host(pinned_host_b64)?;
+    let mut stream = TcpStream::connect(addr).await?;
+    let channel = direct::client_connect_key(&mut stream, identity, pinned).await?;
+    Ok((stream, channel))
+}
+
 /// Connect to a host over the LAN with a shared PIN (PAKE) and fetch one
 /// screenshot. Returns the raw PNG bytes.
 pub async fn screenshot_password(addr: SocketAddr, password: &str) -> SdkResult<Vec<u8>> {
-    let mut stream = TcpStream::connect(addr).await?;
-    let channel = direct::client_connect_password(&mut stream, password).await?;
+    let (mut stream, channel) = connect_password(addr, password).await?;
     fetch_screenshot(&mut stream, &channel).await
 }
 
@@ -324,7 +353,14 @@ pub async fn screenshot_key_pinned(
     identity: &Identity,
     pinned_host_b64: Option<&str>,
 ) -> SdkResult<Vec<u8>> {
-    let pinned = match pinned_host_b64 {
+    screenshot_key(addr, identity, parse_pinned_host(pinned_host_b64)?).await
+}
+
+/// Parse a pinned host identity from base64. `None` means trust-on-first-use;
+/// a `Some(_)` is an explicit pin, so empty/malformed is an error (never a
+/// silent TOFU downgrade — that would let a MITM strip the pin).
+fn parse_pinned_host(pinned_host_b64: Option<&str>) -> SdkResult<Option<VerifyingKey>> {
+    match pinned_host_b64 {
         Some(b64) => {
             let trimmed = b64.trim();
             if trimmed.is_empty() {
@@ -339,14 +375,13 @@ pub async fn screenshot_key_pinned(
                 .as_slice()
                 .try_into()
                 .map_err(|_| SdkError::Crypto("host key must be 32 bytes".to_string()))?;
-            Some(
+            Ok(Some(
                 VerifyingKey::from_bytes(&bytes)
                     .map_err(|e| SdkError::Crypto(format!("bad host key: {e}")))?,
-            )
+            ))
         },
-        None => None,
-    };
-    screenshot_key(addr, identity, pinned).await
+        None => Ok(None),
+    }
 }
 
 async fn fetch_screenshot(stream: &mut TcpStream, channel: &SealedChannel) -> SdkResult<Vec<u8>> {
@@ -355,7 +390,41 @@ async fn fetch_screenshot(stream: &mut TcpStream, channel: &SealedChannel) -> Sd
         LanResponse::Screenshot { png_b64 } => B64
             .decode(png_b64.trim())
             .map_err(|e| SdkError::Base64(e.to_string())),
+        LanResponse::Frame { .. } => {
+            Err(SdkError::Crypto("expected screenshot, got a stream frame".to_string()))
+        },
         LanResponse::Error { message } => Err(SdkError::Relay(message)),
+    }
+}
+
+/// Start a live screen stream and invoke `on_frame` with each decoded JPEG
+/// frame's bytes. Returns when `on_frame` returns `false` (caller asked to
+/// stop) or the host closes the connection. Dropping the future (e.g. aborting
+/// the task) also ends the stream — the host notices the closed socket and
+/// stops capturing.
+pub async fn stream_frames<F>(
+    stream: &mut TcpStream,
+    channel: &SealedChannel,
+    fps: u16,
+    mut on_frame: F,
+) -> SdkResult<()>
+where
+    F: FnMut(Vec<u8>) -> bool,
+{
+    send_request(stream, channel, &LanRequest::StartStream { fps }).await?;
+    loop {
+        match recv_response(stream, channel).await? {
+            LanResponse::Frame { jpeg_b64 } => {
+                let bytes = B64
+                    .decode(jpeg_b64.trim())
+                    .map_err(|e| SdkError::Base64(e.to_string()))?;
+                if !on_frame(bytes) {
+                    return Ok(());
+                }
+            },
+            LanResponse::Error { message } => return Err(SdkError::Relay(message)),
+            LanResponse::Screenshot { .. } => { /* ignore stray screenshot */ },
+        }
     }
 }
 

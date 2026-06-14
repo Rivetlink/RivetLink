@@ -44,4 +44,5 @@ workspace = true
 ashpd = { version = "0.9", default-features = false, features = ["tokio"] }
 scap = "0.0.8"
 png = "0.17"
+jpeg-encoder = "0.6"
 url = "2"

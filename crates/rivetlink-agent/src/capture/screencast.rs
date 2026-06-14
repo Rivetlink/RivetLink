@@ -8,29 +8,94 @@
 //! This grabs a single frame for the screenshot path. Live streaming reuses the
 //! same capturer and keeps pulling frames.
 
+use jpeg_encoder::{ColorType, Encoder};
 use scap::capturer::{Capturer, Options};
 use scap::frame::{Frame, FrameType};
+use tokio::sync::mpsc::{error::TrySendError, Sender};
 
 use crate::error::{AgentError, AgentResult};
+
+/// Build a screen-cast capturer (BGRA frames at `fps`). Triggers the portal
+/// "pick a screen" dialog.
+fn build_capturer(fps: u16) -> AgentResult<Capturer> {
+    if !scap::is_supported() {
+        return Err(AgentError::Lan("screen capture not supported here".to_string()));
+    }
+    let options = Options {
+        fps: u32::from(fps).max(1),
+        show_cursor: true,
+        output_type: FrameType::BGRAFrame,
+        ..Default::default()
+    };
+    Capturer::build(options).map_err(|e| AgentError::Lan(format!("screencast: {e}")))
+}
+
+/// Capture continuously, JPEG-encode each frame, and push it to `tx` until the
+/// receiver is dropped (client disconnected) or the stream ends. Blocking — run
+/// on a dedicated thread. A single portal prompt covers the whole stream.
+///
+/// `tx` is taken by value on purpose: dropping it when this returns closes the
+/// channel, signalling the consumer that the stream has ended.
+#[allow(clippy::needless_pass_by_value)]
+pub fn stream_jpeg_blocking(fps: u16, quality: u8, tx: Sender<Vec<u8>>) -> AgentResult<()> {
+    let mut capturer = build_capturer(fps)?;
+    capturer.start_capture();
+    loop {
+        let Ok(frame) = capturer.get_next_frame() else {
+            break; // stream ended
+        };
+        let jpeg = match frame_to_jpeg(frame, quality) {
+            Ok(j) => j,
+            Err(e) => {
+                tracing::debug!(error = %e, "skipping unencodable frame");
+                continue;
+            },
+        };
+        // Drop frames the consumer can't keep up with rather than build lag.
+        match tx.try_send(jpeg) {
+            Ok(()) => {},
+            Err(TrySendError::Full(_)) => {},
+            Err(TrySendError::Closed(_)) => break, // client gone
+        }
+    }
+    capturer.stop_capture();
+    Ok(())
+}
+
+/// JPEG-encode one captured frame.
+fn frame_to_jpeg(frame: Frame, quality: u8) -> AgentResult<Vec<u8>> {
+    let (w, h, mut data, color, bpp) = match frame {
+        Frame::BGRA(f) => (f.width, f.height, f.data, ColorType::Bgra, 4),
+        Frame::BGRx(f) => (f.width, f.height, f.data, ColorType::Bgra, 4),
+        Frame::RGBx(f) => (f.width, f.height, f.data, ColorType::Rgba, 4),
+        Frame::RGB(f) => (f.width, f.height, f.data, ColorType::Rgb, 3),
+        other => {
+            return Err(AgentError::Lan(format!("unsupported frame format: {other:?}")))
+        },
+    };
+    let (w16, h16) = (u16::try_from(w).unwrap_or(0), u16::try_from(h).unwrap_or(0));
+    let expected = usize::from(w16) * usize::from(h16) * bpp;
+    if w16 == 0 || h16 == 0 || data.len() < expected {
+        return Err(AgentError::Lan(format!(
+            "frame too small: {w}x{h}, {} bytes (need {expected})",
+            data.len()
+        )));
+    }
+    data.truncate(expected); // drop any trailing stride padding
+
+    let mut out = Vec::new();
+    Encoder::new(&mut out, quality)
+        .encode(&data, w16, h16, color)
+        .map_err(|e| AgentError::Lan(format!("jpeg encode: {e}")))?;
+    Ok(out)
+}
 
 /// Capture one frame from a user-selected screen and return PNG bytes.
 ///
 /// Blocking: the portal shows a "pick a screen" dialog and PipeWire delivery is
 /// synchronous. Call from `spawn_blocking`.
 pub fn capture_png_blocking() -> AgentResult<Vec<u8>> {
-    if !scap::is_supported() {
-        return Err(AgentError::Config("screen capture not supported here".to_string()));
-    }
-
-    let options = Options {
-        fps: 30,
-        show_cursor: true,
-        output_type: FrameType::BGRAFrame,
-        ..Default::default()
-    };
-    let mut capturer =
-        Capturer::build(options).map_err(|e| AgentError::Lan(format!("screencast: {e}")))?;
-
+    let mut capturer = build_capturer(30)?;
     capturer.start_capture();
     // The first frame(s) after a portal start can be blank while the stream
     // warms up; take a few and keep the last good one.

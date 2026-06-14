@@ -12,6 +12,7 @@ use base64::Engine;
 use ed25519_dalek::SigningKey;
 use tokio::net::{TcpListener, TcpStream};
 
+use rivetlink_crypto::sealed::SealedChannel;
 use rivetlink_sdk::direct;
 use rivetlink_sdk::identity::Identity;
 use rivetlink_sdk::lan::{self, Advertiser, LanRequest, LanResponse, PROTOCOL_VERSION};
@@ -109,6 +110,52 @@ async fn handle(mut stream: TcpStream, signing_key: SigningKey, auth: &LanAuth) 
                     .await
                     .map_err(|e| AgentError::Lan(e.to_string()))?;
             },
+            LanRequest::StartStream { fps } => {
+                // The stream runs until the client disconnects; then the
+                // connection is done.
+                return stream_screen(&mut stream, &channel, fps).await;
+            },
         }
     }
+}
+
+/// Capture the screen continuously and send JPEG frames over the sealed channel
+/// until the client disconnects. One portal prompt covers the whole stream.
+#[cfg(target_os = "linux")]
+async fn stream_screen(stream: &mut TcpStream, channel: &SealedChannel, fps: u16) -> AgentResult<()> {
+    // Small bounded channel: the capture thread drops frames the network can't
+    // keep up with, so we stream the freshest frame rather than build latency.
+    let (tx, mut rx) = tokio::sync::mpsc::channel::<Vec<u8>>(2);
+    let capture = tokio::task::spawn_blocking(move || {
+        crate::capture::screencast::stream_jpeg_blocking(fps, 70, tx)
+    });
+
+    while let Some(jpeg) = rx.recv().await {
+        let resp = LanResponse::Frame {
+            jpeg_b64: B64.encode(&jpeg),
+        };
+        if lan::send_response(stream, channel, &resp).await.is_err() {
+            break; // client disconnected
+        }
+    }
+
+    drop(rx); // closes the channel so the capture thread stops
+    if let Ok(Err(e)) = capture.await {
+        tracing::debug!(error = %e, "screen capture stream ended with error");
+    }
+    Ok(())
+}
+
+/// Streaming is Linux-only for now (ScreenCast portal + PipeWire).
+#[cfg(not(target_os = "linux"))]
+async fn stream_screen(
+    stream: &mut TcpStream,
+    channel: &SealedChannel,
+    _fps: u16,
+) -> AgentResult<()> {
+    let _ = lan::send_response(stream, channel, &LanResponse::Error {
+        message: "live streaming is not supported on this platform yet".to_string(),
+    })
+    .await;
+    Ok(())
 }
