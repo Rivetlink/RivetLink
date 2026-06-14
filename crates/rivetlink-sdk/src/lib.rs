@@ -12,6 +12,7 @@
 //! state machine.
 
 pub mod config;
+pub mod direct;
 pub mod error;
 pub mod identity;
 pub mod rest;
