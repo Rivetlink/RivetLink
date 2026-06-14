@@ -11,6 +11,10 @@ use crate::error::AgentResult;
 
 pub mod screenshot;
 
+// Native desktop-portal capture (Wayland + X11), Linux only.
+#[cfg(target_os = "linux")]
+pub mod portal;
+
 /// A single captured frame as raw, owned pixel data plus its dimensions.
 #[derive(Debug, Clone)]
 pub struct CapturedFrame {

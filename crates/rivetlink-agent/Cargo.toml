@@ -35,3 +35,8 @@ base64 = { workspace = true }
 
 [lints]
 workspace = true
+
+[target.'cfg(target_os = "linux")'.dependencies]
+ashpd = { version = "0.9", default-features = false, features = ["tokio"] }
+url = "2"
+png = "0.17"

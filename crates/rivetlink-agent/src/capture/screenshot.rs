@@ -20,6 +20,19 @@ pub async fn capture_png() -> AgentResult<Vec<u8>> {
     if let Some(size) = fake_capture_size() {
         return Ok(synthetic_blob(size));
     }
+
+    // Native desktop-portal capture first (Wayland + X11, no external tools).
+    // Fall back to CLI tools only if the portal is unavailable.
+    #[cfg(target_os = "linux")]
+    {
+        match super::portal::capture_png().await {
+            Ok(bytes) => return Ok(bytes),
+            Err(e) => {
+                tracing::debug!(error = %e, "desktop portal capture unavailable, trying CLI tools");
+            },
+        }
+    }
+
     tokio::task::spawn_blocking(capture_blocking)
         .await
         .map_err(|e| AgentError::Config(format!("capture task join error: {e}")))?
@@ -77,7 +90,9 @@ fn capture_blocking() -> AgentResult<Vec<u8>> {
     let tmp = temp_png_path();
     let path = tmp.to_str().unwrap_or("/tmp/rivet.png");
 
-    // Try Wayland, then two common X11 tools.
+    // CLI fallbacks for sessions without a desktop portal (headless X11,
+    // minimal wlroots). The native path is the XDG portal in `portal.rs`.
+    // grim: wlroots Wayland · scrot / import: X11.
     if run("grim", &[path]).is_ok() {
         return read_and_cleanup(&tmp);
     }
@@ -88,8 +103,9 @@ fn capture_blocking() -> AgentResult<Vec<u8>> {
         return read_and_cleanup(&tmp);
     }
     Err(AgentError::Config(
-        "no screenshot tool found (install grim, scrot, or imagemagick), \
-         or set RIVET_FAKE_CAPTURE for headless testing"
+        "no screen capture available (no desktop portal, and none of grim, \
+         scrot, or imagemagick found), or set RIVET_FAKE_CAPTURE for headless \
+         testing"
             .to_string(),
     ))
 }
