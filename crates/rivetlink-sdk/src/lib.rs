@@ -25,7 +25,7 @@ pub use client::RivetClient;
 pub use config::ClientConfig;
 pub use error::{SdkError, SdkResult};
 pub use identity::Identity;
-pub use lan::{Advertiser, LanDevice, LanRequest, LanResponse};
+pub use lan::{Advertiser, FrameDelta, LanDevice, LanRequest, LanResponse, TilePatch};
 pub use rest::Device;
 
 // Re-export the wire vocabulary integrators may need without depending on the

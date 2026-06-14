@@ -222,14 +222,37 @@ pub enum LanRequest {
     StartStream { fps: u16 },
 }
 
+/// One changed tile of a frame: its row-major index plus JPEG bytes (base64).
+#[derive(Debug, Serialize, Deserialize)]
+pub struct TilePatch {
+    pub i: u32,
+    pub jpeg_b64: String,
+}
+
+/// A delta frame: the tiles that changed since the previous frame. On a
+/// `keyframe` every tile is present, so the client can (re)build the full image
+/// and recover from any desync.
+#[derive(Debug, Serialize, Deserialize)]
+pub struct FrameDelta {
+    /// Full frame width / height in pixels.
+    pub w: u32,
+    pub h: u32,
+    /// Tile edge length in pixels (last row/column may be smaller).
+    pub tile: u32,
+    /// True when every tile is included (full image).
+    pub keyframe: bool,
+    /// Only the changed tiles (all tiles when `keyframe`).
+    pub tiles: Vec<TilePatch>,
+}
+
 /// A host response.
 #[derive(Debug, Serialize, Deserialize)]
 #[serde(tag = "ok")]
 pub enum LanResponse {
     /// A screenshot, as base64-encoded PNG bytes.
     Screenshot { png_b64: String },
-    /// One live frame, as base64-encoded JPEG bytes.
-    Frame { jpeg_b64: String },
+    /// One live frame as changed tiles (dirty-rectangle delta encoding).
+    Frame(FrameDelta),
     /// The host could not satisfy the request.
     Error { message: String },
 }
@@ -390,18 +413,17 @@ async fn fetch_screenshot(stream: &mut TcpStream, channel: &SealedChannel) -> Sd
         LanResponse::Screenshot { png_b64 } => B64
             .decode(png_b64.trim())
             .map_err(|e| SdkError::Base64(e.to_string())),
-        LanResponse::Frame { .. } => {
+        LanResponse::Frame(_) => {
             Err(SdkError::Crypto("expected screenshot, got a stream frame".to_string()))
         },
         LanResponse::Error { message } => Err(SdkError::Relay(message)),
     }
 }
 
-/// Start a live screen stream and invoke `on_frame` with each decoded JPEG
-/// frame's bytes. Returns when `on_frame` returns `false` (caller asked to
-/// stop) or the host closes the connection. Dropping the future (e.g. aborting
-/// the task) also ends the stream — the host notices the closed socket and
-/// stops capturing.
+/// Start a live screen stream and invoke `on_frame` with each delta frame.
+/// Returns when `on_frame` returns `false` (caller asked to stop) or the host
+/// closes the connection. Dropping the future (e.g. aborting the task) also
+/// ends the stream — the host notices the closed socket and stops capturing.
 pub async fn stream_frames<F>(
     stream: &mut TcpStream,
     channel: &SealedChannel,
@@ -409,16 +431,13 @@ pub async fn stream_frames<F>(
     mut on_frame: F,
 ) -> SdkResult<()>
 where
-    F: FnMut(Vec<u8>) -> bool,
+    F: FnMut(&FrameDelta) -> bool,
 {
     send_request(stream, channel, &LanRequest::StartStream { fps }).await?;
     loop {
         match recv_response(stream, channel).await? {
-            LanResponse::Frame { jpeg_b64 } => {
-                let bytes = B64
-                    .decode(jpeg_b64.trim())
-                    .map_err(|e| SdkError::Base64(e.to_string()))?;
-                if !on_frame(bytes) {
+            LanResponse::Frame(delta) => {
+                if !on_frame(&delta) {
                     return Ok(());
                 }
             },

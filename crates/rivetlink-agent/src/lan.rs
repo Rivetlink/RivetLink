@@ -123,18 +123,20 @@ async fn handle(mut stream: TcpStream, signing_key: SigningKey, auth: &LanAuth) 
 /// until the client disconnects. One portal prompt covers the whole stream.
 #[cfg(target_os = "linux")]
 async fn stream_screen(stream: &mut TcpStream, channel: &SealedChannel, fps: u16) -> AgentResult<()> {
+    use rivetlink_sdk::lan::FrameDelta;
+
     // Small bounded channel: the capture thread drops frames the network can't
     // keep up with, so we stream the freshest frame rather than build latency.
-    let (tx, mut rx) = tokio::sync::mpsc::channel::<Vec<u8>>(2);
+    let (tx, mut rx) = tokio::sync::mpsc::channel::<FrameDelta>(2);
     let capture = tokio::task::spawn_blocking(move || {
-        crate::capture::screencast::stream_jpeg_blocking(fps, 70, tx)
+        crate::capture::screencast::stream_tiles_blocking(fps, 70, tx)
     });
 
-    while let Some(jpeg) = rx.recv().await {
-        let resp = LanResponse::Frame {
-            jpeg_b64: B64.encode(&jpeg),
-        };
-        if lan::send_response(stream, channel, &resp).await.is_err() {
+    while let Some(delta) = rx.recv().await {
+        if lan::send_response(stream, channel, &LanResponse::Frame(delta))
+            .await
+            .is_err()
+        {
             break; // client disconnected
         }
     }

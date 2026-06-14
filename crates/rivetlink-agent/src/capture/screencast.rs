@@ -8,12 +8,30 @@
 //! This grabs a single frame for the screenshot path. Live streaming reuses the
 //! same capturer and keeps pulling frames.
 
+use base64::engine::general_purpose::STANDARD as B64;
+use base64::Engine;
 use jpeg_encoder::{ColorType, Encoder};
 use scap::capturer::{Capturer, Options, Resolution};
 use scap::frame::{Frame, FrameType};
 use tokio::sync::mpsc::{error::TrySendError, Sender};
 
+use rivetlink_sdk::lan::{FrameDelta, TilePatch};
+
 use crate::error::{AgentError, AgentResult};
+
+/// Tile edge length for delta encoding.
+const TILE: usize = 128;
+/// Send a full keyframe at least this often (frames) to recover from desync.
+const KEYFRAME_INTERVAL: u32 = 90;
+
+/// A tile's rectangle within a frame: frame width plus the tile's origin/size.
+struct TileRect {
+    fw: usize,
+    x: usize,
+    y: usize,
+    w: usize,
+    h: usize,
+}
 
 /// Build a screen-cast capturer (BGRA frames at `fps`, scaled to `resolution`).
 /// Triggers the portal "pick a screen" dialog.
@@ -31,31 +49,82 @@ fn build_capturer(fps: u16, resolution: Resolution) -> AgentResult<Capturer> {
     Capturer::build(options).map_err(|e| AgentError::Lan(format!("screencast: {e}")))
 }
 
-/// Capture continuously, JPEG-encode each frame, and push it to `tx` until the
-/// receiver is dropped (client disconnected) or the stream ends. Blocking — run
-/// on a dedicated thread. A single portal prompt covers the whole stream.
+/// Capture continuously and push delta frames (only the tiles that changed) to
+/// `tx` until the receiver is dropped (client disconnected) or the stream ends.
+/// Blocking — run on a dedicated thread. A single portal prompt covers the
+/// whole stream.
 ///
 /// `tx` is taken by value on purpose: dropping it when this returns closes the
 /// channel, signalling the consumer that the stream has ended.
 #[allow(clippy::needless_pass_by_value)]
-pub fn stream_jpeg_blocking(fps: u16, quality: u8, tx: Sender<Vec<u8>>) -> AgentResult<()> {
-    // Downscale to 1080p server-side: a single 4K/multi-mon source is far too
-    // much data for JPEG-over-the-wire. Real low-latency uses H.264 later.
+pub fn stream_tiles_blocking(fps: u16, quality: u8, tx: Sender<FrameDelta>) -> AgentResult<()> {
+    // Downscale to 1080p server-side; tile-delta then sends only the changed
+    // regions, so a mostly-static desktop is nearly free on the wire.
     let mut capturer = build_capturer(fps, Resolution::_1080p)?;
     capturer.start_capture();
+
+    let mut prev: Option<(usize, usize, Vec<u8>)> = None; // (w, h, BGRA)
+    let mut counter: u32 = 0;
+
     loop {
         let Ok(frame) = capturer.get_next_frame() else {
             break; // stream ended
         };
-        let jpeg = match frame_to_jpeg(frame, quality) {
-            Ok(j) => j,
-            Err(e) => {
-                tracing::debug!(error = %e, "skipping unencodable frame");
-                continue;
-            },
+        let Some((w, h, data)) = frame_to_bgra(frame) else {
+            continue;
+        };
+
+        // Keyframe on the first frame, on a resize, or periodically.
+        let dims_changed = prev.as_ref().is_none_or(|(pw, ph, _)| *pw != w || *ph != h);
+        let keyframe = dims_changed || counter.is_multiple_of(KEYFRAME_INTERVAL);
+        counter = counter.wrapping_add(1);
+
+        let cols = w.div_ceil(TILE);
+        let rows = h.div_ceil(TILE);
+        let mut tiles = Vec::new();
+
+        for ty in 0..rows {
+            for tx_col in 0..cols {
+                let (x0, y0) = (tx_col * TILE, ty * TILE);
+                let rect = TileRect {
+                    fw: w,
+                    x: x0,
+                    y: y0,
+                    w: TILE.min(w - x0),
+                    h: TILE.min(h - y0),
+                };
+
+                let changed = keyframe
+                    || prev.as_ref().is_none_or(|(_, _, pd)| tile_differs(&data, pd, &rect));
+                if !changed {
+                    continue;
+                }
+                match encode_tile(&data, &rect, quality) {
+                    Ok(jpeg) => tiles.push(TilePatch {
+                        i: u32::try_from(ty * cols + tx_col).unwrap_or(0),
+                        jpeg_b64: B64.encode(jpeg),
+                    }),
+                    Err(e) => tracing::debug!(error = %e, "skipping tile"),
+                }
+            }
+        }
+
+        prev = Some((w, h, data));
+
+        // Nothing changed and it isn't a keyframe — don't send an empty frame.
+        if tiles.is_empty() && !keyframe {
+            continue;
+        }
+
+        let delta = FrameDelta {
+            w: u32::try_from(w).unwrap_or(0),
+            h: u32::try_from(h).unwrap_or(0),
+            tile: u32::try_from(TILE).unwrap_or(0),
+            keyframe,
+            tiles,
         };
         // Drop frames the consumer can't keep up with rather than build lag.
-        match tx.try_send(jpeg) {
+        match tx.try_send(delta) {
             Ok(()) => {},
             Err(TrySendError::Full(_)) => {},
             Err(TrySendError::Closed(_)) => break, // client gone
@@ -65,30 +134,44 @@ pub fn stream_jpeg_blocking(fps: u16, quality: u8, tx: Sender<Vec<u8>>) -> Agent
     Ok(())
 }
 
-/// JPEG-encode one captured frame.
-fn frame_to_jpeg(frame: Frame, quality: u8) -> AgentResult<Vec<u8>> {
-    let (w, h, mut data, color, bpp) = match frame {
-        Frame::BGRA(f) => (f.width, f.height, f.data, ColorType::Bgra, 4),
-        Frame::BGRx(f) => (f.width, f.height, f.data, ColorType::Bgra, 4),
-        Frame::RGBx(f) => (f.width, f.height, f.data, ColorType::Rgba, 4),
-        Frame::RGB(f) => (f.width, f.height, f.data, ColorType::Rgb, 3),
-        other => {
-            return Err(AgentError::Lan(format!("unsupported frame format: {other:?}")))
-        },
+/// Convert a captured frame into a tightly-packed BGRA buffer + dimensions.
+fn frame_to_bgra(frame: Frame) -> Option<(usize, usize, Vec<u8>)> {
+    let (w, h, mut data) = match frame {
+        Frame::BGRA(f) => (f.width, f.height, f.data),
+        Frame::BGRx(f) => (f.width, f.height, f.data),
+        _ => return None, // we requested BGRA; ignore unexpected formats
     };
-    let (w16, h16) = (u16::try_from(w).unwrap_or(0), u16::try_from(h).unwrap_or(0));
-    let expected = usize::from(w16) * usize::from(h16) * bpp;
-    if w16 == 0 || h16 == 0 || data.len() < expected {
-        return Err(AgentError::Lan(format!(
-            "frame too small: {w}x{h}, {} bytes (need {expected})",
-            data.len()
-        )));
+    let w = usize::try_from(w).unwrap_or(0);
+    let h = usize::try_from(h).unwrap_or(0);
+    let expected = w * h * 4;
+    if w == 0 || h == 0 || data.len() < expected {
+        return None;
     }
-    data.truncate(expected); // drop any trailing stride padding
+    data.truncate(expected);
+    Some((w, h, data))
+}
 
+/// Whether a tile's pixels differ between the current and previous frame.
+fn tile_differs(cur: &[u8], prev: &[u8], r: &TileRect) -> bool {
+    let row_bytes = r.w * 4;
+    (0..r.h).any(|row| {
+        let start = ((r.y + row) * r.fw + r.x) * 4;
+        cur[start..start + row_bytes] != prev[start..start + row_bytes]
+    })
+}
+
+/// JPEG-encode one tile (a sub-rectangle of the BGRA frame).
+fn encode_tile(frame: &[u8], r: &TileRect, quality: u8) -> AgentResult<Vec<u8>> {
+    let row_bytes = r.w * 4;
+    let mut buf = Vec::with_capacity(r.w * r.h * 4);
+    for row in 0..r.h {
+        let start = ((r.y + row) * r.fw + r.x) * 4;
+        buf.extend_from_slice(&frame[start..start + row_bytes]);
+    }
+    let (tw16, th16) = (u16::try_from(r.w).unwrap_or(0), u16::try_from(r.h).unwrap_or(0));
     let mut out = Vec::new();
     Encoder::new(&mut out, quality)
-        .encode(&data, w16, h16, color)
+        .encode(&buf, tw16, th16, ColorType::Bgra)
         .map_err(|e| AgentError::Lan(format!("jpeg encode: {e}")))?;
     Ok(out)
 }
