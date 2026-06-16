@@ -135,7 +135,19 @@ where
     let Wire::Pake { msg } = read_msg(stream).await? else {
         return Err(SdkError::Crypto("expected pake message".to_string()));
     };
-    let peer_msg = decode(&msg)?;
+    host_password_continue(stream, password, &msg).await
+}
+
+/// Finish the PAKE handshake after the client's first message has been read.
+async fn host_password_continue<S>(
+    stream: &mut S,
+    password: &str,
+    peer_msg_b64: &str,
+) -> SdkResult<SealedChannel>
+where
+    S: AsyncRead + AsyncWrite + Unpin,
+{
+    let peer_msg = decode(peer_msg_b64)?;
 
     let started = pake::start(password.as_bytes());
     write_msg(stream, &Wire::Pake { msg: B64.encode(&started.message) }).await?;
@@ -206,12 +218,29 @@ where
     let Wire::Kex { eph, id, sig } = read_msg(stream).await? else {
         return Err(SdkError::Crypto("expected key exchange".to_string()));
     };
-    let client_id = parse_identity(&id)?;
-    let client_eph = decode_n::<32>(&eph)?;
-    handshake::verify_peer(&client_id, &client_eph, &decode_n::<64>(&sig)?)
+    host_key_continue(stream, identity, trust, &eph, &id, &sig).await
+}
+
+/// Finish the signed key exchange after the client's first message has been
+/// read. `trust` decides whether the client's identity is allowed.
+async fn host_key_continue<S, F>(
+    stream: &mut S,
+    identity: &Identity,
+    trust: F,
+    eph: &str,
+    id: &str,
+    sig: &str,
+) -> SdkResult<(SealedChannel, String)>
+where
+    S: AsyncRead + AsyncWrite + Unpin,
+    F: FnOnce(&str) -> bool,
+{
+    let client_id = parse_identity(id)?;
+    let client_eph = decode_n::<32>(eph)?;
+    handshake::verify_peer(&client_id, &client_eph, &decode_n::<64>(sig)?)
         .map_err(|e| SdkError::Crypto(format!("client key exchange invalid: {e}")))?;
 
-    if !trust(&id) {
+    if !trust(id) {
         return Err(SdkError::Crypto("client not trusted".to_string()));
     }
 
@@ -226,7 +255,38 @@ where
     )
     .await?;
 
-    Ok((kex.into_channel(&client_eph), id))
+    Ok((kex.into_channel(&client_eph), id.to_string()))
+}
+
+/// Host side that accepts EITHER mode in one session: it reads the client's
+/// first message and runs the PAKE handshake (the client used a password) or the
+/// signed key exchange (the client used its identity key). For key mode `trust`
+/// gates the client and the returned `Option<String>` is its identity; for
+/// password mode it is `None`.
+pub async fn host_accept_auto<S, F>(
+    stream: &mut S,
+    identity: &Identity,
+    password: &str,
+    trust: F,
+) -> SdkResult<(SealedChannel, Option<String>)>
+where
+    S: AsyncRead + AsyncWrite + Unpin,
+    F: FnOnce(&str) -> bool,
+{
+    match read_msg(stream).await? {
+        Wire::Pake { msg } => {
+            let channel = host_password_continue(stream, password, &msg).await?;
+            Ok((channel, None))
+        },
+        Wire::Kex { eph, id, sig } => {
+            let (channel, client_id) =
+                host_key_continue(stream, identity, trust, &eph, &id, &sig).await?;
+            Ok((channel, Some(client_id)))
+        },
+        Wire::Confirm { .. } => {
+            Err(SdkError::Crypto("unexpected confirmation as first message".to_string()))
+        },
+    }
 }
 
 #[cfg(test)]
@@ -293,6 +353,53 @@ mod tests {
             host_accept_key(&mut h, &host_id, |_| false).await
         });
         // Host rejects, so the client's read of the host's Kex fails (EOF).
+        let client = client_connect_key(&mut c, &client_id, None).await;
+        assert!(host.await.unwrap().is_err());
+        assert!(client.is_err());
+    }
+
+    #[tokio::test]
+    async fn auto_accepts_password_client() {
+        let host_id = temp_identity("ha");
+        let (mut c, mut h) = pipe();
+        let host = tokio::spawn(async move {
+            host_accept_auto(&mut h, &host_id, "4821", |_| false).await
+        });
+        let client_ch = client_connect_password(&mut c, "4821").await.unwrap();
+        let (host_ch, who) = host.await.unwrap().unwrap();
+
+        assert!(who.is_none()); // password mode reports no identity
+        let sealed = client_ch.seal(b"hi").unwrap();
+        assert_eq!(host_ch.open(&sealed).unwrap(), b"hi");
+    }
+
+    #[tokio::test]
+    async fn auto_accepts_trusted_key_client() {
+        let client_id = temp_identity("ca");
+        let host_id = temp_identity("hb");
+        let client_pub = client_id.public_key_b64();
+
+        let (mut c, mut h) = pipe();
+        let host = tokio::spawn(async move {
+            // Wrong password on purpose: the trusted key must be what lets it in.
+            host_accept_auto(&mut h, &host_id, "0000", |_| true).await
+        });
+        let client_ch = client_connect_key(&mut c, &client_id, None).await.unwrap();
+        let (host_ch, who) = host.await.unwrap().unwrap();
+
+        assert_eq!(who.as_deref(), Some(client_pub.as_str()));
+        let sealed = host_ch.seal(b"yo").unwrap();
+        assert_eq!(client_ch.open(&sealed).unwrap(), b"yo");
+    }
+
+    #[tokio::test]
+    async fn auto_rejects_untrusted_key_client() {
+        let client_id = temp_identity("cc");
+        let host_id = temp_identity("hc");
+        let (mut c, mut h) = pipe();
+        let host = tokio::spawn(async move {
+            host_accept_auto(&mut h, &host_id, "4821", |_| false).await
+        });
         let client = client_connect_key(&mut c, &client_id, None).await;
         assert!(host.await.unwrap().is_err());
         assert!(client.is_err());

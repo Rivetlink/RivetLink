@@ -45,6 +45,17 @@ pub enum LanAuth {
         trusted: TrustedClients,
         auto_accept: bool,
     },
+    /// Accept either a correct `pin` (SPAKE2) OR a client whose identity key is
+    /// in `trusted_keys` (base64). The client picks: an empty PIN means it
+    /// connects with its key, which is allowed only if it's trusted. The list is
+    /// shared so the embedding app can update it live (add/remove a device)
+    /// without restarting the host. Used by the desktop host so a remembered
+    /// device skips the session code.
+    PinOrKey {
+        pin: String,
+        trusted_keys: Arc<std::sync::Mutex<Vec<String>>>,
+        auto_accept: bool,
+    },
 }
 
 /// Bind, advertise, and serve LAN screenshot sessions until the task is
@@ -150,6 +161,29 @@ async fn handle(
                 .map_err(|e| AgentError::Lan(e.to_string()))?;
             tracing::info!(client = %client_id, "LAN client accepted (key mode)");
             (channel, client_id.clone())
+        },
+        LanAuth::PinOrKey {
+            pin,
+            trusted_keys,
+            auto_accept,
+        } => {
+            let identity = Identity::from_signing_key(signing_key);
+            let (channel, client_id) =
+                direct::host_accept_auto(&mut stream, &identity, pin, |id| {
+                    *auto_accept
+                        || trusted_keys
+                            .lock()
+                            .is_ok_and(|keys| keys.iter().any(|k| k == id))
+                })
+                .await
+                .map_err(|e| AgentError::Lan(e.to_string()))?;
+            match client_id {
+                Some(id) => {
+                    tracing::info!(client = %id, "LAN client accepted (trusted key)");
+                    (channel, id)
+                },
+                None => (channel, peer.ip().to_string()),
+            }
         },
     };
 
