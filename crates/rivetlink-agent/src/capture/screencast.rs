@@ -58,9 +58,10 @@ fn build_capturer(fps: u16, resolution: Resolution) -> AgentResult<Capturer> {
 /// channel, signalling the consumer that the stream has ended.
 #[allow(clippy::needless_pass_by_value)]
 pub fn stream_tiles_blocking(fps: u16, quality: u8, tx: Sender<FrameDelta>) -> AgentResult<()> {
-    // Downscale to 1080p server-side; tile-delta then sends only the changed
-    // regions, so a mostly-static desktop is nearly free on the wire.
-    let mut capturer = build_capturer(fps, Resolution::_1080p)?;
+    // Downscale to 720p server-side; tile-delta then sends only the changed
+    // regions, so a mostly-static desktop is nearly free on the wire. 720p
+    // keeps the initial keyframe small enough to stay usable over weak Wi-Fi.
+    let mut capturer = build_capturer(fps, Resolution::_720p)?;
     capturer.start_capture();
 
     let mut prev: Option<(usize, usize, Vec<u8>)> = None; // (w, h, BGRA)

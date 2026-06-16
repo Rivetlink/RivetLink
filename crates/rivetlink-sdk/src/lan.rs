@@ -36,6 +36,12 @@ pub const SERVICE_TYPE: &str = "_rivetlink._tcp.local.";
 /// compatibility checks once version negotiation lands.
 pub const PROTOCOL_VERSION: u16 = 1;
 
+/// Default TCP port a host listens on. A *stable* port (not an OS-assigned 0)
+/// so a remembered device keeps reconnecting to the same address and a restart
+/// doesn't churn the advertised port. The host falls back to an OS-assigned
+/// port only if this one is already taken.
+pub const DEFAULT_LAN_PORT: u16 = 47823;
+
 const TXT_NAME: &str = "name";
 const TXT_PUBKEY: &str = "pk";
 const TXT_VERSION: &str = "v";
@@ -106,7 +112,14 @@ fn discover_blocking(timeout: Duration) -> SdkResult<Vec<LanDevice>> {
         match rx.recv_timeout(remaining) {
             Ok(ServiceEvent::ServiceResolved(info)) => {
                 if let Some(dev) = device_from_info(&info) {
-                    found.insert(info.get_fullname().to_string(), dev);
+                    // Dedup by host identity, not mDNS name: a restarted host
+                    // can linger under a renamed instance ("Name (2)") or a new
+                    // port, but it's the same device. Keep the latest resolved.
+                    let key = dev
+                        .public_key
+                        .clone()
+                        .unwrap_or_else(|| info.get_fullname().to_string());
+                    found.insert(key, dev);
                 }
             },
             Ok(_) => {},

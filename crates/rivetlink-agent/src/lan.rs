@@ -69,7 +69,7 @@ pub async fn serve_with_events(
     auth: LanAuth,
     events: Option<Sender<HostEvent>>,
 ) -> AgentResult<()> {
-    let listener = TcpListener::bind(("0.0.0.0", port)).await?;
+    let listener = bind_listener(port).await?;
     let local_port = listener.local_addr()?.port();
     let pubkey_b64 = B64.encode(signing_key.verifying_key().as_bytes());
 
@@ -85,16 +85,41 @@ pub async fn serve_with_events(
     );
 
     let auth = Arc::new(auth);
+    // Sessions live in a JoinSet owned by this future. Cancelling serve
+    // (dropping the future — e.g. the desktop app stopping the host) drops the
+    // set, which aborts every active session and closes its socket, so the
+    // connected client disconnects instead of streaming on forever.
+    let mut sessions = tokio::task::JoinSet::new();
     loop {
-        let (stream, peer) = listener.accept().await?;
-        let signing_key = signing_key.clone();
-        let auth = Arc::clone(&auth);
-        let events = events.clone();
-        tokio::spawn(async move {
-            if let Err(e) = handle(stream, signing_key, &auth, peer, events).await {
-                tracing::warn!(%peer, error = %e, "LAN session ended with error");
-            }
-        });
+        tokio::select! {
+            accepted = listener.accept() => {
+                let (stream, peer) = accepted?;
+                let signing_key = signing_key.clone();
+                let auth = Arc::clone(&auth);
+                let events = events.clone();
+                sessions.spawn(async move {
+                    if let Err(e) = handle(stream, signing_key, &auth, peer, events).await {
+                        tracing::warn!(%peer, error = %e, "LAN session ended with error");
+                    }
+                });
+            },
+            // Reap finished sessions so the set doesn't grow unbounded.
+            Some(_) = sessions.join_next(), if !sessions.is_empty() => {},
+        }
+    }
+}
+
+/// Bind the requested port; if it's already taken, fall back to an OS-assigned
+/// port so a stale socket never blocks hosting (the real port is advertised
+/// over mDNS either way). Port 0 means "OS-assigned" up front.
+async fn bind_listener(port: u16) -> AgentResult<TcpListener> {
+    match TcpListener::bind(("0.0.0.0", port)).await {
+        Ok(listener) => Ok(listener),
+        Err(e) if port != 0 && e.kind() == std::io::ErrorKind::AddrInUse => {
+            tracing::warn!(port, "LAN port busy, falling back to an OS-assigned port");
+            Ok(TcpListener::bind(("0.0.0.0", 0)).await?)
+        },
+        Err(e) => Err(e.into()),
     }
 }
 
@@ -176,7 +201,9 @@ async fn stream_screen(stream: &mut TcpStream, channel: &SealedChannel, fps: u16
     // keep up with, so we stream the freshest frame rather than build latency.
     let (tx, mut rx) = tokio::sync::mpsc::channel::<FrameDelta>(2);
     let capture = tokio::task::spawn_blocking(move || {
-        crate::capture::screencast::stream_tiles_blocking(fps, 70, tx)
+        // 720p + moderate JPEG quality keeps the keyframe small enough to stay
+        // usable over a weak Wi-Fi link; deltas after that are tiny.
+        crate::capture::screencast::stream_tiles_blocking(fps, 60, tx)
     });
 
     while let Some(delta) = rx.recv().await {
