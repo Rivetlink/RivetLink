@@ -11,6 +11,7 @@ use base64::engine::general_purpose::STANDARD as B64;
 use base64::Engine;
 use ed25519_dalek::SigningKey;
 use tokio::net::{TcpListener, TcpStream};
+use tokio::sync::mpsc::Sender;
 
 use rivetlink_crypto::sealed::SealedChannel;
 use rivetlink_sdk::direct;
@@ -20,6 +21,18 @@ use rivetlink_sdk::lan::{self, Advertiser, LanRequest, LanResponse, PROTOCOL_VER
 use crate::capture::screenshot;
 use crate::error::{AgentError, AgentResult};
 use crate::trusted::TrustedClients;
+
+/// A change in LAN host session state, for an embedding app to drive its UI.
+/// The CLI agent ignores these (it logs instead); a desktop host surfaces them
+/// as "waiting" / "connected" status.
+#[derive(Debug, Clone)]
+pub enum HostEvent {
+    /// A client finished the handshake and now holds a session. The string is a
+    /// short label (peer address in PIN mode, client identity in key mode).
+    ClientConnected(String),
+    /// A client's session ended (disconnect or error).
+    ClientDisconnected,
+}
 
 /// How a LAN host authenticates incoming clients.
 #[derive(Debug)]
@@ -42,6 +55,20 @@ pub async fn serve(
     port: u16,
     auth: LanAuth,
 ) -> AgentResult<()> {
+    serve_with_events(signing_key, device_name, port, auth, None).await
+}
+
+/// Like [`serve`], but reports session lifecycle on `events` (if given) so an
+/// embedding desktop app can show "waiting" / "connected". Cancel by dropping
+/// the future (aborting the task): the listener and mDNS advertisement are
+/// released on drop.
+pub async fn serve_with_events(
+    signing_key: SigningKey,
+    device_name: String,
+    port: u16,
+    auth: LanAuth,
+    events: Option<Sender<HostEvent>>,
+) -> AgentResult<()> {
     let listener = TcpListener::bind(("0.0.0.0", port)).await?;
     let local_port = listener.local_addr()?.port();
     let pubkey_b64 = B64.encode(signing_key.verifying_key().as_bytes());
@@ -62,19 +89,29 @@ pub async fn serve(
         let (stream, peer) = listener.accept().await?;
         let signing_key = signing_key.clone();
         let auth = Arc::clone(&auth);
+        let events = events.clone();
         tokio::spawn(async move {
-            if let Err(e) = handle(stream, signing_key, &auth).await {
+            if let Err(e) = handle(stream, signing_key, &auth, peer, events).await {
                 tracing::warn!(%peer, error = %e, "LAN session ended with error");
             }
         });
     }
 }
 
-async fn handle(mut stream: TcpStream, signing_key: SigningKey, auth: &LanAuth) -> AgentResult<()> {
-    let channel = match auth {
-        LanAuth::Password(pin) => direct::host_accept_password(&mut stream, pin)
-            .await
-            .map_err(|e| AgentError::Lan(e.to_string()))?,
+async fn handle(
+    mut stream: TcpStream,
+    signing_key: SigningKey,
+    auth: &LanAuth,
+    peer: std::net::SocketAddr,
+    events: Option<Sender<HostEvent>>,
+) -> AgentResult<()> {
+    let (channel, label) = match auth {
+        LanAuth::Password(pin) => {
+            let channel = direct::host_accept_password(&mut stream, pin)
+                .await
+                .map_err(|e| AgentError::Lan(e.to_string()))?;
+            (channel, peer.ip().to_string())
+        },
         LanAuth::Key {
             trusted,
             auto_accept,
@@ -87,13 +124,24 @@ async fn handle(mut stream: TcpStream, signing_key: SigningKey, auth: &LanAuth) 
                 .await
                 .map_err(|e| AgentError::Lan(e.to_string()))?;
             tracing::info!(client = %client_id, "LAN client accepted (key mode)");
-            channel
+            (channel, client_id.clone())
         },
     };
 
-    // Serve requests until the client disconnects (a read error ends the loop).
+    if let Some(ev) = &events {
+        let _ = ev.send(HostEvent::ClientConnected(label)).await;
+    }
+    let result = serve_loop(&mut stream, &channel).await;
+    if let Some(ev) = &events {
+        let _ = ev.send(HostEvent::ClientDisconnected).await;
+    }
+    result
+}
+
+/// Serve requests on an established channel until the client disconnects.
+async fn serve_loop(stream: &mut TcpStream, channel: &SealedChannel) -> AgentResult<()> {
     loop {
-        let Ok(req) = lan::recv_request(&mut stream, &channel).await else {
+        let Ok(req) = lan::recv_request(stream, channel).await else {
             return Ok(());
         };
         match req {
@@ -106,14 +154,13 @@ async fn handle(mut stream: TcpStream, signing_key: SigningKey, auth: &LanAuth) 
                         message: e.to_string(),
                     },
                 };
-                lan::send_response(&mut stream, &channel, &resp)
+                lan::send_response(stream, channel, &resp)
                     .await
                     .map_err(|e| AgentError::Lan(e.to_string()))?;
             },
             LanRequest::StartStream { fps } => {
-                // The stream runs until the client disconnects; then the
-                // connection is done.
-                return stream_screen(&mut stream, &channel, fps).await;
+                // The stream runs until the client disconnects; then done.
+                return stream_screen(stream, channel, fps).await;
             },
         }
     }
