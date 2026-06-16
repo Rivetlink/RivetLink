@@ -8,6 +8,8 @@
 //! This grabs a single frame for the screenshot path. Live streaming reuses the
 //! same capturer and keeps pulling frames.
 
+use std::time::{Duration, Instant};
+
 use base64::engine::general_purpose::STANDARD as B64;
 use base64::Engine;
 use jpeg_encoder::{ColorType, Encoder};
@@ -23,6 +25,10 @@ use crate::error::{AgentError, AgentResult};
 const TILE: usize = 128;
 /// Send a full keyframe at least this often (frames) to recover from desync.
 const KEYFRAME_INTERVAL: u32 = 90;
+/// When the screen is static, still emit a tiny empty frame at least this often
+/// so the client can tell a static screen ("alive, nothing moving") from a
+/// stalled/slow link — it drives the viewer's "poor connection" indicator.
+const HEARTBEAT: Duration = Duration::from_millis(1000);
 
 /// A tile's rectangle within a frame: frame width plus the tile's origin/size.
 struct TileRect {
@@ -66,6 +72,7 @@ pub fn stream_tiles_blocking(fps: u16, quality: u8, tx: Sender<FrameDelta>) -> A
 
     let mut prev: Option<(usize, usize, Vec<u8>)> = None; // (w, h, BGRA)
     let mut counter: u32 = 0;
+    let mut last_sent = Instant::now();
 
     loop {
         let Ok(frame) = capturer.get_next_frame() else {
@@ -112,8 +119,10 @@ pub fn stream_tiles_blocking(fps: u16, quality: u8, tx: Sender<FrameDelta>) -> A
 
         prev = Some((w, h, data));
 
-        // Nothing changed and it isn't a keyframe — don't send an empty frame.
-        if tiles.is_empty() && !keyframe {
+        // Nothing changed and it isn't a keyframe: usually skip, but emit a tiny
+        // empty heartbeat frame at most once per HEARTBEAT so the client can
+        // tell a static screen from a stalled/slow link.
+        if tiles.is_empty() && !keyframe && last_sent.elapsed() < HEARTBEAT {
             continue;
         }
 
@@ -126,7 +135,7 @@ pub fn stream_tiles_blocking(fps: u16, quality: u8, tx: Sender<FrameDelta>) -> A
         };
         // Drop frames the consumer can't keep up with rather than build lag.
         match tx.try_send(delta) {
-            Ok(()) => {},
+            Ok(()) => last_sent = Instant::now(),
             Err(TrySendError::Full(_)) => {},
             Err(TrySendError::Closed(_)) => break, // client gone
         }
