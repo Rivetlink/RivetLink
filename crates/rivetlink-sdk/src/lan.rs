@@ -333,13 +333,24 @@ where
 
 // ---- High-level client helpers ---------------------------------------------
 
+/// Open a TCP connection with Nagle's algorithm disabled. Live streaming sends
+/// many small sealed frames; Nagle would coalesce them and, combined with
+/// delayed-ACK, add bursty ~40-200ms stalls — the exact "hiccup every second"
+/// you feel on a real-time screen share. `TCP_NODELAY` ships each frame at once.
+async fn connect_nodelay(addr: SocketAddr) -> SdkResult<TcpStream> {
+    let stream = TcpStream::connect(addr).await?;
+    // Best-effort: a missing TCP_NODELAY only costs latency, never correctness.
+    let _ = stream.set_nodelay(true);
+    Ok(stream)
+}
+
 /// Connect + handshake (PIN/PAKE), returning the raw stream and sealed channel
 /// so the caller can drive any request/response flow (screenshot or stream).
 pub async fn connect_password(
     addr: SocketAddr,
     password: &str,
 ) -> SdkResult<(TcpStream, SealedChannel)> {
-    let mut stream = TcpStream::connect(addr).await?;
+    let mut stream = connect_nodelay(addr).await?;
     let channel = direct::client_connect_password(&mut stream, password).await?;
     Ok((stream, channel))
 }
@@ -352,7 +363,7 @@ pub async fn connect_key_pinned(
     pinned_host_b64: Option<&str>,
 ) -> SdkResult<(TcpStream, SealedChannel)> {
     let pinned = parse_pinned_host(pinned_host_b64)?;
-    let mut stream = TcpStream::connect(addr).await?;
+    let mut stream = connect_nodelay(addr).await?;
     let channel = direct::client_connect_key(&mut stream, identity, pinned).await?;
     Ok((stream, channel))
 }
@@ -372,7 +383,7 @@ pub async fn screenshot_key(
     identity: &Identity,
     pinned_host: Option<VerifyingKey>,
 ) -> SdkResult<Vec<u8>> {
-    let mut stream = TcpStream::connect(addr).await?;
+    let mut stream = connect_nodelay(addr).await?;
     let channel = direct::client_connect_key(&mut stream, identity, pinned_host).await?;
     fetch_screenshot(&mut stream, &channel).await
 }

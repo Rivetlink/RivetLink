@@ -105,6 +105,9 @@ pub async fn serve_with_events(
         tokio::select! {
             accepted = listener.accept() => {
                 let (stream, peer) = accepted?;
+                // Disable Nagle: live streaming pushes many small sealed frames;
+                // coalescing them adds bursty stalls to the real-time view.
+                let _ = stream.set_nodelay(true);
                 let signing_key = signing_key.clone();
                 let auth = Arc::clone(&auth);
                 let events = events.clone();

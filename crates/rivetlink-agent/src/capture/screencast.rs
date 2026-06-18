@@ -23,8 +23,13 @@ use crate::error::{AgentError, AgentResult};
 
 /// Tile edge length for delta encoding.
 const TILE: usize = 128;
-/// Send a full keyframe at least this often (frames) to recover from desync.
-const KEYFRAME_INTERVAL: u32 = 90;
+/// Send a full keyframe at least this often (frames) as a safety net. We only
+/// commit `prev` on a successful send, so dropped frames already self-heal
+/// (the next frame re-diffs against the last *sent* state). This rare keyframe
+/// only guards the residual case — a tile skipped by an encode error. Keeping
+/// it rare avoids the periodic full-screen spike that showed up as a ~1s
+/// hiccup, especially while the mouse was moving.
+const KEYFRAME_INTERVAL: u32 = 600;
 /// When the screen is static, still emit a tiny empty frame at least this often
 /// so the client can tell a static screen ("alive, nothing moving") from a
 /// stalled/slow link — it drives the viewer's "poor connection" indicator.
@@ -90,6 +95,8 @@ pub fn stream_tiles_blocking(fps: u16, quality: u8, tx: Sender<FrameDelta>) -> A
         let cols = w.div_ceil(TILE);
         let rows = h.div_ceil(TILE);
         let mut tiles = Vec::new();
+        let mut jpeg_bytes = 0usize;
+        let encode_start = Instant::now();
 
         for ty in 0..rows {
             for tx_col in 0..cols {
@@ -108,24 +115,28 @@ pub fn stream_tiles_blocking(fps: u16, quality: u8, tx: Sender<FrameDelta>) -> A
                     continue;
                 }
                 match encode_tile(&data, &rect, quality) {
-                    Ok(jpeg) => tiles.push(TilePatch {
-                        i: u32::try_from(ty * cols + tx_col).unwrap_or(0),
-                        jpeg_b64: B64.encode(jpeg),
-                    }),
+                    Ok(jpeg) => {
+                        jpeg_bytes += jpeg.len();
+                        tiles.push(TilePatch {
+                            i: u32::try_from(ty * cols + tx_col).unwrap_or(0),
+                            jpeg_b64: B64.encode(jpeg),
+                        });
+                    },
                     Err(e) => tracing::debug!(error = %e, "skipping tile"),
                 }
             }
         }
-
-        prev = Some((w, h, data));
+        let encode_us = encode_start.elapsed().as_micros();
 
         // Nothing changed and it isn't a keyframe: usually skip, but emit a tiny
         // empty heartbeat frame at most once per HEARTBEAT so the client can
-        // tell a static screen from a stalled/slow link.
+        // tell a static screen from a stalled/slow link. `prev` is unchanged — a
+        // frame with no differing tiles already matches it.
         if tiles.is_empty() && !keyframe && last_sent.elapsed() < HEARTBEAT {
             continue;
         }
 
+        let tile_count = tiles.len();
         let delta = FrameDelta {
             w: u32::try_from(w).unwrap_or(0),
             h: u32::try_from(h).unwrap_or(0),
@@ -133,10 +144,20 @@ pub fn stream_tiles_blocking(fps: u16, quality: u8, tx: Sender<FrameDelta>) -> A
             keyframe,
             tiles,
         };
-        // Drop frames the consumer can't keep up with rather than build lag.
+        // Drop frames the consumer can't keep up with rather than build lag. Only
+        // commit `prev` once a frame is actually queued: if it's dropped, the
+        // next frame still diffs against the last *sent* state, so accumulated
+        // changes get resent instead of silently desyncing the client. That
+        // self-healing is what lets keyframes stay rare.
         match tx.try_send(delta) {
-            Ok(()) => last_sent = Instant::now(),
-            Err(TrySendError::Full(_)) => {},
+            Ok(()) => {
+                last_sent = Instant::now();
+                prev = Some((w, h, data));
+                tracing::debug!(keyframe, tiles = tile_count, encode_us, jpeg_bytes, "lan frame sent");
+            },
+            Err(TrySendError::Full(_)) => {
+                tracing::debug!(tiles = tile_count, "lan frame dropped (consumer behind)");
+            },
             Err(TrySendError::Closed(_)) => break, // client gone
         }
     }
