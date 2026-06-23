@@ -317,7 +317,8 @@ mod macos {
             Some(id) => displays.find(|t| matches!(t, scap::Target::Display(d) if d.id == id)),
             None => displays.next(),
         };
-        tracing::info!(requested = ?display, picked = target.is_some(), "screencast(macos): target");
+        let req = display; // `display` is a reserved token in tracing fields
+        tracing::info!(requested = ?req, picked = target.is_some(), "screencast(macos): target");
 
         let options = Options {
             fps: u32::from(fps).max(1),
