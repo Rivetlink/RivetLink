@@ -32,20 +32,28 @@ ed25519-dalek = { workspace = true }
 x25519-dalek = { workspace = true }
 rand_08 = { workspace = true }
 base64 = { workspace = true }
-# Screen capture: ScreenCast portal + PipeWire on Linux, ScreenCaptureKit on
-# macOS (where we pick the primary display programmatically — no picker dialog).
-# Windows stays client-only for now (scap's Windows capture backend doesn't build).
-scap = "0.0.8"
 # Live-stream frames are JPEG tile-deltas on both host platforms, so this is general.
 jpeg-encoder = "0.6"
 
 [lints]
 workspace = true
 
+# macOS live capture: ScreenCaptureKit via scap (we pick the display
+# programmatically — no picker dialog). Linux does NOT use scap: its libspa
+# binding (PipeWire ~1.0) can't negotiate a stream with newer PipeWire daemons
+# (Ubuntu 25.10+/26.04 ship 1.6+), and it won't even build against those
+# headers. Linux capture goes through Mutter ScreenCast + GStreamer instead
+# (see capture/mutter.rs) — version-proof and dialog-free. Windows stays
+# client-only (scap's Windows backend doesn't build).
+[target.'cfg(target_os = "macos")'.dependencies]
+scap = "0.0.8"
+
 [target.'cfg(target_os = "linux")'.dependencies]
 # ashpd: the full-desktop Screenshot-portal fallback (Linux screenshot path).
-# png: one-shot screenshot encoding via the ScreenCast portal (Linux only;
-# macOS/Windows screenshots shell out to native tools).
+# png: one-shot screenshot encoding (Linux screenshot fallback).
 ashpd = { version = "0.9", default-features = false, features = ["tokio"] }
 png = "0.17"
 url = "2"
+# zbus: talk to GNOME Mutter's ScreenCast D-Bus API to start a dialog-free
+# screen cast and get a PipeWire node id. Shares tokio with the rest of the app.
+zbus = { version = "4", default-features = false, features = ["tokio"] }

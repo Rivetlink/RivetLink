@@ -22,18 +22,12 @@ pub async fn capture_png() -> AgentResult<Vec<u8>> {
     }
 
     // Native capture, no external tools:
-    //  1. ScreenCast portal + PipeWire — one user-picked screen (preferred).
-    //  2. Screenshot portal — whole desktop (fallback).
-    //  3. CLI tools — last resort (headless X11 / minimal wlroots).
+    //  1. Screenshot portal — whole desktop (preferred; works on GNOME/Wayland).
+    //  2. CLI tools — last resort (headless X11 / minimal wlroots).
+    // (Live streaming uses Mutter ScreenCast + GStreamer; the one-shot
+    // screenshot stays on the portal, which needs no PipeWire negotiation.)
     #[cfg(target_os = "linux")]
     {
-        match tokio::task::spawn_blocking(super::screencast::capture_png_blocking).await {
-            Ok(Ok(bytes)) => return Ok(bytes),
-            Ok(Err(e)) => {
-                tracing::debug!(error = %e, "screencast capture failed, trying portal screenshot");
-            },
-            Err(e) => tracing::debug!(error = %e, "screencast task join failed"),
-        }
         match super::portal::capture_png().await {
             Ok(bytes) => return Ok(bytes),
             Err(e) => {

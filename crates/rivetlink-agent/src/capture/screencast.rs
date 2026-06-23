@@ -1,39 +1,88 @@
-//! Native single-screen capture via the XDG ScreenCast portal + PipeWire.
+//! Live single-screen capture for the tile-delta stream.
 //!
-//! Uses `scap`, which drives the desktop portal (the user picks **one** screen
-//! in the compositor's own dialog) and reads frames over PipeWire — the same
-//! mechanism RustDesk/TeamViewer use on Wayland. Nothing extra is installed:
-//! only the PipeWire runtime, which ships with every modern Linux desktop.
+//! The pixel source is platform-specific:
+//! - **macOS**: `scap` (ScreenCaptureKit). We pick the display programmatically,
+//!   so capture starts with no picker dialog and the client can switch screens.
+//! - **Linux**: GNOME **Mutter ScreenCast** (D-Bus) + **GStreamer** — see
+//!   [`crate::capture::mutter`]. Dialog-free, monitor-selectable, and version-
+//!   proof against the host's PipeWire (scap's old libspa can't talk to PipeWire
+//!   1.6+ on Ubuntu 26.04).
 //!
-//! This grabs a single frame for the screenshot path. Live streaming reuses the
-//! same capturer and keeps pulling frames.
+//! The frame **encoding** (downscale-aware tile-delta JPEG) is shared by both
+//! backends via [`TileEncoder`]: each backend just decodes its native frame to a
+//! tightly-packed BGRA/BGRx buffer and pushes it in.
 
 use std::time::{Duration, Instant};
 
 use base64::engine::general_purpose::STANDARD as B64;
 use base64::Engine;
 use jpeg_encoder::{ColorType, Encoder};
-use scap::capturer::{Capturer, Options, Resolution};
-use scap::frame::{Frame, FrameType};
 use tokio::sync::mpsc::{error::TrySendError, Sender};
 
 use rivetlink_sdk::lan::{DisplayInfo, FrameDelta, TilePatch};
 
-use crate::error::{AgentError, AgentResult};
+use crate::error::AgentResult;
 
 /// Tile edge length for delta encoding.
 const TILE: usize = 128;
 /// Send a full keyframe at least this often (frames) as a safety net. We only
-/// commit `prev` on a successful send, so dropped frames already self-heal
-/// (the next frame re-diffs against the last *sent* state). This rare keyframe
-/// only guards the residual case — a tile skipped by an encode error. Keeping
-/// it rare avoids the periodic full-screen spike that showed up as a ~1s
-/// hiccup, especially while the mouse was moving.
+/// commit `prev` on a successful send, so dropped frames already self-heal (the
+/// next frame re-diffs against the last *sent* state). This rare keyframe only
+/// guards the residual case — a tile skipped by an encode error.
 const KEYFRAME_INTERVAL: u32 = 600;
 /// When the screen is static, still emit a tiny empty frame at least this often
-/// so the client can tell a static screen ("alive, nothing moving") from a
-/// stalled/slow link — it drives the viewer's "poor connection" indicator.
+/// so the client can tell a static screen from a stalled/slow link.
 const HEARTBEAT: Duration = Duration::from_millis(1000);
+
+// ---- Public API (platform-dispatched) --------------------------------------
+
+/// The displays the host can offer to share.
+pub fn list_displays() -> Vec<DisplayInfo> {
+    #[cfg(target_os = "macos")]
+    {
+        macos::list_displays()
+    }
+    #[cfg(target_os = "linux")]
+    {
+        crate::capture::mutter::list_displays()
+    }
+    #[cfg(not(any(target_os = "macos", target_os = "linux")))]
+    {
+        Vec::new()
+    }
+}
+
+/// Capture `display` continuously and push delta frames to `tx` until the
+/// receiver is dropped (client disconnected) or the stream ends. Blocking — run
+/// on a dedicated thread. `display` selects the screen (`None` = primary).
+///
+/// `tx` is taken by value: dropping it on return closes the channel, signalling
+/// the consumer that the stream ended.
+#[allow(clippy::needless_pass_by_value)]
+pub fn stream_tiles_blocking(
+    fps: u16,
+    quality: u8,
+    display: Option<u32>,
+    tx: Sender<FrameDelta>,
+) -> AgentResult<()> {
+    #[cfg(target_os = "macos")]
+    {
+        macos::stream(fps, quality, display, tx)
+    }
+    #[cfg(target_os = "linux")]
+    {
+        crate::capture::mutter::stream(fps, quality, display, tx)
+    }
+    #[cfg(not(any(target_os = "macos", target_os = "linux")))]
+    {
+        let _ = (fps, quality, display, tx);
+        Err(crate::error::AgentError::Lan(
+            "live capture not supported on this platform".to_string(),
+        ))
+    }
+}
+
+// ---- Shared tile-delta encoder ---------------------------------------------
 
 /// A tile's rectangle within a frame: frame width plus the tile's origin/size.
 struct TileRect {
@@ -44,148 +93,45 @@ struct TileRect {
     h: usize,
 }
 
-/// Build a screen-cast capturer (BGRA frames at `fps`, scaled to `resolution`).
-///
-/// `display` selects which screen to capture by its id (`None` = the first /
-/// primary display). On macOS we can pick a `target` programmatically, so
-/// capture starts with **no picker dialog** — the host shares the requested
-/// screen (or screen 1 by default), and the client can switch displays. On
-/// Linux there is no programmatic pick: `scap` drives the ScreenCast portal,
-/// whose own dialog handles selection, so `display` is ignored and `target`
-/// stays unset.
-fn build_capturer(fps: u16, resolution: Resolution, display: Option<u32>) -> AgentResult<Capturer> {
-    if !scap::is_supported() {
-        tracing::warn!("screencast: scap reports capture is not supported here");
-        return Err(AgentError::Lan("screen capture not supported here".to_string()));
+/// Stateful tile-delta encoder shared by every capture backend. Feed it raw
+/// BGRA/BGRx frames; it diffs against the previous *sent* frame, JPEG-encodes
+/// only the changed tiles, and pushes a [`FrameDelta`] onto `tx`.
+pub(crate) struct TileEncoder {
+    prev: Option<(usize, usize, Vec<u8>)>, // (w, h, BGRA)
+    counter: u32,
+    last_sent: Instant,
+}
+
+impl TileEncoder {
+    pub(crate) fn new() -> Self {
+        Self {
+            prev: None,
+            counter: 0,
+            last_sent: Instant::now(),
+        }
     }
 
-    let target = {
-        #[cfg(target_os = "macos")]
-        {
-            // scap only exposes `get_all_targets()` publicly (`get_main_display`
-            // is crate-private and panics on Linux). Pick the requested display
-            // by id, else the first one — "screen 1".
-            let all = scap::get_all_targets();
-            let n_displays = all.iter().filter(|t| matches!(t, scap::Target::Display(_))).count();
-            let mut displays = all
-                .into_iter()
-                .filter(|t| matches!(t, scap::Target::Display(_)));
-            let picked = match display {
-                Some(id) => displays.find(
-                    |t| matches!(t, scap::Target::Display(d) if d.id == id),
-                ),
-                None => displays.next(),
-            };
-            let req = display; // `display` is a reserved token in tracing fields
-            tracing::info!(
-                requested = ?req,
-                available = n_displays,
-                got = picked.is_some(),
-                "screencast: macOS display target"
-            );
-            picked
+    /// Encode one frame (BGRA/BGRx, `w*h*4` bytes) and queue the changed tiles.
+    /// Returns `false` when the consumer is gone (caller should stop capturing).
+    pub(crate) fn push(
+        &mut self,
+        w: usize,
+        h: usize,
+        data: Vec<u8>,
+        quality: u8,
+        tx: &Sender<FrameDelta>,
+    ) -> bool {
+        if w == 0 || h == 0 || data.len() < w * h * 4 {
+            return true; // skip a malformed frame, keep going
         }
-        #[cfg(not(target_os = "macos"))]
-        {
-            let _ = display; // portal picks the screen on Linux
-            None
-        }
-    };
 
-    let options = Options {
-        fps: u32::from(fps).max(1),
-        show_cursor: true,
-        target,
-        output_type: FrameType::BGRAFrame,
-        output_resolution: resolution,
-        ..Default::default()
-    };
-    Capturer::build(options).map_err(|e| {
-        tracing::warn!(error = %e, "screencast: Capturer::build failed (permission? no display?)");
-        AgentError::Lan(format!("screencast: {e}"))
-    })
-}
-
-/// The displays the host can share. Empty on Linux, where scap can't enumerate
-/// screens (the ScreenCast portal owns selection).
-pub fn list_displays() -> Vec<DisplayInfo> {
-    scap::get_all_targets()
-        .into_iter()
-        .filter_map(|t| match t {
-            scap::Target::Display(d) => Some(DisplayInfo {
-                id: d.id,
-                name: d.title,
-            }),
-            scap::Target::Window(_) => None,
-        })
-        .collect()
-}
-
-/// Capture continuously and push delta frames (only the tiles that changed) to
-/// `tx` until the receiver is dropped (client disconnected) or the stream ends.
-/// Blocking — run on a dedicated thread. A single portal prompt covers the
-/// whole stream.
-///
-/// `tx` is taken by value on purpose: dropping it when this returns closes the
-/// channel, signalling the consumer that the stream has ended.
-#[allow(clippy::needless_pass_by_value)]
-pub fn stream_tiles_blocking(
-    fps: u16,
-    quality: u8,
-    display: Option<u32>,
-    tx: Sender<FrameDelta>,
-) -> AgentResult<()> {
-    // Downscale to 720p server-side; tile-delta then sends only the changed
-    // regions, so a mostly-static desktop is nearly free on the wire. 720p
-    // keeps the initial keyframe small enough to stay usable over weak Wi-Fi.
-    let mut capturer = build_capturer(fps, Resolution::_720p, display)?;
-    capturer.start_capture();
-    let scr = display; // reserved token in tracing fields — log a copy
-    tracing::info!(fps, screen = ?scr, "screencast: capturer started, pulling frames");
-
-    let mut prev: Option<(usize, usize, Vec<u8>)> = None; // (w, h, BGRA)
-    let mut counter: u32 = 0;
-    let mut last_sent = Instant::now();
-    let mut got_frame = false;
-
-    loop {
-        let frame = match capturer.get_next_frame() {
-            Ok(f) => f,
-            Err(e) => {
-                tracing::warn!(
-                    error = %e,
-                    got_any = got_frame,
-                    "screencast: get_next_frame failed — capture ending (permission/portal?)"
-                );
-                // If we never produced a single frame, the capture never really
-                // started — almost always denied Screen Recording permission on
-                // macOS. Surface that as an error so the client shows a reason
-                // instead of a bare "connection ended". Once frames have flowed,
-                // a later failure is just a normal end (disconnect/portal close).
-                if !got_frame {
-                    capturer.stop_capture();
-                    return Err(AgentError::Lan(format!(
-                        "screen capture failed to start (Screen Recording permission?): {e}"
-                    )));
-                }
-                break;
-            },
-        };
-        got_frame = true;
-        let Some((w, h, data)) = frame_to_bgra(frame) else {
-            continue;
-        };
-
-        // Keyframe on the first frame, on a resize, or periodically.
-        let dims_changed = prev.as_ref().is_none_or(|(pw, ph, _)| *pw != w || *ph != h);
-        let keyframe = dims_changed || counter.is_multiple_of(KEYFRAME_INTERVAL);
-        counter = counter.wrapping_add(1);
+        let dims_changed = self.prev.as_ref().is_none_or(|(pw, ph, _)| *pw != w || *ph != h);
+        let keyframe = dims_changed || self.counter.is_multiple_of(KEYFRAME_INTERVAL);
+        self.counter = self.counter.wrapping_add(1);
 
         let cols = w.div_ceil(TILE);
         let rows = h.div_ceil(TILE);
         let mut tiles = Vec::new();
-        let mut jpeg_bytes = 0usize;
-        let encode_start = Instant::now();
 
         for ty in 0..rows {
             for tx_col in 0..cols {
@@ -197,32 +143,26 @@ pub fn stream_tiles_blocking(
                     w: TILE.min(w - x0),
                     h: TILE.min(h - y0),
                 };
-
                 let changed = keyframe
-                    || prev.as_ref().is_none_or(|(_, _, pd)| tile_differs(&data, pd, &rect));
+                    || self.prev.as_ref().is_none_or(|(_, _, pd)| tile_differs(&data, pd, &rect));
                 if !changed {
                     continue;
                 }
                 match encode_tile(&data, &rect, quality) {
-                    Ok(jpeg) => {
-                        jpeg_bytes += jpeg.len();
-                        tiles.push(TilePatch {
-                            i: u32::try_from(ty * cols + tx_col).unwrap_or(0),
-                            jpeg_b64: B64.encode(jpeg),
-                        });
-                    },
+                    Ok(jpeg) => tiles.push(TilePatch {
+                        i: u32::try_from(ty * cols + tx_col).unwrap_or(0),
+                        jpeg_b64: B64.encode(jpeg),
+                    }),
                     Err(e) => tracing::debug!(error = %e, "skipping tile"),
                 }
             }
         }
-        let encode_us = encode_start.elapsed().as_micros();
 
-        // Nothing changed and it isn't a keyframe: usually skip, but emit a tiny
-        // empty heartbeat frame at most once per HEARTBEAT so the client can
-        // tell a static screen from a stalled/slow link. `prev` is unchanged — a
-        // frame with no differing tiles already matches it.
-        if tiles.is_empty() && !keyframe && last_sent.elapsed() < HEARTBEAT {
-            continue;
+        // Nothing changed and not a keyframe: usually skip, but emit a tiny
+        // heartbeat at most once per HEARTBEAT so the client can tell a static
+        // screen from a stalled link.
+        if tiles.is_empty() && !keyframe && self.last_sent.elapsed() < HEARTBEAT {
+            return true;
         }
 
         let tile_count = tiles.len();
@@ -234,41 +174,51 @@ pub fn stream_tiles_blocking(
             tiles,
         };
         // Drop frames the consumer can't keep up with rather than build lag. Only
-        // commit `prev` once a frame is actually queued: if it's dropped, the
-        // next frame still diffs against the last *sent* state, so accumulated
-        // changes get resent instead of silently desyncing the client. That
-        // self-healing is what lets keyframes stay rare.
+        // commit `prev` once a frame is queued: a dropped frame re-diffs against
+        // the last *sent* state, so accumulated changes get resent instead of
+        // silently desyncing the client.
         match tx.try_send(delta) {
             Ok(()) => {
-                last_sent = Instant::now();
-                prev = Some((w, h, data));
-                tracing::debug!(keyframe, tiles = tile_count, encode_us, jpeg_bytes, "lan frame sent");
+                self.last_sent = Instant::now();
+                self.prev = Some((w, h, data));
+                tracing::debug!(keyframe, tiles = tile_count, "lan frame sent");
+                true
             },
             Err(TrySendError::Full(_)) => {
                 tracing::debug!(tiles = tile_count, "lan frame dropped (consumer behind)");
+                true
             },
-            Err(TrySendError::Closed(_)) => break, // client gone
+            Err(TrySendError::Closed(_)) => false, // client gone
         }
     }
-    capturer.stop_capture();
-    Ok(())
-}
 
-/// Convert a captured frame into a tightly-packed BGRA buffer + dimensions.
-fn frame_to_bgra(frame: Frame) -> Option<(usize, usize, Vec<u8>)> {
-    let (w, h, mut data) = match frame {
-        Frame::BGRA(f) => (f.width, f.height, f.data),
-        Frame::BGRx(f) => (f.width, f.height, f.data),
-        _ => return None, // we requested BGRA; ignore unexpected formats
-    };
-    let w = usize::try_from(w).unwrap_or(0);
-    let h = usize::try_from(h).unwrap_or(0);
-    let expected = w * h * 4;
-    if w == 0 || h == 0 || data.len() < expected {
-        return None;
+    /// Send an empty heartbeat frame if the screen has been idle for a while, so
+    /// a static screen still reads as "alive, nothing moving" instead of tripping
+    /// the client's slow-link indicator. No-op until a real frame has been sent.
+    /// Returns `false` when the consumer is gone.
+    pub(crate) fn heartbeat(&mut self, tx: &Sender<FrameDelta>) -> bool {
+        let Some((w, h, _)) = self.prev.as_ref() else {
+            return true; // nothing to anchor a heartbeat to yet
+        };
+        if self.last_sent.elapsed() < HEARTBEAT {
+            return true;
+        }
+        let delta = FrameDelta {
+            w: u32::try_from(*w).unwrap_or(0),
+            h: u32::try_from(*h).unwrap_or(0),
+            tile: u32::try_from(TILE).unwrap_or(0),
+            keyframe: false,
+            tiles: Vec::new(),
+        };
+        match tx.try_send(delta) {
+            Ok(()) => {
+                self.last_sent = Instant::now();
+                true
+            },
+            Err(TrySendError::Full(_)) => true,
+            Err(TrySendError::Closed(_)) => false,
+        }
     }
-    data.truncate(expected);
-    Some((w, h, data))
 }
 
 /// Whether a tile's pixels differ between the current and previous frame.
@@ -292,84 +242,111 @@ fn encode_tile(frame: &[u8], r: &TileRect, quality: u8) -> AgentResult<Vec<u8>> 
     let mut out = Vec::new();
     Encoder::new(&mut out, quality)
         .encode(&buf, tw16, th16, ColorType::Bgra)
-        .map_err(|e| AgentError::Lan(format!("jpeg encode: {e}")))?;
+        .map_err(|e| crate::error::AgentError::Lan(format!("jpeg encode: {e}")))?;
     Ok(out)
 }
 
-/// Capture one frame from a user-selected screen and return PNG bytes.
-///
-/// Blocking: the portal shows a "pick a screen" dialog and PipeWire delivery is
-/// synchronous. Call from `spawn_blocking`. Linux only — it backs the Linux
-/// screenshot fallback; macOS/Windows screenshots use native CLI tools.
-#[cfg(target_os = "linux")]
-pub fn capture_png_blocking() -> AgentResult<Vec<u8>> {
-    // Full native resolution for a crisp one-shot screenshot.
-    let mut capturer = build_capturer(30, Resolution::Captured, None)?;
-    capturer.start_capture();
-    // The first frame(s) after a portal start can be blank while the stream
-    // warms up; take a few and keep the last good one.
-    let mut frame = None;
-    for _ in 0..3 {
-        match capturer.get_next_frame() {
-            Ok(f) => frame = Some(f),
-            Err(e) => return Err(AgentError::Lan(format!("screencast frame: {e}"))),
+// ---- macOS backend (scap / ScreenCaptureKit) -------------------------------
+
+#[cfg(target_os = "macos")]
+mod macos {
+    use scap::capturer::{Capturer, Options, Resolution};
+    use scap::frame::{Frame, FrameType};
+    use tokio::sync::mpsc::Sender;
+
+    use rivetlink_sdk::lan::{DisplayInfo, FrameDelta};
+
+    use crate::error::{AgentError, AgentResult};
+
+    /// The displays scap can share (real screens on macOS).
+    pub(super) fn list_displays() -> Vec<DisplayInfo> {
+        scap::get_all_targets()
+            .into_iter()
+            .filter_map(|t| match t {
+                scap::Target::Display(d) => Some(DisplayInfo { id: d.id, name: d.title }),
+                scap::Target::Window(_) => None,
+            })
+            .collect()
+    }
+
+    pub(super) fn stream(
+        fps: u16,
+        quality: u8,
+        display: Option<u32>,
+        tx: Sender<FrameDelta>,
+    ) -> AgentResult<()> {
+        let mut capturer = build_capturer(fps, display)?;
+        capturer.start_capture();
+        tracing::info!(fps, "screencast(macos): capturer started");
+
+        let mut enc = super::TileEncoder::new();
+        let mut got_frame = false;
+        loop {
+            let frame = match capturer.get_next_frame() {
+                Ok(f) => f,
+                Err(e) => {
+                    tracing::warn!(error = %e, got_any = got_frame, "screencast(macos): capture ended");
+                    if !got_frame {
+                        capturer.stop_capture();
+                        return Err(AgentError::Lan(format!(
+                            "screen capture failed to start (Screen Recording permission?): {e}"
+                        )));
+                    }
+                    break;
+                },
+            };
+            got_frame = true;
+            if let Some((w, h, data)) = frame_to_bgra(frame) {
+                if !enc.push(w, h, data, quality, &tx) {
+                    break;
+                }
+            }
         }
+        capturer.stop_capture();
+        Ok(())
     }
-    capturer.stop_capture();
 
-    let (width, height, data) = into_rgba(frame.ok_or_else(|| {
-        AgentError::Lan("screencast produced no frame".to_string())
-    })?)?;
-    encode_png(width, height, &data)
-}
-
-/// Convert a captured frame into tightly-packed RGBA8 + dimensions.
-#[cfg(target_os = "linux")]
-fn into_rgba(frame: Frame) -> AgentResult<(u32, u32, Vec<u8>)> {
-    // We requested BGRA, but handle the common variants defensively.
-    let (w, h, mut data, swap_rb) = match frame {
-        Frame::BGRA(f) => (f.width, f.height, f.data, true),
-        Frame::BGRx(f) => (f.width, f.height, f.data, true),
-        Frame::RGBx(f) => (f.width, f.height, f.data, false),
-        Frame::XBGR(f) => (f.width, f.height, f.data, true),
-        other => {
-            return Err(AgentError::Lan(format!(
-                "unsupported frame format from screencast: {other:?}"
-            )))
-        },
-    };
-    let (w, h) = (u32::try_from(w).unwrap_or(0), u32::try_from(h).unwrap_or(0));
-    let expected = (w as usize) * (h as usize) * 4;
-    if w == 0 || h == 0 || data.len() < expected {
-        return Err(AgentError::Lan(format!(
-            "screencast frame too small: {}x{}, {} bytes (need {expected})",
-            w,
-            h,
-            data.len()
-        )));
-    }
-    data.truncate(expected); // drop any trailing stride padding on the last row
-    if swap_rb {
-        for px in data.chunks_exact_mut(4) {
-            px.swap(0, 2); // BGRA -> RGBA
+    /// Build a 720p BGRA capturer for the chosen display (`None` = first).
+    fn build_capturer(fps: u16, display: Option<u32>) -> AgentResult<Capturer> {
+        if !scap::is_supported() {
+            return Err(AgentError::Lan("screen capture not supported here".to_string()));
         }
-    }
-    Ok((w, h, data))
-}
+        let all = scap::get_all_targets();
+        let mut displays = all.into_iter().filter(|t| matches!(t, scap::Target::Display(_)));
+        let target = match display {
+            Some(id) => displays.find(|t| matches!(t, scap::Target::Display(d) if d.id == id)),
+            None => displays.next(),
+        };
+        tracing::info!(requested = ?display, picked = target.is_some(), "screencast(macos): target");
 
-#[cfg(target_os = "linux")]
-fn encode_png(width: u32, height: u32, rgba: &[u8]) -> AgentResult<Vec<u8>> {
-    let mut out = Vec::new();
-    {
-        let mut encoder = png::Encoder::new(&mut out, width, height);
-        encoder.set_color(png::ColorType::Rgba);
-        encoder.set_depth(png::BitDepth::Eight);
-        let mut writer = encoder
-            .write_header()
-            .map_err(|e| AgentError::Lan(format!("png header: {e}")))?;
-        writer
-            .write_image_data(rgba)
-            .map_err(|e| AgentError::Lan(format!("png data: {e}")))?;
+        let options = Options {
+            fps: u32::from(fps).max(1),
+            show_cursor: true,
+            target,
+            output_type: FrameType::BGRAFrame,
+            output_resolution: Resolution::_720p,
+            ..Default::default()
+        };
+        Capturer::build(options).map_err(|e| {
+            tracing::warn!(error = %e, "screencast(macos): Capturer::build failed");
+            AgentError::Lan(format!("screencast: {e}"))
+        })
     }
-    Ok(out)
+
+    /// Convert a captured frame into a tightly-packed BGRA buffer + dimensions.
+    fn frame_to_bgra(frame: Frame) -> Option<(usize, usize, Vec<u8>)> {
+        let (w, h, mut data) = match frame {
+            Frame::BGRA(f) => (f.width, f.height, f.data),
+            Frame::BGRx(f) => (f.width, f.height, f.data),
+            _ => return None,
+        };
+        let w = usize::try_from(w).unwrap_or(0);
+        let h = usize::try_from(h).unwrap_or(0);
+        let expected = w * h * 4;
+        if w == 0 || h == 0 || data.len() < expected {
+            return None;
+        }
+        data.truncate(expected);
+        Some((w, h, data))
+    }
 }

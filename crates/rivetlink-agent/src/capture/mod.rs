@@ -15,6 +15,12 @@ pub mod screenshot;
 #[cfg(target_os = "linux")]
 pub mod portal;
 
+// Dialog-free live capture via GNOME Mutter ScreenCast + GStreamer, Linux only.
+// Backs the Linux streaming path in `screencast` (scap can't talk to modern
+// PipeWire daemons).
+#[cfg(target_os = "linux")]
+pub mod mutter;
+
 // Native single-screen live capture via `scap`: ScreenCast portal + PipeWire on
 // Linux, ScreenCaptureKit on macOS. Windows stays client-only for now (scap's
 // Windows capture backend doesn't build), matching the app's host support.
