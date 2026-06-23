@@ -110,7 +110,13 @@ fn discover_blocking(timeout: Duration) -> SdkResult<Vec<LanDevice>> {
         .map_err(|e| SdkError::Discovery(e.to_string()))?;
 
     let deadline = Instant::now() + timeout;
-    let mut found: BTreeMap<String, LanDevice> = BTreeMap::new();
+    // Accumulate per host identity. The same device shows up once per network
+    // interface and address family (Ethernet + Wi-Fi, IPv4 + IPv6), often in
+    // separate resolution events. Merging all their addresses lets us pick the
+    // single most-connectable one at the end instead of letting a late IPv6
+    // resolution clobber a good IPv4 address (which left hosts shown — and
+    // dialled — on an unreachable `fe80::` link-local).
+    let mut found: BTreeMap<String, HostAccumulator> = BTreeMap::new();
     loop {
         let remaining = deadline.saturating_duration_since(Instant::now());
         if remaining.is_zero() {
@@ -118,15 +124,15 @@ fn discover_blocking(timeout: Duration) -> SdkResult<Vec<LanDevice>> {
         }
         match rx.recv_timeout(remaining) {
             Ok(ServiceEvent::ServiceResolved(info)) => {
-                if let Some(dev) = device_from_info(&info) {
-                    // Dedup by host identity, not mDNS name: a restarted host
-                    // can linger under a renamed instance ("Name (2)") or a new
-                    // port, but it's the same device. Keep the latest resolved.
-                    let key = dev
+                if let Some(acc) = HostAccumulator::from_info(&info) {
+                    // Dedup by host identity, not mDNS name: a restarted host can
+                    // linger under a renamed instance ("Name (2)") or a new port,
+                    // but it's the same device.
+                    let key = acc
                         .public_key
                         .clone()
                         .unwrap_or_else(|| info.get_fullname().to_string());
-                    found.insert(key, dev);
+                    found.entry(key).or_default().merge(acc);
                 }
             },
             Ok(_) => {},
@@ -134,37 +140,86 @@ fn discover_blocking(timeout: Duration) -> SdkResult<Vec<LanDevice>> {
         }
     }
     let _ = daemon.shutdown();
-    Ok(found.into_values().collect())
+    Ok(found.into_values().filter_map(HostAccumulator::into_device).collect())
 }
 
-fn device_from_info(info: &ServiceInfo) -> Option<LanDevice> {
-    let address = info
-        .get_addresses()
-        .iter()
-        .find(|ip| ip.is_ipv4())
-        .or_else(|| info.get_addresses().iter().next())
-        .map(ToString::to_string)?;
-    let name = info
-        .get_property_val_str(TXT_NAME)
-        .map(str::to_string)
-        .unwrap_or_else(|| {
-            info.get_fullname()
-                .split('.')
-                .next()
-                .unwrap_or("RivetLink")
-                .to_string()
-        });
-    let public_key = info.get_property_val_str(TXT_PUBKEY).map(str::to_string);
-    let protocol_version = info
-        .get_property_val_str(TXT_VERSION)
-        .and_then(|v| v.parse().ok());
-    Some(LanDevice {
-        name,
-        address,
-        port: info.get_port(),
-        public_key,
-        protocol_version,
-    })
+/// One host's advertisement, gathered across every interface/address-family
+/// resolution so we can choose the best address once at the end.
+#[derive(Default)]
+struct HostAccumulator {
+    name: Option<String>,
+    port: u16,
+    public_key: Option<String>,
+    protocol_version: Option<u16>,
+    addresses: std::collections::BTreeSet<IpAddr>,
+}
+
+impl HostAccumulator {
+    fn from_info(info: &ServiceInfo) -> Option<Self> {
+        let addresses: std::collections::BTreeSet<IpAddr> =
+            info.get_addresses().iter().copied().collect();
+        if addresses.is_empty() {
+            return None;
+        }
+        let name = info
+            .get_property_val_str(TXT_NAME)
+            .map(str::to_string)
+            .or_else(|| info.get_fullname().split('.').next().map(str::to_string));
+        Some(Self {
+            name,
+            port: info.get_port(),
+            public_key: info.get_property_val_str(TXT_PUBKEY).map(str::to_string),
+            protocol_version: info
+                .get_property_val_str(TXT_VERSION)
+                .and_then(|v| v.parse().ok()),
+            addresses,
+        })
+    }
+
+    fn merge(&mut self, other: Self) {
+        if other.name.is_some() {
+            self.name = other.name;
+        }
+        if other.port != 0 {
+            self.port = other.port;
+        }
+        if other.public_key.is_some() {
+            self.public_key = other.public_key;
+        }
+        if other.protocol_version.is_some() {
+            self.protocol_version = other.protocol_version;
+        }
+        self.addresses.extend(other.addresses);
+    }
+
+    fn into_device(self) -> Option<LanDevice> {
+        // Most connectable first: routable IPv4, then routable IPv6, then
+        // link-local. A `fe80::` link-local IPv6 can't be dialled without a
+        // scope id, so it's the worst; loopback-only hosts are dropped entirely.
+        let best = self.addresses.iter().min_by_key(|ip| addr_rank(ip)).copied()?;
+        if addr_rank(&best) >= 4 {
+            return None;
+        }
+        Some(LanDevice {
+            name: self.name.unwrap_or_else(|| "RivetLink".to_string()),
+            address: best.to_string(),
+            port: self.port,
+            public_key: self.public_key,
+            protocol_version: self.protocol_version,
+        })
+    }
+}
+
+/// Preference for an advertised address — lower is better.
+fn addr_rank(ip: &IpAddr) -> u8 {
+    match ip {
+        IpAddr::V4(v4) if v4.is_loopback() => 4,
+        IpAddr::V6(v6) if v6.is_loopback() => 4,
+        IpAddr::V4(v4) if v4.is_link_local() => 2, // 169.254.0.0/16
+        IpAddr::V6(v6) if (v6.segments()[0] & 0xffc0) == 0xfe80 => 3, // fe80::/10
+        IpAddr::V4(_) => 0,                         // routable IPv4 — best
+        IpAddr::V6(_) => 1,                         // routable IPv6
+    }
 }
 
 // ---- Advertising (host) ----------------------------------------------------
