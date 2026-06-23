@@ -13,6 +13,7 @@
 
 use std::collections::BTreeMap;
 use std::net::{IpAddr, SocketAddr};
+use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use base64::engine::general_purpose::STANDARD as B64;
@@ -34,7 +35,13 @@ pub const SERVICE_TYPE: &str = "_rivetlink._tcp.local.";
 
 /// Direct-LAN wire protocol version, advertised in mDNS and used for
 /// compatibility checks once version negotiation lands.
-pub const PROTOCOL_VERSION: u16 = 1;
+///
+/// v2 added `ListDisplays`/`SwitchDisplay` + the optional `display` on
+/// `StartStream` (client-driven display switching). The additions are
+/// backward-compatible one way: a v1 client talks to a v2 host fine (it never
+/// asks for displays, and the host only sends them on request), but a v2 client
+/// must not send `ListDisplays` to a v1 host — both ends should be v2+.
+pub const PROTOCOL_VERSION: u16 = 2;
 
 /// Default TCP port a host listens on. A *stable* port (not an OS-assigned 0)
 /// so a remembered device keeps reconnecting to the same address and a restart
@@ -231,8 +238,29 @@ pub enum LanRequest {
     Screenshot,
     /// Start a live screen stream at up to `fps` frames per second. The host
     /// replies with a continuous sequence of [`LanResponse::Frame`] until the
-    /// client disconnects.
-    StartStream { fps: u16 },
+    /// client disconnects. `display` selects which screen to capture by its
+    /// [`DisplayInfo::id`]; `None` (the default, and what older clients send)
+    /// means the host's primary display. Honoured on macOS; on Linux the
+    /// ScreenCast portal picks the screen and this is ignored.
+    StartStream {
+        fps: u16,
+        #[serde(default)]
+        display: Option<u32>,
+    },
+    /// Ask the host which displays it can share. The host replies with
+    /// [`LanResponse::Displays`] (empty on Linux, where the portal owns
+    /// selection and scap can't enumerate screens).
+    ListDisplays,
+    /// While streaming, switch the capture to another display by its
+    /// [`DisplayInfo::id`]. macOS switches seamlessly; ignored on Linux.
+    SwitchDisplay { display: u32 },
+}
+
+/// A display the host can share: a stable `id` plus a human-readable `name`.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct DisplayInfo {
+    pub id: u32,
+    pub name: String,
 }
 
 /// One changed tile of a frame: its row-major index plus JPEG bytes (base64).
@@ -266,6 +294,8 @@ pub enum LanResponse {
     Screenshot { png_b64: String },
     /// One live frame as changed tiles (dirty-rectangle delta encoding).
     Frame(FrameDelta),
+    /// The displays the host can share (reply to [`LanRequest::ListDisplays`]).
+    Displays { displays: Vec<DisplayInfo> },
     /// The host could not satisfy the request.
     Error { message: String },
 }
@@ -437,37 +467,90 @@ async fn fetch_screenshot(stream: &mut TcpStream, channel: &SealedChannel) -> Sd
         LanResponse::Screenshot { png_b64 } => B64
             .decode(png_b64.trim())
             .map_err(|e| SdkError::Base64(e.to_string())),
-        LanResponse::Frame(_) => {
-            Err(SdkError::Crypto("expected screenshot, got a stream frame".to_string()))
+        LanResponse::Frame(_) | LanResponse::Displays { .. } => {
+            Err(SdkError::Crypto("expected screenshot, got another response".to_string()))
         },
         LanResponse::Error { message } => Err(SdkError::Relay(message)),
     }
 }
 
-/// Start a live screen stream and invoke `on_frame` with each delta frame.
-/// Returns when `on_frame` returns `false` (caller asked to stop) or the host
-/// closes the connection. Dropping the future (e.g. aborting the task) also
-/// ends the stream — the host notices the closed socket and stops capturing.
-pub async fn stream_frames<F>(
+/// Ask the host which displays it can share. Returns an empty list when the
+/// host can't enumerate them (Linux: the ScreenCast portal owns selection).
+pub async fn list_displays(
     stream: &mut TcpStream,
     channel: &SealedChannel,
+) -> SdkResult<Vec<DisplayInfo>> {
+    send_request(stream, channel, &LanRequest::ListDisplays).await?;
+    match recv_response(stream, channel).await? {
+        LanResponse::Displays { displays } => Ok(displays),
+        LanResponse::Error { message } => Err(SdkError::Relay(message)),
+        _ => Ok(Vec::new()),
+    }
+}
+
+/// Start a live screen stream and invoke `on_frame` with each delta frame.
+///
+/// `display` selects the initial screen (`None` = host primary). Pushing a
+/// display id onto `switch_rx` switches the capture mid-stream (macOS only;
+/// the host ignores it on Linux). Returns when `on_frame` returns `false`
+/// (caller asked to stop) or the host closes the connection. Dropping the
+/// future (e.g. aborting the task) also ends the stream — the host notices the
+/// closed socket and stops capturing.
+pub async fn stream_frames<F>(
+    stream: TcpStream,
+    channel: SealedChannel,
     fps: u16,
+    display: Option<u32>,
+    mut switch_rx: tokio::sync::mpsc::Receiver<u32>,
     mut on_frame: F,
 ) -> SdkResult<()>
 where
     F: FnMut(&FrameDelta) -> bool,
 {
-    send_request(stream, channel, &LanRequest::StartStream { fps }).await?;
+    // Own the read/write halves so the write side can live in its own task. The
+    // sealed channel is stateless (random per-message nonce), so sealing (writes)
+    // and opening (reads) need no shared mutable state — an Arc to share the key
+    // is enough. Reading frames is the hot path and stays in this task; the rare
+    // display-switch writes go to a small writer task.
+    let channel = Arc::new(channel);
+    let (mut rd, mut wr) = stream.into_split();
+    send_request(&mut wr, &channel, &LanRequest::StartStream { fps, display }).await?;
+
+    let ch_w = Arc::clone(&channel);
+    let writer = tokio::spawn(async move {
+        while let Some(display) = switch_rx.recv().await {
+            if send_request(&mut wr, &ch_w, &LanRequest::SwitchDisplay { display })
+                .await
+                .is_err()
+            {
+                break;
+            }
+        }
+    });
+    // Abort the writer when this future ends or is dropped (e.g. the caller
+    // aborts the stream task), so it never lingers on a dead connection.
+    let _writer_guard = AbortOnDrop(writer.abort_handle());
+
     loop {
-        match recv_response(stream, channel).await? {
+        match recv_response(&mut rd, &channel).await? {
             LanResponse::Frame(delta) => {
                 if !on_frame(&delta) {
                     return Ok(());
                 }
             },
             LanResponse::Error { message } => return Err(SdkError::Relay(message)),
-            LanResponse::Screenshot { .. } => { /* ignore stray screenshot */ },
+            LanResponse::Screenshot { .. } | LanResponse::Displays { .. } => {},
         }
+    }
+}
+
+/// Aborts a spawned task when dropped — keeps a helper task from outliving the
+/// future that owns it.
+struct AbortOnDrop(tokio::task::AbortHandle);
+
+impl Drop for AbortOnDrop {
+    fn drop(&mut self) {
+        self.0.abort();
     }
 }
 

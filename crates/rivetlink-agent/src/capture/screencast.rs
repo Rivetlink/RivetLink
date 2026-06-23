@@ -17,7 +17,7 @@ use scap::capturer::{Capturer, Options, Resolution};
 use scap::frame::{Frame, FrameType};
 use tokio::sync::mpsc::{error::TrySendError, Sender};
 
-use rivetlink_sdk::lan::{FrameDelta, TilePatch};
+use rivetlink_sdk::lan::{DisplayInfo, FrameDelta, TilePatch};
 
 use crate::error::{AgentError, AgentResult};
 
@@ -46,30 +46,37 @@ struct TileRect {
 
 /// Build a screen-cast capturer (BGRA frames at `fps`, scaled to `resolution`).
 ///
-/// On macOS/Windows we set `target` to the primary display, so capture starts
-/// straight away with **no picker dialog** — the host just shares screen 1.
-/// (Switching displays will later come from the client via the protocol.) On
-/// Linux there is no programmatic display pick: `scap` drives the ScreenCast
-/// portal, whose own dialog handles selection, so we leave `target` unset.
-fn build_capturer(fps: u16, resolution: Resolution) -> AgentResult<Capturer> {
+/// `display` selects which screen to capture by its id (`None` = the first /
+/// primary display). On macOS we can pick a `target` programmatically, so
+/// capture starts with **no picker dialog** — the host shares the requested
+/// screen (or screen 1 by default), and the client can switch displays. On
+/// Linux there is no programmatic pick: `scap` drives the ScreenCast portal,
+/// whose own dialog handles selection, so `display` is ignored and `target`
+/// stays unset.
+fn build_capturer(fps: u16, resolution: Resolution, display: Option<u32>) -> AgentResult<Capturer> {
     if !scap::is_supported() {
         return Err(AgentError::Lan("screen capture not supported here".to_string()));
     }
 
-    // Default to the first display where the platform lets us pick one without
-    // prompting. scap only exposes `get_all_targets()` publicly (its
-    // `get_main_display` is crate-private and panics on Linux anyway), so take
-    // the first `Display` target — "screen 1". On Linux we leave `target` unset:
-    // scap drives the ScreenCast portal there and its dialog handles selection.
     let target = {
         #[cfg(target_os = "macos")]
         {
-            scap::get_all_targets()
+            // scap only exposes `get_all_targets()` publicly (`get_main_display`
+            // is crate-private and panics on Linux). Pick the requested display
+            // by id, else the first one — "screen 1".
+            let mut displays = scap::get_all_targets()
                 .into_iter()
-                .find(|t| matches!(t, scap::Target::Display(_)))
+                .filter(|t| matches!(t, scap::Target::Display(_)));
+            match display {
+                Some(id) => displays.find(
+                    |t| matches!(t, scap::Target::Display(d) if d.id == id),
+                ),
+                None => displays.next(),
+            }
         }
         #[cfg(not(target_os = "macos"))]
         {
+            let _ = display; // portal picks the screen on Linux
             None
         }
     };
@@ -85,6 +92,21 @@ fn build_capturer(fps: u16, resolution: Resolution) -> AgentResult<Capturer> {
     Capturer::build(options).map_err(|e| AgentError::Lan(format!("screencast: {e}")))
 }
 
+/// The displays the host can share. Empty on Linux, where scap can't enumerate
+/// screens (the ScreenCast portal owns selection).
+pub fn list_displays() -> Vec<DisplayInfo> {
+    scap::get_all_targets()
+        .into_iter()
+        .filter_map(|t| match t {
+            scap::Target::Display(d) => Some(DisplayInfo {
+                id: d.id,
+                name: d.title,
+            }),
+            scap::Target::Window(_) => None,
+        })
+        .collect()
+}
+
 /// Capture continuously and push delta frames (only the tiles that changed) to
 /// `tx` until the receiver is dropped (client disconnected) or the stream ends.
 /// Blocking — run on a dedicated thread. A single portal prompt covers the
@@ -93,11 +115,16 @@ fn build_capturer(fps: u16, resolution: Resolution) -> AgentResult<Capturer> {
 /// `tx` is taken by value on purpose: dropping it when this returns closes the
 /// channel, signalling the consumer that the stream has ended.
 #[allow(clippy::needless_pass_by_value)]
-pub fn stream_tiles_blocking(fps: u16, quality: u8, tx: Sender<FrameDelta>) -> AgentResult<()> {
+pub fn stream_tiles_blocking(
+    fps: u16,
+    quality: u8,
+    display: Option<u32>,
+    tx: Sender<FrameDelta>,
+) -> AgentResult<()> {
     // Downscale to 720p server-side; tile-delta then sends only the changed
     // regions, so a mostly-static desktop is nearly free on the wire. 720p
     // keeps the initial keyframe small enough to stay usable over weak Wi-Fi.
-    let mut capturer = build_capturer(fps, Resolution::_720p)?;
+    let mut capturer = build_capturer(fps, Resolution::_720p, display)?;
     capturer.start_capture();
 
     let mut prev: Option<(usize, usize, Vec<u8>)> = None; // (w, h, BGRA)
@@ -240,7 +267,7 @@ fn encode_tile(frame: &[u8], r: &TileRect, quality: u8) -> AgentResult<Vec<u8>> 
 #[cfg(target_os = "linux")]
 pub fn capture_png_blocking() -> AgentResult<Vec<u8>> {
     // Full native resolution for a crisp one-shot screenshot.
-    let mut capturer = build_capturer(30, Resolution::Captured)?;
+    let mut capturer = build_capturer(30, Resolution::Captured, None)?;
     capturer.start_capture();
     // The first frame(s) after a portal start can be blank while the stream
     // warms up; take a few and keep the last good one.

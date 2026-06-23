@@ -16,7 +16,9 @@ use tokio::sync::mpsc::Sender;
 use rivetlink_crypto::sealed::SealedChannel;
 use rivetlink_sdk::direct;
 use rivetlink_sdk::identity::Identity;
-use rivetlink_sdk::lan::{self, Advertiser, LanRequest, LanResponse, PROTOCOL_VERSION};
+use rivetlink_sdk::lan::{
+    self, Advertiser, DisplayInfo, LanRequest, LanResponse, PROTOCOL_VERSION,
+};
 
 use crate::capture::screenshot;
 use crate::error::{AgentError, AgentResult};
@@ -193,17 +195,29 @@ async fn handle(
     if let Some(ev) = &events {
         let _ = ev.send(HostEvent::ClientConnected(label)).await;
     }
-    let result = serve_loop(&mut stream, &channel).await;
+    // Share the channel (Arc) so a live stream can read control messages in a
+    // side task while it writes frames — the sealed channel is stateless.
+    let result = serve_loop(stream, Arc::new(channel)).await;
     if let Some(ev) = &events {
         let _ = ev.send(HostEvent::ClientDisconnected).await;
     }
     result
 }
 
+/// Aborts a spawned task when dropped — keeps the stream's reader task from
+/// outliving the session.
+struct AbortOnDrop(tokio::task::AbortHandle);
+
+impl Drop for AbortOnDrop {
+    fn drop(&mut self) {
+        self.0.abort();
+    }
+}
+
 /// Serve requests on an established channel until the client disconnects.
-async fn serve_loop(stream: &mut TcpStream, channel: &SealedChannel) -> AgentResult<()> {
+async fn serve_loop(mut stream: TcpStream, channel: Arc<SealedChannel>) -> AgentResult<()> {
     loop {
-        let Ok(req) = lan::recv_request(stream, channel).await else {
+        let Ok(req) = lan::recv_request(&mut stream, &channel).await else {
             return Ok(());
         };
         match req {
@@ -216,58 +230,132 @@ async fn serve_loop(stream: &mut TcpStream, channel: &SealedChannel) -> AgentRes
                         message: e.to_string(),
                     },
                 };
-                lan::send_response(stream, channel, &resp)
+                lan::send_response(&mut stream, &channel, &resp)
                     .await
                     .map_err(|e| AgentError::Lan(e.to_string()))?;
             },
-            LanRequest::StartStream { fps } => {
-                // The stream runs until the client disconnects; then done.
-                return stream_screen(stream, channel, fps).await;
+            LanRequest::ListDisplays => {
+                let displays = displays_for_host();
+                lan::send_response(&mut stream, &channel, &LanResponse::Displays { displays })
+                    .await
+                    .map_err(|e| AgentError::Lan(e.to_string()))?;
             },
+            LanRequest::StartStream { fps, display } => {
+                // The stream runs until the client disconnects; then done.
+                return stream_screen(stream, channel, fps, display).await;
+            },
+            // Only meaningful while streaming; ignore it outside a stream.
+            LanRequest::SwitchDisplay { .. } => {},
         }
     }
 }
 
-/// Capture the screen continuously and send JPEG frames over the sealed channel
-/// until the client disconnects. On macOS capture starts on the primary display
-/// with no dialog; on Linux one ScreenCast portal prompt covers the whole stream.
+/// The displays this host can offer to share. Empty where there's no capture
+/// backend that enumerates screens (Linux's portal owns selection; Windows has
+/// no host backend).
+fn displays_for_host() -> Vec<DisplayInfo> {
+    #[cfg(any(target_os = "linux", target_os = "macos"))]
+    {
+        crate::capture::screencast::list_displays()
+    }
+    #[cfg(not(any(target_os = "linux", target_os = "macos")))]
+    {
+        Vec::new()
+    }
+}
+
+/// Capture a screen continuously and send JPEG frames over the sealed channel
+/// until the client disconnects. `display` is the initial screen (`None` =
+/// primary); a [`LanRequest::SwitchDisplay`] from the client mid-stream restarts
+/// capture on another screen (macOS). On macOS capture starts with no dialog; on
+/// Linux one ScreenCast portal prompt covers the stream and switching is a no-op.
 #[cfg(any(target_os = "linux", target_os = "macos"))]
-async fn stream_screen(stream: &mut TcpStream, channel: &SealedChannel, fps: u16) -> AgentResult<()> {
+async fn stream_screen(
+    stream: TcpStream,
+    channel: Arc<SealedChannel>,
+    fps: u16,
+    mut display: Option<u32>,
+) -> AgentResult<()> {
     use rivetlink_sdk::lan::FrameDelta;
 
-    // Small bounded channel: the capture thread drops frames the network can't
-    // keep up with, so we stream the freshest frame rather than build latency.
-    let (tx, mut rx) = tokio::sync::mpsc::channel::<FrameDelta>(2);
-    let capture = tokio::task::spawn_blocking(move || {
-        // 720p + moderate JPEG quality keeps the keyframe small enough to stay
-        // usable over a weak Wi-Fi link; deltas after that are tiny.
-        crate::capture::screencast::stream_tiles_blocking(fps, 60, tx)
-    });
+    let (mut rd, mut wr) = stream.into_split();
 
-    while let Some(delta) = rx.recv().await {
-        if lan::send_response(stream, channel, &LanResponse::Frame(delta))
-            .await
-            .is_err()
-        {
-            break; // client disconnected
+    // Read client control messages in a side task and forward them over a
+    // channel. That keeps the (non-cancel-safe) request read off the frame-send
+    // path: the main loop only selects on cancel-safe mpsc receivers.
+    let (ctrl_tx, mut ctrl_rx) = tokio::sync::mpsc::channel::<LanRequest>(4);
+    let reader_ch = Arc::clone(&channel);
+    let reader = tokio::spawn(async move {
+        while let Ok(req) = lan::recv_request(&mut rd, &reader_ch).await {
+            if ctrl_tx.send(req).await.is_err() {
+                break; // main loop gone
+            }
         }
+    });
+    let _reader_guard = AbortOnDrop(reader.abort_handle());
+
+    // Re-enter on every display switch: tear down the capturer and start a new
+    // one targeting the requested screen.
+    'session: loop {
+        // Small bounded channel: the capture thread drops frames the network
+        // can't keep up with, so we stream the freshest frame, not stale ones.
+        let (tx, mut rx) = tokio::sync::mpsc::channel::<FrameDelta>(2);
+        let cap_display = display;
+        let capture = tokio::task::spawn_blocking(move || {
+            // 720p + moderate JPEG quality keeps the keyframe small enough to
+            // stay usable over a weak Wi-Fi link; deltas after that are tiny.
+            crate::capture::screencast::stream_tiles_blocking(fps, 60, cap_display, tx)
+        });
+
+        let switch_to: u32 = loop {
+            tokio::select! {
+                frame = rx.recv() => match frame {
+                    Some(delta) => {
+                        if lan::send_response(&mut wr, &channel, &LanResponse::Frame(delta))
+                            .await
+                            .is_err()
+                        {
+                            break 'session; // client disconnected
+                        }
+                    },
+                    None => break 'session, // capture ended (portal closed / error)
+                },
+                ctrl = ctrl_rx.recv() => match ctrl {
+                    Some(LanRequest::SwitchDisplay { display: d }) => break d,
+                    Some(LanRequest::ListDisplays) => {
+                        let displays = displays_for_host();
+                        let _ = lan::send_response(
+                            &mut wr,
+                            &channel,
+                            &LanResponse::Displays { displays },
+                        )
+                        .await;
+                    },
+                    // Ignore a stray Screenshot/StartStream sent mid-stream.
+                    Some(_) => {},
+                    None => break 'session, // reader stopped (client disconnected)
+                },
+            }
+        };
+
+        // Stop the current capture before restarting on the new display.
+        drop(rx);
+        let _ = capture.await;
+        display = Some(switch_to);
     }
 
-    drop(rx); // closes the channel so the capture thread stops
-    if let Ok(Err(e)) = capture.await {
-        tracing::debug!(error = %e, "screen capture stream ended with error");
-    }
     Ok(())
 }
 
 /// Fallback for platforms without a host capture backend (e.g. Windows).
 #[cfg(not(any(target_os = "linux", target_os = "macos")))]
 async fn stream_screen(
-    stream: &mut TcpStream,
-    channel: &SealedChannel,
+    mut stream: TcpStream,
+    channel: Arc<SealedChannel>,
     _fps: u16,
+    _display: Option<u32>,
 ) -> AgentResult<()> {
-    let _ = lan::send_response(stream, channel, &LanResponse::Error {
+    let _ = lan::send_response(&mut stream, &channel, &LanResponse::Error {
         message: "live streaming is not supported on this platform yet".to_string(),
     })
     .await;
