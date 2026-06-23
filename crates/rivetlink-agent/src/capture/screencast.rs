@@ -25,11 +25,13 @@ use crate::error::AgentResult;
 
 /// Tile edge length for delta encoding.
 const TILE: usize = 128;
-/// Send a full keyframe at least this often (frames) as a safety net. We only
-/// commit `prev` on a successful send, so dropped frames already self-heal (the
-/// next frame re-diffs against the last *sent* state). This rare keyframe only
-/// guards the residual case — a tile skipped by an encode error.
-const KEYFRAME_INTERVAL: u32 = 600;
+/// Send a full keyframe at least this often (frames). Besides recovering tiles
+/// skipped by an encode error, this re-fills any region that was stale in the
+/// initial keyframe (e.g. a capture backend that warms up to a blank frame, or
+/// delivers dirty-region frames): static areas never "change", so without a
+/// periodic keyframe they'd stay wrong until something moves over them. At ~20
+/// fps this is every ~8s — small over LAN, frequent enough to self-heal.
+const KEYFRAME_INTERVAL: u32 = 160;
 /// When the screen is static, still emit a tiny empty frame at least this often
 /// so the client can tell a static screen from a stalled/slow link.
 const HEARTBEAT: Duration = Duration::from_millis(1000);
@@ -283,6 +285,13 @@ mod macos {
         let mut capturer = build_capturer(fps, display)?;
         capturer.start_capture();
         tracing::info!(fps, "screencast(macos): capturer started");
+
+        // ScreenCaptureKit's first frames after start can be blank/partial while
+        // the capture warms up. Discard a few so the keyframe is a complete
+        // screen (otherwise static regions stay black until they're damaged).
+        for _ in 0..5 {
+            let _ = capturer.get_next_frame();
+        }
 
         let mut enc = super::TileEncoder::new();
         let mut got_frame = false;
