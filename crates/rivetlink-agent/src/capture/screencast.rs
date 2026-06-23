@@ -55,6 +55,7 @@ struct TileRect {
 /// stays unset.
 fn build_capturer(fps: u16, resolution: Resolution, display: Option<u32>) -> AgentResult<Capturer> {
     if !scap::is_supported() {
+        tracing::warn!("screencast: scap reports capture is not supported here");
         return Err(AgentError::Lan("screen capture not supported here".to_string()));
     }
 
@@ -64,15 +65,25 @@ fn build_capturer(fps: u16, resolution: Resolution, display: Option<u32>) -> Age
             // scap only exposes `get_all_targets()` publicly (`get_main_display`
             // is crate-private and panics on Linux). Pick the requested display
             // by id, else the first one — "screen 1".
-            let mut displays = scap::get_all_targets()
+            let all = scap::get_all_targets();
+            let n_displays = all.iter().filter(|t| matches!(t, scap::Target::Display(_))).count();
+            let mut displays = all
                 .into_iter()
                 .filter(|t| matches!(t, scap::Target::Display(_)));
-            match display {
+            let picked = match display {
                 Some(id) => displays.find(
                     |t| matches!(t, scap::Target::Display(d) if d.id == id),
                 ),
                 None => displays.next(),
-            }
+            };
+            let req = display; // `display` is a reserved token in tracing fields
+            tracing::info!(
+                requested = ?req,
+                available = n_displays,
+                got = picked.is_some(),
+                "screencast: macOS display target"
+            );
+            picked
         }
         #[cfg(not(target_os = "macos"))]
         {
@@ -89,7 +100,10 @@ fn build_capturer(fps: u16, resolution: Resolution, display: Option<u32>) -> Age
         output_resolution: resolution,
         ..Default::default()
     };
-    Capturer::build(options).map_err(|e| AgentError::Lan(format!("screencast: {e}")))
+    Capturer::build(options).map_err(|e| {
+        tracing::warn!(error = %e, "screencast: Capturer::build failed (permission? no display?)");
+        AgentError::Lan(format!("screencast: {e}"))
+    })
 }
 
 /// The displays the host can share. Empty on Linux, where scap can't enumerate
@@ -126,15 +140,38 @@ pub fn stream_tiles_blocking(
     // keeps the initial keyframe small enough to stay usable over weak Wi-Fi.
     let mut capturer = build_capturer(fps, Resolution::_720p, display)?;
     capturer.start_capture();
+    let scr = display; // reserved token in tracing fields — log a copy
+    tracing::info!(fps, screen = ?scr, "screencast: capturer started, pulling frames");
 
     let mut prev: Option<(usize, usize, Vec<u8>)> = None; // (w, h, BGRA)
     let mut counter: u32 = 0;
     let mut last_sent = Instant::now();
+    let mut got_frame = false;
 
     loop {
-        let Ok(frame) = capturer.get_next_frame() else {
-            break; // stream ended
+        let frame = match capturer.get_next_frame() {
+            Ok(f) => f,
+            Err(e) => {
+                tracing::warn!(
+                    error = %e,
+                    got_any = got_frame,
+                    "screencast: get_next_frame failed — capture ending (permission/portal?)"
+                );
+                // If we never produced a single frame, the capture never really
+                // started — almost always denied Screen Recording permission on
+                // macOS. Surface that as an error so the client shows a reason
+                // instead of a bare "connection ended". Once frames have flowed,
+                // a later failure is just a normal end (disconnect/portal close).
+                if !got_frame {
+                    capturer.stop_capture();
+                    return Err(AgentError::Lan(format!(
+                        "screen capture failed to start (Screen Recording permission?): {e}"
+                    )));
+                }
+                break;
+            },
         };
+        got_frame = true;
         let Some((w, h, data)) = frame_to_bgra(frame) else {
             continue;
         };

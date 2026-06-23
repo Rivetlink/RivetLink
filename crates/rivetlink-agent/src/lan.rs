@@ -107,6 +107,7 @@ pub async fn serve_with_events(
         tokio::select! {
             accepted = listener.accept() => {
                 let (stream, peer) = accepted?;
+                tracing::info!(%peer, "LAN: accepted connection, starting handshake");
                 // Disable Nagle: live streaming pushes many small sealed frames;
                 // coalescing them adds bursty stalls to the real-time view.
                 let _ = stream.set_nodelay(true);
@@ -192,12 +193,14 @@ async fn handle(
         },
     };
 
+    tracing::info!(%peer, label = %label, "LAN: session established, serving");
     if let Some(ev) = &events {
         let _ = ev.send(HostEvent::ClientConnected(label)).await;
     }
     // Share the channel (Arc) so a live stream can read control messages in a
     // side task while it writes frames — the sealed channel is stateless.
     let result = serve_loop(stream, Arc::new(channel)).await;
+    tracing::info!(%peer, "LAN: session ended");
     if let Some(ev) = &events {
         let _ = ev.send(HostEvent::ClientDisconnected).await;
     }
@@ -218,10 +221,12 @@ impl Drop for AbortOnDrop {
 async fn serve_loop(mut stream: TcpStream, channel: Arc<SealedChannel>) -> AgentResult<()> {
     loop {
         let Ok(req) = lan::recv_request(&mut stream, &channel).await else {
+            tracing::debug!("LAN serve: client closed channel");
             return Ok(());
         };
         match req {
             LanRequest::Screenshot => {
+                tracing::info!("LAN serve: Screenshot request");
                 let resp = match screenshot::capture_png().await {
                     Ok(png) => LanResponse::Screenshot {
                         png_b64: B64.encode(png),
@@ -236,11 +241,14 @@ async fn serve_loop(mut stream: TcpStream, channel: Arc<SealedChannel>) -> Agent
             },
             LanRequest::ListDisplays => {
                 let displays = displays_for_host();
+                tracing::info!(count = displays.len(), "LAN serve: ListDisplays request");
                 lan::send_response(&mut stream, &channel, &LanResponse::Displays { displays })
                     .await
                     .map_err(|e| AgentError::Lan(e.to_string()))?;
             },
             LanRequest::StartStream { fps, display } => {
+                let scr = display;
+                tracing::info!(fps, screen = ?scr, "LAN serve: StartStream request");
                 // The stream runs until the client disconnects; then done.
                 return stream_screen(stream, channel, fps, display).await;
             },
@@ -278,6 +286,8 @@ async fn stream_screen(
 ) -> AgentResult<()> {
     use rivetlink_sdk::lan::FrameDelta;
 
+    let scr = display; // reserved token in tracing fields — log a copy
+    tracing::info!(fps, screen = ?scr, "LAN stream: starting");
     let (mut rd, mut wr) = stream.into_split();
 
     // Read client control messages in a side task and forward them over a
@@ -315,13 +325,36 @@ async fn stream_screen(
                             .await
                             .is_err()
                         {
-                            break 'session; // client disconnected
+                            tracing::info!("LAN stream: client disconnected (frame send failed)");
+                            break 'session;
                         }
                     },
-                    None => break 'session, // capture ended (portal closed / error)
+                    None => {
+                        // Capture stopped on its own. Await the task to learn WHY
+                        // (build failure, missing Screen Recording permission on
+                        // macOS, portal closed) and surface it — to the host log
+                        // and to the client, which otherwise just sees the stream
+                        // die ("connection ended") with no reason.
+                        let reason = match capture.await {
+                            Ok(Ok(())) => "capture stopped".to_string(),
+                            Ok(Err(e)) => e.to_string(),
+                            Err(e) => format!("capture task crashed: {e}"),
+                        };
+                        tracing::warn!(reason, "LAN stream: capture ended");
+                        let _ = lan::send_response(
+                            &mut wr,
+                            &channel,
+                            &LanResponse::Error { message: reason },
+                        )
+                        .await;
+                        break 'session;
+                    },
                 },
                 ctrl = ctrl_rx.recv() => match ctrl {
-                    Some(LanRequest::SwitchDisplay { display: d }) => break d,
+                    Some(LanRequest::SwitchDisplay { display: d }) => {
+                        tracing::info!(display = d, "LAN stream: switching display");
+                        break d;
+                    },
                     Some(LanRequest::ListDisplays) => {
                         let displays = displays_for_host();
                         let _ = lan::send_response(
@@ -333,7 +366,10 @@ async fn stream_screen(
                     },
                     // Ignore a stray Screenshot/StartStream sent mid-stream.
                     Some(_) => {},
-                    None => break 'session, // reader stopped (client disconnected)
+                    None => {
+                        tracing::info!("LAN stream: client disconnected (control closed)");
+                        break 'session; // reader stopped (client disconnected)
+                    },
                 },
             }
         };

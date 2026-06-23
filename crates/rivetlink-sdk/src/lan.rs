@@ -140,7 +140,19 @@ fn discover_blocking(timeout: Duration) -> SdkResult<Vec<LanDevice>> {
         }
     }
     let _ = daemon.shutdown();
-    Ok(found.into_values().filter_map(HostAccumulator::into_device).collect())
+    for acc in found.values() {
+        tracing::debug!(
+            name = acc.name.as_deref().unwrap_or("?"),
+            port = acc.port,
+            pk = acc.public_key.as_deref().map(short).unwrap_or("none"),
+            addrs = ?acc.addresses,
+            "discovery: resolved host"
+        );
+    }
+    let devices: Vec<LanDevice> =
+        found.into_values().filter_map(HostAccumulator::into_device).collect();
+    tracing::info!(hosts = devices.len(), "discovery: done");
+    Ok(devices)
 }
 
 /// One host's advertisement, gathered across every interface/address-family
@@ -194,10 +206,17 @@ impl HostAccumulator {
 
     fn into_device(self) -> Option<LanDevice> {
         // Most connectable first: routable IPv4, then routable IPv6, then
-        // link-local. A `fe80::` link-local IPv6 can't be dialled without a
-        // scope id, so it's the worst; loopback-only hosts are dropped entirely.
+        // link-local IPv4. Anything at rank >= 4 is undialable and dropped:
+        // loopback, and crucially `fe80::` link-local IPv6 — it can't be reached
+        // without a scope/zone id, so surfacing it only spawns a phantom IPv6
+        // entry next to the real IPv4 one (and "bad address" on connect).
         let best = self.addresses.iter().min_by_key(|ip| addr_rank(ip)).copied()?;
         if addr_rank(&best) >= 4 {
+            tracing::debug!(
+                name = self.name.as_deref().unwrap_or("?"),
+                addrs = ?self.addresses,
+                "discovery: host has only undialable addresses (link-local IPv6/loopback), dropping"
+            );
             return None;
         }
         Some(LanDevice {
@@ -210,13 +229,21 @@ impl HostAccumulator {
     }
 }
 
-/// Preference for an advertised address — lower is better.
+/// Short, log-safe prefix of a base64 key — enough to correlate two ends.
+fn short(b64: &str) -> &str {
+    let t = b64.trim();
+    &t[..t.len().min(10)]
+}
+
+/// Preference for an advertised address — lower is better; rank >= 4 is dropped.
 fn addr_rank(ip: &IpAddr) -> u8 {
     match ip {
         IpAddr::V4(v4) if v4.is_loopback() => 4,
         IpAddr::V6(v6) if v6.is_loopback() => 4,
-        IpAddr::V4(v4) if v4.is_link_local() => 2, // 169.254.0.0/16
-        IpAddr::V6(v6) if (v6.segments()[0] & 0xffc0) == 0xfe80 => 3, // fe80::/10
+        // fe80::/10 — link-local IPv6 needs a scope id we don't carry, so it's
+        // undialable. Drop it (rank 4) rather than rank it just below loopback.
+        IpAddr::V6(v6) if (v6.segments()[0] & 0xffc0) == 0xfe80 => 4,
+        IpAddr::V4(v4) if v4.is_link_local() => 2, // 169.254.0.0/16 — dialable APIPA
         IpAddr::V4(_) => 0,                         // routable IPv4 — best
         IpAddr::V6(_) => 1,                         // routable IPv6
     }
@@ -423,9 +450,13 @@ where
 /// delayed-ACK, add bursty ~40-200ms stalls — the exact "hiccup every second"
 /// you feel on a real-time screen share. `TCP_NODELAY` ships each frame at once.
 async fn connect_nodelay(addr: SocketAddr) -> SdkResult<TcpStream> {
-    let stream = TcpStream::connect(addr).await?;
+    tracing::debug!(%addr, "LAN: opening TCP");
+    let stream = TcpStream::connect(addr).await.inspect_err(|e| {
+        tracing::warn!(%addr, error = %e, "LAN: TCP connect failed");
+    })?;
     // Best-effort: a missing TCP_NODELAY only costs latency, never correctness.
     let _ = stream.set_nodelay(true);
+    tracing::debug!(%addr, "LAN: TCP connected");
     Ok(stream)
 }
 
@@ -435,8 +466,10 @@ pub async fn connect_password(
     addr: SocketAddr,
     password: &str,
 ) -> SdkResult<(TcpStream, SealedChannel)> {
+    tracing::info!(%addr, "LAN connect: PIN mode");
     let mut stream = connect_nodelay(addr).await?;
     let channel = direct::client_connect_password(&mut stream, password).await?;
+    tracing::info!(%addr, "LAN connect: channel up (PIN)");
     Ok((stream, channel))
 }
 
@@ -448,8 +481,10 @@ pub async fn connect_key_pinned(
     pinned_host_b64: Option<&str>,
 ) -> SdkResult<(TcpStream, SealedChannel)> {
     let pinned = parse_pinned_host(pinned_host_b64)?;
+    tracing::info!(%addr, pinned = pinned.is_some(), "LAN connect: key mode");
     let mut stream = connect_nodelay(addr).await?;
     let channel = direct::client_connect_key(&mut stream, identity, pinned).await?;
+    tracing::info!(%addr, "LAN connect: channel up (key)");
     Ok((stream, channel))
 }
 
@@ -567,9 +602,13 @@ where
     // and opening (reads) need no shared mutable state — an Arc to share the key
     // is enough. Reading frames is the hot path and stays in this task; the rare
     // display-switch writes go to a small writer task.
+    // `display` is a reserved token in tracing's field shorthand, so log a copy.
+    let scr = display;
+    tracing::info!(fps, screen = ?scr, "LAN stream: requesting StartStream");
     let channel = Arc::new(channel);
     let (mut rd, mut wr) = stream.into_split();
     send_request(&mut wr, &channel, &LanRequest::StartStream { fps, display }).await?;
+    let mut first = true;
 
     let ch_w = Arc::clone(&channel);
     let writer = tokio::spawn(async move {
@@ -589,11 +628,19 @@ where
     loop {
         match recv_response(&mut rd, &channel).await? {
             LanResponse::Frame(delta) => {
+                if first {
+                    tracing::info!(w = delta.w, h = delta.h, "LAN stream: first frame received");
+                    first = false;
+                }
                 if !on_frame(&delta) {
+                    tracing::info!("LAN stream: stopped by viewer");
                     return Ok(());
                 }
             },
-            LanResponse::Error { message } => return Err(SdkError::Relay(message)),
+            LanResponse::Error { message } => {
+                tracing::warn!(%message, "LAN stream: host sent error");
+                return Err(SdkError::Relay(message));
+            },
             LanResponse::Screenshot { .. } | LanResponse::Displays { .. } => {},
         }
     }
