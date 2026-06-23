@@ -196,6 +196,11 @@ impl TileEncoder {
     /// a static screen still reads as "alive, nothing moving" instead of tripping
     /// the client's slow-link indicator. No-op until a real frame has been sent.
     /// Returns `false` when the consumer is gone.
+    ///
+    /// Only the Linux (Mutter+GStreamer) backend needs this — its capture is
+    /// damage-driven, so a static screen produces no frames; the macOS scap loop
+    /// blocks on `get_next_frame` and drives heartbeats from the capturer itself.
+    #[cfg(target_os = "linux")]
     pub(crate) fn heartbeat(&mut self, tx: &Sender<FrameDelta>) -> bool {
         let Some((w, h, _)) = self.prev.as_ref() else {
             return true; // nothing to anchor a heartbeat to yet
