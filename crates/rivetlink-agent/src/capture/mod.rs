@@ -15,8 +15,10 @@ pub mod screenshot;
 #[cfg(target_os = "linux")]
 pub mod portal;
 
-// Native single-screen capture (ScreenCast portal + PipeWire), Linux only.
-#[cfg(target_os = "linux")]
+// Native single-screen live capture via `scap`: ScreenCast portal + PipeWire on
+// Linux, ScreenCaptureKit on macOS. Windows stays client-only for now (scap's
+// Windows capture backend doesn't build), matching the app's host support.
+#[cfg(any(target_os = "linux", target_os = "macos"))]
 pub mod screencast;
 
 /// A single captured frame as raw, owned pixel data plus its dimensions.

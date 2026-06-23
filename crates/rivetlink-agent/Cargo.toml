@@ -32,17 +32,20 @@ ed25519-dalek = { workspace = true }
 x25519-dalek = { workspace = true }
 rand_08 = { workspace = true }
 base64 = { workspace = true }
+# Screen capture: ScreenCast portal + PipeWire on Linux, ScreenCaptureKit on
+# macOS (where we pick the primary display programmatically — no picker dialog).
+# Windows stays client-only for now (scap's Windows capture backend doesn't build).
 scap = "0.0.8"
+# Live-stream frames are JPEG tile-deltas on both host platforms, so this is general.
+jpeg-encoder = "0.6"
 
 [lints]
 workspace = true
 
 [target.'cfg(target_os = "linux")'.dependencies]
-# Native screen capture via the XDG ScreenCast portal + PipeWire (scap wraps
-# the portal/pipewire stack, so the user picks one screen and nothing extra is
-# installed). ashpd is kept for the full-desktop Screenshot-portal fallback.
+# ashpd: the full-desktop Screenshot-portal fallback (Linux screenshot path).
+# png: one-shot screenshot encoding via the ScreenCast portal (Linux only;
+# macOS/Windows screenshots shell out to native tools).
 ashpd = { version = "0.9", default-features = false, features = ["tokio"] }
-scap = "0.0.8"
 png = "0.17"
-jpeg-encoder = "0.6"
 url = "2"

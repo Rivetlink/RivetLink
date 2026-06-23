@@ -45,14 +45,39 @@ struct TileRect {
 }
 
 /// Build a screen-cast capturer (BGRA frames at `fps`, scaled to `resolution`).
-/// Triggers the portal "pick a screen" dialog.
+///
+/// On macOS/Windows we set `target` to the primary display, so capture starts
+/// straight away with **no picker dialog** — the host just shares screen 1.
+/// (Switching displays will later come from the client via the protocol.) On
+/// Linux there is no programmatic display pick: `scap` drives the ScreenCast
+/// portal, whose own dialog handles selection, so we leave `target` unset.
 fn build_capturer(fps: u16, resolution: Resolution) -> AgentResult<Capturer> {
     if !scap::is_supported() {
         return Err(AgentError::Lan("screen capture not supported here".to_string()));
     }
+
+    // Default to the first display where the platform lets us pick one without
+    // prompting. scap only exposes `get_all_targets()` publicly (its
+    // `get_main_display` is crate-private and panics on Linux anyway), so take
+    // the first `Display` target — "screen 1". On Linux we leave `target` unset:
+    // scap drives the ScreenCast portal there and its dialog handles selection.
+    let target = {
+        #[cfg(target_os = "macos")]
+        {
+            scap::get_all_targets()
+                .into_iter()
+                .find(|t| matches!(t, scap::Target::Display(_)))
+        }
+        #[cfg(not(target_os = "macos"))]
+        {
+            None
+        }
+    };
+
     let options = Options {
         fps: u32::from(fps).max(1),
         show_cursor: true,
+        target,
         output_type: FrameType::BGRAFrame,
         output_resolution: resolution,
         ..Default::default()
@@ -210,7 +235,9 @@ fn encode_tile(frame: &[u8], r: &TileRect, quality: u8) -> AgentResult<Vec<u8>> 
 /// Capture one frame from a user-selected screen and return PNG bytes.
 ///
 /// Blocking: the portal shows a "pick a screen" dialog and PipeWire delivery is
-/// synchronous. Call from `spawn_blocking`.
+/// synchronous. Call from `spawn_blocking`. Linux only — it backs the Linux
+/// screenshot fallback; macOS/Windows screenshots use native CLI tools.
+#[cfg(target_os = "linux")]
 pub fn capture_png_blocking() -> AgentResult<Vec<u8>> {
     // Full native resolution for a crisp one-shot screenshot.
     let mut capturer = build_capturer(30, Resolution::Captured)?;
@@ -233,6 +260,7 @@ pub fn capture_png_blocking() -> AgentResult<Vec<u8>> {
 }
 
 /// Convert a captured frame into tightly-packed RGBA8 + dimensions.
+#[cfg(target_os = "linux")]
 fn into_rgba(frame: Frame) -> AgentResult<(u32, u32, Vec<u8>)> {
     // We requested BGRA, but handle the common variants defensively.
     let (w, h, mut data, swap_rb) = match frame {
@@ -265,6 +293,7 @@ fn into_rgba(frame: Frame) -> AgentResult<(u32, u32, Vec<u8>)> {
     Ok((w, h, data))
 }
 
+#[cfg(target_os = "linux")]
 fn encode_png(width: u32, height: u32, rgba: &[u8]) -> AgentResult<Vec<u8>> {
     let mut out = Vec::new();
     {

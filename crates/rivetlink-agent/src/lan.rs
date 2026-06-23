@@ -229,8 +229,9 @@ async fn serve_loop(stream: &mut TcpStream, channel: &SealedChannel) -> AgentRes
 }
 
 /// Capture the screen continuously and send JPEG frames over the sealed channel
-/// until the client disconnects. One portal prompt covers the whole stream.
-#[cfg(target_os = "linux")]
+/// until the client disconnects. On macOS capture starts on the primary display
+/// with no dialog; on Linux one ScreenCast portal prompt covers the whole stream.
+#[cfg(any(target_os = "linux", target_os = "macos"))]
 async fn stream_screen(stream: &mut TcpStream, channel: &SealedChannel, fps: u16) -> AgentResult<()> {
     use rivetlink_sdk::lan::FrameDelta;
 
@@ -259,8 +260,8 @@ async fn stream_screen(stream: &mut TcpStream, channel: &SealedChannel, fps: u16
     Ok(())
 }
 
-/// Streaming is Linux-only for now (ScreenCast portal + PipeWire).
-#[cfg(not(target_os = "linux"))]
+/// Fallback for platforms without a host capture backend (e.g. Windows).
+#[cfg(not(any(target_os = "linux", target_os = "macos")))]
 async fn stream_screen(
     stream: &mut TcpStream,
     channel: &SealedChannel,
