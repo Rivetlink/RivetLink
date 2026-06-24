@@ -16,7 +16,7 @@
 //! GNOME-only (Mutter). Other compositors fall back to nothing here for now.
 
 use std::collections::BTreeMap;
-use std::io::Read;
+use std::io::{BufRead, BufReader, Read};
 use std::process::{Child, Command, Stdio};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
@@ -230,32 +230,62 @@ impl Drop for MutterSession {
 /// [`stream`] instead.
 fn spawn_gst(node: u32) -> AgentResult<Child> {
     let out_caps = format!("video/x-raw,format=BGRx,width={OUT_W},height={OUT_H}");
-    Command::new("gst-launch-1.0")
-        .args([
-            "-q",
-            "pipewiresrc",
-            &format!("path={node}"),
-            "do-timestamp=true",
-            "!",
-            "videoscale",
-            "add-borders=true",
-            "!",
-            "videoconvert",
-            "!",
-            &out_caps,
-            "!",
-            "fdsink",
-            "fd=1",
-        ])
-        .stdout(Stdio::piped())
-        .stderr(Stdio::null())
-        .spawn()
-        .map_err(|e| {
-            AgentError::Lan(format!(
-                "gst-launch-1.0 failed to start (install gstreamer1.0-tools + \
-                 gstreamer1.0-pipewire): {e}"
-            ))
-        })
+    let mut cmd = Command::new("gst-launch-1.0");
+    cmd.args([
+        "-q",
+        "pipewiresrc",
+        &format!("path={node}"),
+        "do-timestamp=true",
+        "!",
+        "videoscale",
+        "add-borders=true",
+        "!",
+        "videoconvert",
+        "!",
+        &out_caps,
+        "!",
+        "fdsink",
+        "fd=1",
+    ])
+    .stdout(Stdio::piped())
+    .stderr(Stdio::piped());
+
+    // We run inside an AppImage, which exports LD_LIBRARY_PATH + GST_PLUGIN_*
+    // pointing at its *bundled* libs. The system gst-launch-1.0 we spawn must
+    // load the host's GLib/GStreamer, not ours — a version mismatch makes it
+    // crash on startup (no frames, silent). Strip those so the child runs in a
+    // clean system environment. Harmless when run from a deb (vars unset).
+    for var in [
+        "LD_LIBRARY_PATH",
+        "LD_PRELOAD",
+        "GST_PLUGIN_PATH",
+        "GST_PLUGIN_PATH_1_0",
+        "GST_PLUGIN_SYSTEM_PATH",
+        "GST_PLUGIN_SYSTEM_PATH_1_0",
+        "GST_PLUGIN_SCANNER",
+        "GIO_MODULE_DIR",
+        "GTK_PATH",
+    ] {
+        cmd.env_remove(var);
+    }
+
+    let mut child = cmd.spawn().map_err(|e| {
+        AgentError::Lan(format!(
+            "gst-launch-1.0 failed to start (install gstreamer1.0-tools + \
+             gstreamer1.0-pipewire): {e}"
+        ))
+    })?;
+
+    // Drain gst's stderr to the agent log so a setup failure (missing plugin,
+    // bad pipewire node, lib mismatch) shows up instead of just "no frames".
+    if let Some(err) = child.stderr.take() {
+        std::thread::spawn(move || {
+            for line in BufReader::new(err).lines().map_while(Result::ok) {
+                tracing::debug!(target: "gst", "{line}");
+            }
+        });
+    }
+    Ok(child)
 }
 
 // ---- Monitor enumeration (Mutter DisplayConfig) ----------------------------
