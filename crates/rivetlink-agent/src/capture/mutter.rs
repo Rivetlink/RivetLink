@@ -30,19 +30,49 @@ use rivetlink_sdk::lan::{DisplayInfo, FrameDelta};
 
 use crate::error::{AgentError, AgentResult};
 
-/// Fixed output size for the stream. `videoscale add-borders=true` pillar/letter-
-/// boxes the monitor into this box, so every frame is exactly `W*H*4` bytes and
-/// the aspect ratio is preserved. 720p keeps keyframes small over weak Wi-Fi.
-const OUT_W: usize = 1280;
-const OUT_H: usize = 720;
+/// Upper bound on the streamed frame. The capture is downscaled to fit this box
+/// **while preserving the monitor's aspect ratio** — so a 21:9 ultrawide streams
+/// as e.g. 1920×824 (full width, no letterbox), not squished into a 16:9 box.
+/// Never upscales (a small screen streams at its native size). 1080p-ish keeps
+/// keyframes reasonable over weak Wi-Fi; tile-delta keeps the steady state tiny.
+const MAX_W: u32 = 1920;
+const MAX_H: u32 = 1080;
+/// Fallback when the monitor's mode resolution can't be read.
+const FALLBACK_W: usize = 1280;
+const FALLBACK_H: usize = 720;
 
 const SC_DEST: &str = "org.gnome.Mutter.ScreenCast";
 const SC_PATH: &str = "/org/gnome/Mutter/ScreenCast";
 
-/// One monitor Mutter can cast.
+/// One monitor Mutter can cast, with its current-mode pixel resolution (0×0 when
+/// unknown — capture then falls back to a fixed size).
 struct MonitorInfo {
     connector: String,
     label: String,
+    width: u32,
+    height: u32,
+}
+
+/// Scale `src` down to fit the `MAX_W`×`MAX_H` box, preserving aspect ratio and
+/// never upscaling; result dimensions are even (videoconvert/JPEG prefer it).
+/// Returns the fallback size when the source resolution is unknown.
+fn fit_output(src_w: u32, src_h: u32) -> (usize, usize) {
+    if src_w == 0 || src_h == 0 {
+        return (FALLBACK_W, FALLBACK_H);
+    }
+    // Integer math (no float casts): shrink to the width bound, then the height
+    // bound; each step scales the other side by the same ratio.
+    let (mut w, mut h) = (src_w, src_h);
+    if w > MAX_W {
+        h = u32::try_from(u64::from(h) * u64::from(MAX_W) / u64::from(w)).unwrap_or(MAX_H);
+        w = MAX_W;
+    }
+    if h > MAX_H {
+        w = u32::try_from(u64::from(w) * u64::from(MAX_H) / u64::from(h)).unwrap_or(MAX_W);
+        h = MAX_H;
+    }
+    let even = |v: u32| (v & !1).max(2) as usize;
+    (even(w), even(h))
 }
 
 // ---- Public API ------------------------------------------------------------
@@ -78,14 +108,23 @@ pub fn stream(
         .filter(|i| *i < mons.len())
         .unwrap_or(0);
     let connector = mons[idx].connector.clone();
-    tracing::info!(connector = %connector, fps, "screencast(linux): starting Mutter ScreenCast");
+    // Output keeps the monitor's aspect ratio (capped at MAX_W×MAX_H) so an
+    // ultrawide host doesn't get letterboxed into 16:9 and look low-res.
+    let (out_w, out_h) = fit_output(mons[idx].width, mons[idx].height);
+    tracing::info!(
+        connector = %connector,
+        fps,
+        src = format!("{}x{}", mons[idx].width, mons[idx].height),
+        out = format!("{out_w}x{out_h}"),
+        "screencast(linux): starting Mutter ScreenCast"
+    );
 
     // 1. Dialog-free Mutter session -> PipeWire node id.
     let session = MutterSession::record_monitor(&connector)?;
     tracing::info!(node = session.node_id, "screencast(linux): got PipeWire node");
 
     // 2. gst-launch pulls that node and writes fixed-size BGRx frames to stdout.
-    let mut child = spawn_gst(session.node_id)?;
+    let mut child = spawn_gst(session.node_id, out_w, out_h)?;
     let mut stdout = child
         .stdout
         .take()
@@ -95,7 +134,7 @@ pub fn stream(
     // faster than we encode, and screen capture is damage-driven — bursts then
     // quiet). The main loop ticks at the target rate, encoding the latest frame
     // or sending a heartbeat when the screen is idle.
-    let frame_bytes = OUT_W * OUT_H * 4;
+    let frame_bytes = out_w * out_h * 4;
     let latest: Arc<Mutex<Option<Vec<u8>>>> = Arc::new(Mutex::new(None));
     let alive = Arc::new(AtomicBool::new(true));
     let saw_frame = Arc::new(AtomicBool::new(false));
@@ -121,7 +160,7 @@ pub fn stream(
         std::thread::sleep(interval);
         let frame = latest.lock().unwrap_or_else(std::sync::PoisonError::into_inner).take();
         let keep_going = match frame {
-            Some(buf) => enc.push(OUT_W, OUT_H, buf, quality, &tx),
+            Some(buf) => enc.push(out_w, out_h, buf, quality, &tx),
             None => {
                 if !alive.load(Ordering::Relaxed) {
                     break; // capture ended (gst gone)
@@ -228,8 +267,8 @@ impl Drop for MutterSession {
 /// it), so on a static screen the client would never see the initial frame. We
 /// let `pipewiresrc` deliver at the monitor's damage-driven rate and throttle in
 /// [`stream`] instead.
-fn spawn_gst(node: u32) -> AgentResult<Child> {
-    let out_caps = format!("video/x-raw,format=BGRx,width={OUT_W},height={OUT_H}");
+fn spawn_gst(node: u32, out_w: usize, out_h: usize) -> AgentResult<Child> {
+    let out_caps = format!("video/x-raw,format=BGRx,width={out_w},height={out_h}");
     let mut cmd = Command::new("gst-launch-1.0");
     cmd.args([
         "-q",
@@ -327,7 +366,7 @@ fn monitors() -> AgentResult<Vec<MonitorInfo>> {
     let mut monitors: Vec<MonitorInfo> = state
         .1
         .into_iter()
-        .map(|((connector, vendor, product, _serial), _modes, _props)| {
+        .map(|((connector, vendor, product, _serial), modes, _props)| {
             let label = if !product.is_empty() {
                 format!("{connector} · {product}")
             } else if !vendor.is_empty() {
@@ -335,7 +374,24 @@ fn monitors() -> AgentResult<Vec<MonitorInfo>> {
             } else {
                 connector.clone()
             };
-            MonitorInfo { connector, label }
+            // The active mode carries the live pixel resolution; fall back to the
+            // first listed mode, else 0×0 (capture uses a fixed size then).
+            let (width, height) = modes
+                .iter()
+                .find(|m| mode_flag(&m.6, "is-current"))
+                .or_else(|| modes.first())
+                .map_or((0, 0), |m| {
+                    (
+                        u32::try_from(m.1).unwrap_or(0),
+                        u32::try_from(m.2).unwrap_or(0),
+                    )
+                });
+            MonitorInfo {
+                connector,
+                label,
+                width,
+                height,
+            }
         })
         .collect();
 
@@ -346,6 +402,34 @@ fn monitors() -> AgentResult<Vec<MonitorInfo>> {
     Ok(monitors)
 }
 
+/// Read a boolean flag (e.g. `is-current`) from a Mutter mode's `a{sv}` props.
+fn mode_flag(props: &BTreeMap<String, OwnedValue>, key: &str) -> bool {
+    matches!(props.get(key).map(|v| &**v), Some(Value::Bool(true)))
+}
+
 fn dbus_err(e: impl std::fmt::Display) -> AgentError {
     AgentError::Lan(format!("Mutter ScreenCast D-Bus error: {e}"))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn fit_preserves_aspect_within_bounds() {
+        // 21:9 ultrawide -> full width, no letterbox.
+        assert_eq!(fit_output(3440, 1440), (1920, 802));
+        // 16:9 1080p passes through unchanged.
+        assert_eq!(fit_output(1920, 1080), (1920, 1080));
+        // 1440p and 4K both clamp to the 1080p box.
+        assert_eq!(fit_output(2560, 1440), (1920, 1080));
+        assert_eq!(fit_output(3840, 2160), (1920, 1080));
+        // Small screens are never upscaled.
+        assert_eq!(fit_output(1366, 768), (1366, 768));
+        // Unknown resolution -> fixed fallback.
+        assert_eq!(fit_output(0, 0), (FALLBACK_W, FALLBACK_H));
+        // Dimensions are always even.
+        let (w, h) = fit_output(3441, 1441);
+        assert_eq!((w % 2, h % 2), (0, 0));
+    }
 }
