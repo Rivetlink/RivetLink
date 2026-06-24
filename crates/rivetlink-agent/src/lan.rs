@@ -210,7 +210,9 @@ async fn handle(
     // The connected/disconnected events are emitted inside serve_loop, bracketing
     // the *stream* (StartStream..end) — not the bare handshake — so the host only
     // shows "connected" once the client is actually viewing.
-    serve_loop(stream, Arc::new(channel), events, label, kick).await
+    let result = serve_loop(stream, Arc::new(channel), events, label, kick).await;
+    tracing::info!(%peer, ok = result.is_ok(), "LAN: session ended");
+    result
 }
 
 /// Aborts a spawned task when dropped — keeps the stream's reader task from
@@ -257,7 +259,13 @@ async fn serve_loop(
                     .map_err(|e| AgentError::Lan(e.to_string()))?;
             },
             LanRequest::ListDisplays => {
-                let displays = displays_for_host();
+                // Enumerating displays uses `zbus::blocking` on Linux (Mutter);
+                // with zbus's tokio feature, a blocking D-Bus call from this async
+                // worker thread panics ("cannot block from within a runtime") and
+                // silently kills the session. Run it on a blocking thread.
+                let displays = tokio::task::spawn_blocking(displays_for_host)
+                    .await
+                    .unwrap_or_default();
                 tracing::info!(count = displays.len(), "LAN serve: ListDisplays request");
                 lan::send_response(&mut stream, &channel, &LanResponse::Displays { displays })
                     .await
@@ -398,7 +406,10 @@ async fn stream_screen(
                         break d;
                     },
                     Some(LanRequest::ListDisplays) => {
-                        let displays = displays_for_host();
+                        // See serve_loop: must not block this async worker.
+                        let displays = tokio::task::spawn_blocking(displays_for_host)
+                            .await
+                            .unwrap_or_default();
                         let _ = lan::send_response(
                             &mut wr,
                             &channel,
