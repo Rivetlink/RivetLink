@@ -122,8 +122,15 @@ pub async fn serve_with_events(
                 let auth = Arc::clone(&auth);
                 let events = events.clone();
                 // Each session watches the same kick channel; a bump drops
-                // whichever client is currently streaming.
-                let kick = kick.clone();
+                // whichever client is currently streaming. Catch the fresh
+                // receiver up to the current value first — a watch clone inherits
+                // the parent's *seen* version, so a kick from a PAST client would
+                // otherwise read as unseen and instantly drop this new session
+                // (symptom: after one kick, no one can reconnect until restart).
+                let kick = kick.clone().map(|mut rx| {
+                    let _ = rx.borrow_and_update();
+                    rx
+                });
                 sessions.spawn(async move {
                     if let Err(e) = handle(stream, signing_key, &auth, peer, events, kick).await {
                         tracing::warn!(%peer, error = %e, "LAN session ended with error");
