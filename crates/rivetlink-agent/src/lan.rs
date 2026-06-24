@@ -12,6 +12,7 @@ use base64::Engine;
 use ed25519_dalek::SigningKey;
 use tokio::net::{TcpListener, TcpStream};
 use tokio::sync::mpsc::Sender;
+use tokio::sync::watch;
 
 use rivetlink_crypto::sealed::SealedChannel;
 use rivetlink_sdk::direct;
@@ -29,10 +30,11 @@ use crate::trusted::TrustedClients;
 /// as "waiting" / "connected" status.
 #[derive(Debug, Clone)]
 pub enum HostEvent {
-    /// A client finished the handshake and now holds a session. The string is a
-    /// short label (peer address in PIN mode, client identity in key mode).
+    /// A client started *viewing* the screen (sent a `StartStream`, not merely
+    /// finished the handshake). The string is the client's device name when it
+    /// sent one, else a short network label (peer IP / client identity).
     ClientConnected(String),
-    /// A client's session ended (disconnect or error).
+    /// A client's session ended (disconnect, error, or host-initiated kick).
     ClientDisconnected,
 }
 
@@ -68,19 +70,24 @@ pub async fn serve(
     port: u16,
     auth: LanAuth,
 ) -> AgentResult<()> {
-    serve_with_events(signing_key, device_name, port, auth, None).await
+    serve_with_events(signing_key, device_name, port, auth, None, None).await
 }
 
 /// Like [`serve`], but reports session lifecycle on `events` (if given) so an
 /// embedding desktop app can show "waiting" / "connected". Cancel by dropping
 /// the future (aborting the task): the listener and mDNS advertisement are
 /// released on drop.
+///
+/// `kick` lets the host hang up on the *active* viewer without stopping the
+/// listener: every change to the watched value drops the current stream (the
+/// client sees a disconnect), while advertising and the PIN stay live.
 pub async fn serve_with_events(
     signing_key: SigningKey,
     device_name: String,
     port: u16,
     auth: LanAuth,
     events: Option<Sender<HostEvent>>,
+    kick: Option<watch::Receiver<u64>>,
 ) -> AgentResult<()> {
     let listener = bind_listener(port).await?;
     let local_port = listener.local_addr()?.port();
@@ -114,8 +121,11 @@ pub async fn serve_with_events(
                 let signing_key = signing_key.clone();
                 let auth = Arc::clone(&auth);
                 let events = events.clone();
+                // Each session watches the same kick channel; a bump drops
+                // whichever client is currently streaming.
+                let kick = kick.clone();
                 sessions.spawn(async move {
-                    if let Err(e) = handle(stream, signing_key, &auth, peer, events).await {
+                    if let Err(e) = handle(stream, signing_key, &auth, peer, events, kick).await {
                         tracing::warn!(%peer, error = %e, "LAN session ended with error");
                     }
                 });
@@ -146,6 +156,7 @@ async fn handle(
     auth: &LanAuth,
     peer: std::net::SocketAddr,
     events: Option<Sender<HostEvent>>,
+    kick: Option<watch::Receiver<u64>>,
 ) -> AgentResult<()> {
     let (channel, label) = match auth {
         LanAuth::Password(pin) => {
@@ -194,17 +205,12 @@ async fn handle(
     };
 
     tracing::info!(%peer, label = %label, "LAN: session established, serving");
-    if let Some(ev) = &events {
-        let _ = ev.send(HostEvent::ClientConnected(label)).await;
-    }
     // Share the channel (Arc) so a live stream can read control messages in a
     // side task while it writes frames — the sealed channel is stateless.
-    let result = serve_loop(stream, Arc::new(channel)).await;
-    tracing::info!(%peer, "LAN: session ended");
-    if let Some(ev) = &events {
-        let _ = ev.send(HostEvent::ClientDisconnected).await;
-    }
-    result
+    // The connected/disconnected events are emitted inside serve_loop, bracketing
+    // the *stream* (StartStream..end) — not the bare handshake — so the host only
+    // shows "connected" once the client is actually viewing.
+    serve_loop(stream, Arc::new(channel), events, label, kick).await
 }
 
 /// Aborts a spawned task when dropped — keeps the stream's reader task from
@@ -218,7 +224,18 @@ impl Drop for AbortOnDrop {
 }
 
 /// Serve requests on an established channel until the client disconnects.
-async fn serve_loop(mut stream: TcpStream, channel: Arc<SealedChannel>) -> AgentResult<()> {
+///
+/// `events`/`label` report the *viewing* lifecycle: `ClientConnected` fires when
+/// the client sends `StartStream` (using its device name if given, else the
+/// network `label`), and `ClientDisconnected` when that stream ends. A
+/// screenshot-only or connect-then-leave session never reports "connected".
+async fn serve_loop(
+    mut stream: TcpStream,
+    channel: Arc<SealedChannel>,
+    events: Option<Sender<HostEvent>>,
+    label: String,
+    kick: Option<watch::Receiver<u64>>,
+) -> AgentResult<()> {
     loop {
         let Ok(req) = lan::recv_request(&mut stream, &channel).await else {
             tracing::debug!("LAN serve: client closed channel");
@@ -246,11 +263,23 @@ async fn serve_loop(mut stream: TcpStream, channel: Arc<SealedChannel>) -> Agent
                     .await
                     .map_err(|e| AgentError::Lan(e.to_string()))?;
             },
-            LanRequest::StartStream { fps, display } => {
+            LanRequest::StartStream { fps, display, name } => {
                 let scr = display;
                 tracing::info!(fps, screen = ?scr, "LAN serve: StartStream request");
-                // The stream runs until the client disconnects; then done.
-                return stream_screen(stream, channel, fps, display).await;
+                // Now the client is actually viewing: announce who, falling back
+                // to the network label when it sent no name.
+                let who = name
+                    .filter(|n| !n.trim().is_empty())
+                    .unwrap_or_else(|| label.clone());
+                if let Some(ev) = &events {
+                    let _ = ev.send(HostEvent::ClientConnected(who)).await;
+                }
+                // The stream runs until the client disconnects or the host kicks.
+                let result = stream_screen(stream, channel, fps, display, kick).await;
+                if let Some(ev) = &events {
+                    let _ = ev.send(HostEvent::ClientDisconnected).await;
+                }
+                return result;
             },
             // Only meaningful while streaming; ignore it outside a stream.
             LanRequest::SwitchDisplay { .. } => {},
@@ -277,12 +306,25 @@ fn displays_for_host() -> Vec<DisplayInfo> {
 /// primary); a [`LanRequest::SwitchDisplay`] from the client mid-stream restarts
 /// capture on another screen (macOS). On macOS capture starts with no dialog; on
 /// Linux one ScreenCast portal prompt covers the stream and switching is a no-op.
+/// Resolve when the host bumps the `kick` channel (host-initiated disconnect);
+/// stay pending forever when there's no channel, so the `select!` arm is inert.
+#[cfg(any(target_os = "linux", target_os = "macos"))]
+async fn wait_kick(kick: &mut Option<watch::Receiver<u64>>) {
+    match kick {
+        Some(rx) => {
+            let _ = rx.changed().await;
+        },
+        None => std::future::pending().await,
+    }
+}
+
 #[cfg(any(target_os = "linux", target_os = "macos"))]
 async fn stream_screen(
     stream: TcpStream,
     channel: Arc<SealedChannel>,
     fps: u16,
     mut display: Option<u32>,
+    mut kick: Option<watch::Receiver<u64>>,
 ) -> AgentResult<()> {
     use rivetlink_sdk::lan::FrameDelta;
 
@@ -371,6 +413,12 @@ async fn stream_screen(
                         break 'session; // reader stopped (client disconnected)
                     },
                 },
+                // The host hit "disconnect" on the Receive-help page: drop this
+                // viewer, but leave the listener/advertisement up for the next one.
+                () = wait_kick(&mut kick) => {
+                    tracing::info!("LAN stream: host disconnected the client");
+                    break 'session;
+                },
             }
         };
 
@@ -390,6 +438,7 @@ async fn stream_screen(
     channel: Arc<SealedChannel>,
     _fps: u16,
     _display: Option<u32>,
+    _kick: Option<watch::Receiver<u64>>,
 ) -> AgentResult<()> {
     let _ = lan::send_response(&mut stream, &channel, &LanResponse::Error {
         message: "live streaming is not supported on this platform yet".to_string(),

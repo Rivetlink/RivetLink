@@ -328,6 +328,11 @@ pub enum LanRequest {
         fps: u16,
         #[serde(default)]
         display: Option<u32>,
+        /// The connecting client's device name, so the host can show *who* is
+        /// viewing ("Anna's MacBook is watching") and not just an IP. `None`
+        /// from older clients → the host falls back to the network label.
+        #[serde(default)]
+        name: Option<String>,
     },
     /// Ask the host which displays it can share. The host replies with
     /// [`LanResponse::Displays`] (empty on Linux, where the portal owns
@@ -586,11 +591,16 @@ pub async fn list_displays(
 /// (caller asked to stop) or the host closes the connection. Dropping the
 /// future (e.g. aborting the task) also ends the stream — the host notices the
 /// closed socket and stops capturing.
+// Each parameter is a distinct stream option (transport, codec rate, screen,
+// identity, control channel, sink); bundling them into a struct would add
+// ceremony without clarity.
+#[allow(clippy::too_many_arguments)]
 pub async fn stream_frames<F>(
     stream: TcpStream,
     channel: SealedChannel,
     fps: u16,
     display: Option<u32>,
+    name: Option<String>,
     mut switch_rx: tokio::sync::mpsc::Receiver<u32>,
     mut on_frame: F,
 ) -> SdkResult<()>
@@ -607,7 +617,7 @@ where
     tracing::info!(fps, screen = ?scr, "LAN stream: requesting StartStream");
     let channel = Arc::new(channel);
     let (mut rd, mut wr) = stream.into_split();
-    send_request(&mut wr, &channel, &LanRequest::StartStream { fps, display }).await?;
+    send_request(&mut wr, &channel, &LanRequest::StartStream { fps, display, name }).await?;
     let mut first = true;
 
     let ch_w = Arc::clone(&channel);
