@@ -18,7 +18,7 @@ use std::time::{Duration, Instant};
 
 use base64::engine::general_purpose::STANDARD as B64;
 use base64::Engine;
-use ed25519_dalek::VerifyingKey;
+use ed25519_dalek::{Signature, Signer, Verifier, VerifyingKey};
 use mdns_sd::{ServiceDaemon, ServiceEvent, ServiceInfo};
 use serde::{Deserialize, Serialize};
 use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
@@ -41,7 +41,43 @@ pub const SERVICE_TYPE: &str = "_rivetlink._tcp.local.";
 /// backward-compatible one way: a v1 client talks to a v2 host fine (it never
 /// asks for displays, and the host only sends them on request), but a v2 client
 /// must not send `ListDisplays` to a v1 host — both ends should be v2+.
-pub const PROTOCOL_VERSION: u16 = 2;
+///
+/// v3 added the optional signed identity (`identity_key`/`identity_sig`) on
+/// `StartStream` so a host can learn (and remember, trust-on-connect) the key of
+/// a client that connected by PIN. The fields are `#[serde(default)]`, so a v3
+/// client talking to a v2 host is fine — the host just ignores them.
+pub const PROTOCOL_VERSION: u16 = 3;
+
+/// Domain-separated context a client signs (with its Ed25519 identity) to prove
+/// it controls the key it announces on `StartStream`. Bump the suffix if the
+/// signed payload ever changes.
+const IDENTITY_CONTEXT: &[u8] = b"rivetlink-lan-identify-v1";
+
+/// Build a client's identity announcement: its public key (base64) plus a
+/// proof-of-possession signature over `IDENTITY_CONTEXT || public_key_bytes`.
+/// The host verifies this so it can't be tricked into remembering someone
+/// else's key (a client could otherwise *claim* any public key).
+fn identity_proof(identity: &Identity) -> (String, String) {
+    let key = identity.signing_key();
+    let pubkey = key.verifying_key();
+    let mut msg = IDENTITY_CONTEXT.to_vec();
+    msg.extend_from_slice(pubkey.as_bytes());
+    let sig = key.sign(&msg);
+    (B64.encode(pubkey.as_bytes()), B64.encode(sig.to_bytes()))
+}
+
+/// Verify a client's identity announcement (see [`identity_proof`]). Returns the
+/// announced public key (base64, normalised) on success — `None` if the key or
+/// signature is malformed or the proof doesn't check out.
+pub fn verify_identity(public_key_b64: &str, sig_b64: &str) -> Option<String> {
+    let key_bytes: [u8; 32] = B64.decode(public_key_b64.trim()).ok()?.try_into().ok()?;
+    let sig_bytes: [u8; 64] = B64.decode(sig_b64.trim()).ok()?.try_into().ok()?;
+    let pubkey = VerifyingKey::from_bytes(&key_bytes).ok()?;
+    let mut msg = IDENTITY_CONTEXT.to_vec();
+    msg.extend_from_slice(&key_bytes);
+    pubkey.verify(&msg, &Signature::from_bytes(&sig_bytes)).ok()?;
+    Some(B64.encode(key_bytes))
+}
 
 /// Default TCP port a host listens on. A *stable* port (not an OS-assigned 0)
 /// so a remembered device keeps reconnecting to the same address and a restart
@@ -333,6 +369,17 @@ pub enum LanRequest {
         /// from older clients → the host falls back to the network label.
         #[serde(default)]
         name: Option<String>,
+        /// The client's Ed25519 identity public key (base64), for trust-on-
+        /// connect: a PIN-authenticated client announces it so the host can
+        /// remember the device and let it reconnect without the code. `None`
+        /// from older clients or when no identity is offered.
+        #[serde(default)]
+        identity_key: Option<String>,
+        /// Proof-of-possession signature over the announced key (see
+        /// [`verify_identity`]). Without a valid signature the host ignores the
+        /// announced key.
+        #[serde(default)]
+        identity_sig: Option<String>,
     },
     /// Ask the host which displays it can share. The host replies with
     /// [`LanResponse::Displays`] (empty on Linux, where the portal owns
@@ -601,6 +648,7 @@ pub async fn stream_frames<F, D>(
     fps: u16,
     display: Option<u32>,
     name: Option<String>,
+    identity: Option<&Identity>,
     mut switch_rx: tokio::sync::mpsc::Receiver<u32>,
     mut on_frame: F,
     mut on_displays: D,
@@ -619,7 +667,23 @@ where
     tracing::info!(fps, screen = ?scr, "LAN stream: requesting StartStream");
     let channel = Arc::new(channel);
     let (mut rd, mut wr) = stream.into_split();
-    send_request(&mut wr, &channel, &LanRequest::StartStream { fps, display, name }).await?;
+    // Announce our identity (signed) alongside the stream request so a host we
+    // reached by PIN can offer to remember this device (trust-on-connect).
+    let (identity_key, identity_sig) = match identity {
+        Some(id) => {
+            let (key, sig) = identity_proof(id);
+            (Some(key), Some(sig))
+        },
+        None => (None, None),
+    };
+    send_request(&mut wr, &channel, &LanRequest::StartStream {
+        fps,
+        display,
+        name,
+        identity_key,
+        identity_sig,
+    })
+    .await?;
     let mut first = true;
 
     let ch_w = Arc::clone(&channel);
@@ -681,6 +745,28 @@ mod tests {
         assert_eq!(sanitize_hostname("Jan's Laptop"), "jan-s-laptop");
         assert_eq!(sanitize_hostname("  --  "), "rivetlink");
         assert_eq!(sanitize_hostname("Café 42"), "caf--42");
+    }
+
+    // Trust-on-connect security: a valid proof verifies and yields the client's
+    // own key; a key the client doesn't control (wrong key, tampered sig) must
+    // NOT verify — otherwise a client could make the host remember someone else.
+    #[test]
+    fn identity_proof_roundtrips_and_rejects_forgery() {
+        let id = Identity::from_signing_key(ed25519_dalek::SigningKey::from_bytes(&[7u8; 32]));
+        let (key, sig) = identity_proof(&id);
+        assert_eq!(verify_identity(&key, &sig), Some(id.public_key_b64()));
+
+        // Claim a different key with the real signature → rejected.
+        let other = Identity::from_signing_key(ed25519_dalek::SigningKey::from_bytes(&[8u8; 32]));
+        assert_eq!(verify_identity(&other.public_key_b64(), &sig), None);
+
+        // Tampered signature → rejected.
+        let mut bad = B64.decode(&sig).unwrap();
+        bad[0] ^= 0x01;
+        assert_eq!(verify_identity(&key, &B64.encode(&bad)), None);
+
+        // Garbage in → None, never a panic.
+        assert_eq!(verify_identity("not-base64!", "nope"), None);
     }
 
     #[tokio::test]

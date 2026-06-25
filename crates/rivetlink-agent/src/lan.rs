@@ -31,9 +31,15 @@ use crate::trusted::TrustedClients;
 #[derive(Debug, Clone)]
 pub enum HostEvent {
     /// A client started *viewing* the screen (sent a `StartStream`, not merely
-    /// finished the handshake). The string is the client's device name when it
-    /// sent one, else a short network label (peer IP / client identity).
-    ClientConnected(String),
+    /// finished the handshake). `label` is the client's device name when it sent
+    /// one, else a short network label (peer IP / client identity). `key` is the
+    /// client's verified Ed25519 identity (base64) when it announced one with a
+    /// valid proof-of-possession — what the host remembers for trust-on-connect;
+    /// `None` for a bare PIN client that offered no (or an invalid) identity.
+    ClientConnected {
+        label: String,
+        key: Option<String>,
+    },
     /// A client's session ended (disconnect, error, or host-initiated kick).
     ClientDisconnected,
 }
@@ -294,7 +300,13 @@ async fn serve_loop(
                     .await
                     .map_err(|e| AgentError::Lan(e.to_string()))?;
             },
-            LanRequest::StartStream { fps, display, name } => {
+            LanRequest::StartStream {
+                fps,
+                display,
+                name,
+                identity_key,
+                identity_sig,
+            } => {
                 // Honour the requested screen only when sharing all screens is on;
                 // otherwise pin to the primary (`None`).
                 let display = if share_all_now(&share_all) { display } else { None };
@@ -305,8 +317,21 @@ async fn serve_loop(
                 let who = name
                     .filter(|n| !n.trim().is_empty())
                     .unwrap_or_else(|| label.clone());
+                // Verify the announced identity (proof-of-possession) before we
+                // surface it — an unverified key must never reach the host's
+                // "remember this device" prompt.
+                let key = match (identity_key, identity_sig) {
+                    (Some(k), Some(s)) => match lan::verify_identity(&k, &s) {
+                        Some(verified) => Some(verified),
+                        None => {
+                            tracing::warn!("LAN serve: client identity proof invalid, ignoring");
+                            None
+                        },
+                    },
+                    _ => None,
+                };
                 if let Some(ev) = &events {
-                    let _ = ev.send(HostEvent::ClientConnected(who)).await;
+                    let _ = ev.send(HostEvent::ClientConnected { label: who, key }).await;
                 }
                 // The stream runs until the client disconnects or the host kicks.
                 let result = stream_screen(stream, channel, fps, display, kick, share_all).await;
