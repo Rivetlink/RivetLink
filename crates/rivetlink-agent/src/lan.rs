@@ -12,7 +12,7 @@ use base64::Engine;
 use ed25519_dalek::SigningKey;
 use tokio::net::{TcpListener, TcpStream};
 use tokio::sync::mpsc::Sender;
-use tokio::sync::watch;
+use tokio::sync::{oneshot, watch};
 
 use rivetlink_crypto::sealed::SealedChannel;
 use rivetlink_sdk::direct;
@@ -42,6 +42,17 @@ pub enum HostEvent {
     },
     /// A client's session ended (disconnect, error, or host-initiated kick).
     ClientDisconnected,
+}
+
+/// A host-consent request: a not-yet-trusted client (connected by PIN) is asking
+/// to view the screen. The embedding app shows an accept/reject prompt and sends
+/// the decision back on `reply` (`true` = accept). `key` is the client's verified
+/// identity (base64) when it announced one, so the app can offer to remember it.
+#[derive(Debug)]
+pub struct ConsentRequest {
+    pub key: Option<String>,
+    pub name: String,
+    pub reply: oneshot::Sender<bool>,
 }
 
 /// How a LAN host authenticates incoming clients.
@@ -76,7 +87,7 @@ pub async fn serve(
     port: u16,
     auth: LanAuth,
 ) -> AgentResult<()> {
-    serve_with_events(signing_key, device_name, port, auth, None, None, None).await
+    serve_with_events(signing_key, device_name, port, auth, None, None, None, None).await
 }
 
 /// Like [`serve`], but reports session lifecycle on `events` (if given) so an
@@ -93,6 +104,9 @@ pub async fn serve(
 /// to the primary screen — the host offers only that one and refuses switches.
 /// Toggling it mid-stream takes effect immediately (the host pushes a fresh
 /// display list and snaps back to the primary on revoke).
+/// `consent` (if given) gates not-yet-trusted (PIN) clients: before such a
+/// client may view, the agent sends a [`ConsentRequest`] and waits for the host
+/// to accept. A trusted-key client skips it (that's the point of remembering).
 #[allow(clippy::too_many_arguments)] // distinct host knobs; a struct adds ceremony
 pub async fn serve_with_events(
     signing_key: SigningKey,
@@ -102,6 +116,7 @@ pub async fn serve_with_events(
     events: Option<Sender<HostEvent>>,
     kick: Option<watch::Receiver<u64>>,
     share_all: Option<watch::Receiver<bool>>,
+    consent: Option<Sender<ConsentRequest>>,
 ) -> AgentResult<()> {
     let listener = bind_listener(port).await?;
     let local_port = listener.local_addr()?.port();
@@ -152,9 +167,11 @@ pub async fn serve_with_events(
                     let _ = rx.borrow_and_update();
                     rx
                 });
+                let consent = consent.clone();
                 sessions.spawn(async move {
                     if let Err(e) =
-                        handle(stream, signing_key, &auth, peer, events, kick, share_all).await
+                        handle(stream, signing_key, &auth, peer, events, kick, share_all, consent)
+                            .await
                     {
                         tracing::warn!(%peer, error = %e, "LAN session ended with error");
                     }
@@ -189,13 +206,16 @@ async fn handle(
     events: Option<Sender<HostEvent>>,
     kick: Option<watch::Receiver<u64>>,
     share_all: Option<watch::Receiver<bool>>,
+    consent: Option<Sender<ConsentRequest>>,
 ) -> AgentResult<()> {
-    let (channel, label) = match auth {
+    // `needs_consent` = the client authenticated by PIN (not a remembered key),
+    // so the host should approve it before it can view (trusted keys skip this).
+    let (channel, label, needs_consent) = match auth {
         LanAuth::Password(pin) => {
             let channel = direct::host_accept_password(&mut stream, pin)
                 .await
                 .map_err(|e| AgentError::Lan(e.to_string()))?;
-            (channel, peer.ip().to_string())
+            (channel, peer.ip().to_string(), true)
         },
         LanAuth::Key {
             trusted,
@@ -209,7 +229,7 @@ async fn handle(
                 .await
                 .map_err(|e| AgentError::Lan(e.to_string()))?;
             tracing::info!(client = %client_id, "LAN client accepted (key mode)");
-            (channel, client_id.clone())
+            (channel, client_id.clone(), false)
         },
         LanAuth::PinOrKey {
             pin,
@@ -229,9 +249,9 @@ async fn handle(
             match client_id {
                 Some(id) => {
                     tracing::info!(client = %id, "LAN client accepted (trusted key)");
-                    (channel, id)
+                    (channel, id, false)
                 },
-                None => (channel, peer.ip().to_string()),
+                None => (channel, peer.ip().to_string(), true),
             }
         },
     };
@@ -242,7 +262,17 @@ async fn handle(
     // The connected/disconnected events are emitted inside serve_loop, bracketing
     // the *stream* (StartStream..end) — not the bare handshake — so the host only
     // shows "connected" once the client is actually viewing.
-    let result = serve_loop(stream, Arc::new(channel), events, label, kick, share_all).await;
+    let result = serve_loop(
+        stream,
+        Arc::new(channel),
+        events,
+        label,
+        kick,
+        share_all,
+        needs_consent,
+        consent,
+    )
+    .await;
     tracing::info!(%peer, ok = result.is_ok(), "LAN: session ended");
     result
 }
@@ -263,6 +293,7 @@ impl Drop for AbortOnDrop {
 /// the client sends `StartStream` (using its device name if given, else the
 /// network `label`), and `ClientDisconnected` when that stream ends. A
 /// screenshot-only or connect-then-leave session never reports "connected".
+#[allow(clippy::too_many_arguments)] // session params; bundling them adds ceremony
 async fn serve_loop(
     mut stream: TcpStream,
     channel: Arc<SealedChannel>,
@@ -270,6 +301,8 @@ async fn serve_loop(
     label: String,
     kick: Option<watch::Receiver<u64>>,
     share_all: Option<watch::Receiver<bool>>,
+    needs_consent: bool,
+    consent: Option<Sender<ConsentRequest>>,
 ) -> AgentResult<()> {
     loop {
         let Ok(req) = lan::recv_request(&mut stream, &channel).await else {
@@ -330,6 +363,21 @@ async fn serve_loop(
                     },
                     _ => None,
                 };
+                // A not-yet-trusted (PIN) client must be approved by the host
+                // before it can view. A trusted key skips this. No `consent`
+                // channel (CLI agent) = accept silently, as before.
+                if needs_consent {
+                    if let Some(tx) = &consent {
+                        if !ask_consent(tx, key.clone(), who.clone()).await {
+                            tracing::info!(%who, "LAN serve: host rejected (or timed out) the client");
+                            let _ = lan::send_response(&mut stream, &channel, &LanResponse::Error {
+                                message: "the host declined the connection".to_string(),
+                            })
+                            .await;
+                            return Ok(());
+                        }
+                    }
+                }
                 if let Some(ev) = &events {
                     let _ = ev.send(HostEvent::ClientConnected { label: who, key }).await;
                 }
@@ -364,6 +412,20 @@ fn displays_for_host() -> Vec<DisplayInfo> {
 /// client sees and can switch every display; `false` restricts it to the primary.
 fn share_all_now(share_all: &Option<watch::Receiver<bool>>) -> bool {
     share_all.as_ref().is_none_or(|rx| *rx.borrow())
+}
+
+/// Ask the host to accept a not-yet-trusted client; returns the decision
+/// (`false` on reject, timeout, or a dropped channel). Bounded so a connection
+/// never hangs forever waiting on an absent or distracted host.
+async fn ask_consent(tx: &Sender<ConsentRequest>, key: Option<String>, name: String) -> bool {
+    let (reply, rx) = oneshot::channel();
+    if tx.send(ConsentRequest { key, name, reply }).await.is_err() {
+        return false; // the app side is gone
+    }
+    matches!(
+        tokio::time::timeout(std::time::Duration::from_secs(60), rx).await,
+        Ok(Ok(true))
+    )
 }
 
 /// The displays to offer the client: all of them when sharing is unrestricted,
