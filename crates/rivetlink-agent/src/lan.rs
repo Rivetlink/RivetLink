@@ -70,7 +70,7 @@ pub async fn serve(
     port: u16,
     auth: LanAuth,
 ) -> AgentResult<()> {
-    serve_with_events(signing_key, device_name, port, auth, None, None).await
+    serve_with_events(signing_key, device_name, port, auth, None, None, None).await
 }
 
 /// Like [`serve`], but reports session lifecycle on `events` (if given) so an
@@ -81,6 +81,13 @@ pub async fn serve(
 /// `kick` lets the host hang up on the *active* viewer without stopping the
 /// listener: every change to the watched value drops the current stream (the
 /// client sees a disconnect), while advertising and the PIN stay live.
+///
+/// `share_all` gates multi-screen access live: `true` (or `None`, the CLI
+/// default) lets the client list and switch every display; `false` restricts it
+/// to the primary screen — the host offers only that one and refuses switches.
+/// Toggling it mid-stream takes effect immediately (the host pushes a fresh
+/// display list and snaps back to the primary on revoke).
+#[allow(clippy::too_many_arguments)] // distinct host knobs; a struct adds ceremony
 pub async fn serve_with_events(
     signing_key: SigningKey,
     device_name: String,
@@ -88,6 +95,7 @@ pub async fn serve_with_events(
     auth: LanAuth,
     events: Option<Sender<HostEvent>>,
     kick: Option<watch::Receiver<u64>>,
+    share_all: Option<watch::Receiver<bool>>,
 ) -> AgentResult<()> {
     let listener = bind_listener(port).await?;
     let local_port = listener.local_addr()?.port();
@@ -131,8 +139,17 @@ pub async fn serve_with_events(
                     let _ = rx.borrow_and_update();
                     rx
                 });
+                // Same catch-up as kick: a fresh watch clone inherits the parent's
+                // seen version, so the stream's `changed()` arm only fires on
+                // toggles that happen *after* this session starts.
+                let share_all = share_all.clone().map(|mut rx| {
+                    let _ = rx.borrow_and_update();
+                    rx
+                });
                 sessions.spawn(async move {
-                    if let Err(e) = handle(stream, signing_key, &auth, peer, events, kick).await {
+                    if let Err(e) =
+                        handle(stream, signing_key, &auth, peer, events, kick, share_all).await
+                    {
                         tracing::warn!(%peer, error = %e, "LAN session ended with error");
                     }
                 });
@@ -157,6 +174,7 @@ async fn bind_listener(port: u16) -> AgentResult<TcpListener> {
     }
 }
 
+#[allow(clippy::too_many_arguments)] // session params; bundling them adds ceremony
 async fn handle(
     mut stream: TcpStream,
     signing_key: SigningKey,
@@ -164,6 +182,7 @@ async fn handle(
     peer: std::net::SocketAddr,
     events: Option<Sender<HostEvent>>,
     kick: Option<watch::Receiver<u64>>,
+    share_all: Option<watch::Receiver<bool>>,
 ) -> AgentResult<()> {
     let (channel, label) = match auth {
         LanAuth::Password(pin) => {
@@ -217,7 +236,7 @@ async fn handle(
     // The connected/disconnected events are emitted inside serve_loop, bracketing
     // the *stream* (StartStream..end) — not the bare handshake — so the host only
     // shows "connected" once the client is actually viewing.
-    let result = serve_loop(stream, Arc::new(channel), events, label, kick).await;
+    let result = serve_loop(stream, Arc::new(channel), events, label, kick, share_all).await;
     tracing::info!(%peer, ok = result.is_ok(), "LAN: session ended");
     result
 }
@@ -244,6 +263,7 @@ async fn serve_loop(
     events: Option<Sender<HostEvent>>,
     label: String,
     kick: Option<watch::Receiver<u64>>,
+    share_all: Option<watch::Receiver<bool>>,
 ) -> AgentResult<()> {
     loop {
         let Ok(req) = lan::recv_request(&mut stream, &channel).await else {
@@ -266,19 +286,18 @@ async fn serve_loop(
                     .map_err(|e| AgentError::Lan(e.to_string()))?;
             },
             LanRequest::ListDisplays => {
-                // Enumerating displays uses `zbus::blocking` on Linux (Mutter);
-                // with zbus's tokio feature, a blocking D-Bus call from this async
-                // worker thread panics ("cannot block from within a runtime") and
-                // silently kills the session. Run it on a blocking thread.
-                let displays = tokio::task::spawn_blocking(displays_for_host)
-                    .await
-                    .unwrap_or_default();
+                // When the host hasn't granted "share all screens", offer only the
+                // primary display so the client's picker stays hidden.
+                let displays = allowed_displays(share_all_now(&share_all)).await;
                 tracing::info!(count = displays.len(), "LAN serve: ListDisplays request");
                 lan::send_response(&mut stream, &channel, &LanResponse::Displays { displays })
                     .await
                     .map_err(|e| AgentError::Lan(e.to_string()))?;
             },
             LanRequest::StartStream { fps, display, name } => {
+                // Honour the requested screen only when sharing all screens is on;
+                // otherwise pin to the primary (`None`).
+                let display = if share_all_now(&share_all) { display } else { None };
                 let scr = display;
                 tracing::info!(fps, screen = ?scr, "LAN serve: StartStream request");
                 // Now the client is actually viewing: announce who, falling back
@@ -290,7 +309,7 @@ async fn serve_loop(
                     let _ = ev.send(HostEvent::ClientConnected(who)).await;
                 }
                 // The stream runs until the client disconnects or the host kicks.
-                let result = stream_screen(stream, channel, fps, display, kick).await;
+                let result = stream_screen(stream, channel, fps, display, kick, share_all).await;
                 if let Some(ev) = &events {
                     let _ = ev.send(HostEvent::ClientDisconnected).await;
                 }
@@ -316,6 +335,25 @@ fn displays_for_host() -> Vec<DisplayInfo> {
     }
 }
 
+/// Current "share all screens" state. `None` (CLI agent) or `true` means the
+/// client sees and can switch every display; `false` restricts it to the primary.
+fn share_all_now(share_all: &Option<watch::Receiver<bool>>) -> bool {
+    share_all.as_ref().is_none_or(|rx| *rx.borrow())
+}
+
+/// The displays to offer the client: all of them when sharing is unrestricted,
+/// else just the primary (the first one) so the client's screen picker hides.
+async fn allowed_displays(share_all: bool) -> Vec<DisplayInfo> {
+    // `displays_for_host` blocks on D-Bus (Mutter) — keep it off the async worker.
+    let mut displays = tokio::task::spawn_blocking(displays_for_host)
+        .await
+        .unwrap_or_default();
+    if !share_all {
+        displays.truncate(1);
+    }
+    displays
+}
+
 /// Capture a screen continuously and send JPEG frames over the sealed channel
 /// until the client disconnects. `display` is the initial screen (`None` =
 /// primary); a [`LanRequest::SwitchDisplay`] from the client mid-stream restarts
@@ -333,13 +371,27 @@ async fn wait_kick(kick: &mut Option<watch::Receiver<u64>>) {
     }
 }
 
+/// Resolve when the host toggles "share all screens"; stay pending forever when
+/// there's no channel, so the `select!` arm is inert (CLI agent).
 #[cfg(any(target_os = "linux", target_os = "macos"))]
+async fn wait_share_change(share_all: &mut Option<watch::Receiver<bool>>) {
+    match share_all {
+        Some(rx) => {
+            let _ = rx.changed().await;
+        },
+        None => std::future::pending().await,
+    }
+}
+
+#[cfg(any(target_os = "linux", target_os = "macos"))]
+#[allow(clippy::too_many_arguments, clippy::cognitive_complexity, clippy::too_many_lines)]
 async fn stream_screen(
     stream: TcpStream,
     channel: Arc<SealedChannel>,
     fps: u16,
     mut display: Option<u32>,
     mut kick: Option<watch::Receiver<u64>>,
+    mut share_all: Option<watch::Receiver<bool>>,
 ) -> AgentResult<()> {
     use rivetlink_sdk::lan::FrameDelta;
 
@@ -409,14 +461,17 @@ async fn stream_screen(
                 },
                 ctrl = ctrl_rx.recv() => match ctrl {
                     Some(LanRequest::SwitchDisplay { display: d }) => {
-                        tracing::info!(display = d, "LAN stream: switching display");
-                        break d;
+                        // Refuse switches the host hasn't allowed: with "share all
+                        // screens" off the client is pinned to the primary. Enforced
+                        // here regardless of what the client's picker shows.
+                        if share_all_now(&share_all) {
+                            tracing::info!(display = d, "LAN stream: switching display");
+                            break d;
+                        }
+                        tracing::info!(display = d, "LAN stream: switch refused (share-all off)");
                     },
                     Some(LanRequest::ListDisplays) => {
-                        // See serve_loop: must not block this async worker.
-                        let displays = tokio::task::spawn_blocking(displays_for_host)
-                            .await
-                            .unwrap_or_default();
+                        let displays = allowed_displays(share_all_now(&share_all)).await;
                         let _ = lan::send_response(
                             &mut wr,
                             &channel,
@@ -436,6 +491,29 @@ async fn stream_screen(
                 () = wait_kick(&mut kick) => {
                     tracing::info!("LAN stream: host disconnected the client");
                     break 'session;
+                },
+                // The host toggled "share all screens": push the client a fresh
+                // display list so its picker shows/hides live, and on revoke snap
+                // capture back to the primary screen.
+                () = wait_share_change(&mut share_all) => {
+                    let on = share_all_now(&share_all);
+                    let displays = allowed_displays(on).await;
+                    tracing::info!(on, count = displays.len(), "LAN stream: share-all toggled");
+                    let _ = lan::send_response(
+                        &mut wr,
+                        &channel,
+                        &LanResponse::Displays { displays: displays.clone() },
+                    )
+                    .await;
+                    if !on {
+                        let already_primary =
+                            display.is_none() || display == displays.first().map(|d| d.id);
+                        if !already_primary {
+                            if let Some(first) = displays.first() {
+                                break first.id;
+                            }
+                        }
+                    }
                 },
             }
         };
@@ -457,10 +535,28 @@ async fn stream_screen(
     _fps: u16,
     _display: Option<u32>,
     _kick: Option<watch::Receiver<u64>>,
+    _share_all: Option<watch::Receiver<bool>>,
 ) -> AgentResult<()> {
     let _ = lan::send_response(&mut stream, &channel, &LanResponse::Error {
         message: "live streaming is not supported on this platform yet".to_string(),
     })
     .await;
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    // The privacy default: a `None` channel (the CLI agent, no UI gate) shares
+    // every screen; an explicit flag is honoured verbatim. If this flips, an
+    // app host that set `false` would leak all screens — so pin it.
+    #[test]
+    fn share_all_now_defaults_open_only_without_channel() {
+        assert!(share_all_now(&None));
+        let (_tx, rx) = watch::channel(false);
+        assert!(!share_all_now(&Some(rx)));
+        let (_tx2, rx2) = watch::channel(true);
+        assert!(share_all_now(&Some(rx2)));
+    }
 }

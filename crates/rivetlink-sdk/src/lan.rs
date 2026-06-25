@@ -595,7 +595,7 @@ pub async fn list_displays(
 // identity, control channel, sink); bundling them into a struct would add
 // ceremony without clarity.
 #[allow(clippy::too_many_arguments)]
-pub async fn stream_frames<F>(
+pub async fn stream_frames<F, D>(
     stream: TcpStream,
     channel: SealedChannel,
     fps: u16,
@@ -603,9 +603,11 @@ pub async fn stream_frames<F>(
     name: Option<String>,
     mut switch_rx: tokio::sync::mpsc::Receiver<u32>,
     mut on_frame: F,
+    mut on_displays: D,
 ) -> SdkResult<()>
 where
     F: FnMut(&FrameDelta) -> bool,
+    D: FnMut(Vec<DisplayInfo>),
 {
     // Own the read/write halves so the write side can live in its own task. The
     // sealed channel is stateless (random per-message nonce), so sealing (writes)
@@ -651,7 +653,11 @@ where
                 tracing::warn!(%message, "LAN stream: host sent error");
                 return Err(SdkError::Relay(message));
             },
-            LanResponse::Screenshot { .. } | LanResponse::Displays { .. } => {},
+            // The host pushes a fresh display list mid-stream when it grants or
+            // revokes "share all screens" — surface it so the viewer can show or
+            // hide its screen picker live.
+            LanResponse::Displays { displays } => on_displays(displays),
+            LanResponse::Screenshot { .. } => {},
         }
     }
 }
