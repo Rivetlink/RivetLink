@@ -285,6 +285,11 @@ fn spawn_gst(node: u32, out_w: usize, out_h: usize) -> AgentResult<Child> {
         "!",
         "fdsink",
         "fd=1",
+        // Push each frame the moment it arrives instead of pacing it to the
+        // pipeline clock — clock-sync withholds buffers up to a frame interval,
+        // pure latency on a real-time share. The reader thread already keeps
+        // only the freshest frame, so unpaced output can't build a backlog.
+        "sync=false",
     ])
     .stdout(Stdio::piped())
     .stderr(Stdio::piped());
