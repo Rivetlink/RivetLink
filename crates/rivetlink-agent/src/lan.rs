@@ -440,37 +440,30 @@ fn control_now(control: &Option<watch::Receiver<bool>>) -> bool {
     control.as_ref().is_none_or(|rx| *rx.borrow())
 }
 
-/// Replay one remote input event via the (lazily created) uinput device. Creates
-/// the device on first use; logs and drops the event if uinput is unavailable
-/// (e.g. no `/dev/uinput` access). Linux only.
+/// Forward one remote input event to the injector thread, spawning it on first
+/// use (a Mutter RemoteDesktop session for the monitor being shared). Sending is
+/// non-blocking, so this never stalls the frame loop. Linux only.
 #[cfg(target_os = "linux")]
-fn apply_input(injector: &mut Option<crate::input::UinputInjector>, req: &LanRequest) {
+fn apply_input(handle: &mut Option<crate::input::InputHandle>, display: Option<u32>, req: &LanRequest) {
     use rivetlink_sdk::lan::LanRequest as R;
-    if injector.is_none() {
-        // ponytail: UinputInjector::new sleeps ~200ms (device settle) — a one-off
-        // stall on the frame loop the first time control is used. Move to a
-        // blocking input task if that hiccup ever matters.
-        match crate::input::UinputInjector::new() {
-            Ok(inj) => *injector = Some(inj),
-            Err(e) => {
-                tracing::warn!(error = %e, "remote control: uinput unavailable, dropping input");
-                return;
-            },
-        }
-    }
-    let Some(inj) = injector.as_mut() else {
-        return;
+
+    use crate::input::{InputAction, InputHandle};
+
+    let handle = handle.get_or_insert_with(|| InputHandle::spawn(display));
+    let action = match req {
+        R::PointerMove { x, y } => InputAction::Move { x: *x, y: *y },
+        R::PointerButton { button, down } => InputAction::Button {
+            button: *button,
+            down: *down,
+        },
+        R::Scroll { dx, dy } => InputAction::Scroll { dx: *dx, dy: *dy },
+        R::Key { code, down } => InputAction::Key {
+            code: code.clone(),
+            down: *down,
+        },
+        _ => return,
     };
-    let r = match req {
-        R::PointerMove { x, y } => inj.pointer_move(*x, *y),
-        R::PointerButton { button, down } => inj.pointer_button(*button, *down),
-        R::Scroll { dx, dy } => inj.scroll(*dx, *dy),
-        R::Key { code, down } => inj.key(code, *down),
-        _ => Ok(()),
-    };
-    if let Err(e) = r {
-        tracing::warn!(error = %e, "remote control: input injection failed");
-    }
+    handle.send(action);
 }
 
 /// Ask the host to accept a not-yet-trusted client; returns the decision
@@ -562,11 +555,12 @@ async fn stream_screen(
     });
     let _reader_guard = AbortOnDrop(reader.abort_handle());
 
-    // The uinput virtual device is created lazily on the first input event that
-    // the host has granted control for, then reused for the session. Linux only;
-    // macOS has no injector backend yet, so remote input is silently dropped.
+    // The remote-input injector (a Mutter RemoteDesktop session on a worker
+    // thread) is spawned lazily on the first granted input event, then reused for
+    // the session. Linux only; macOS has no injector backend yet, so remote input
+    // is silently dropped.
     #[cfg(target_os = "linux")]
-    let mut injector: Option<crate::input::UinputInjector> = None;
+    let mut injector: Option<crate::input::InputHandle> = None;
 
     // Re-enter on every display switch: tear down the capturer and start a new
     // one targeting the requested screen.
@@ -643,7 +637,7 @@ async fn stream_screen(
                     ) => {
                         if control_now(&control) {
                             #[cfg(target_os = "linux")]
-                            apply_input(&mut injector, &req);
+                            apply_input(&mut injector, display, &req);
                             #[cfg(not(target_os = "linux"))]
                             let _ = req; // no host input backend on this platform
                         }

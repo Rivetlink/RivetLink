@@ -49,9 +49,9 @@ workspace = true
 scap = "0.0.8"
 
 [target.'cfg(target_os = "linux")'.dependencies]
-# evdev: uinput virtual input device for remote-control injection. Injects at
-# the kernel evdev layer, so it works under both X11 AND Wayland/GNOME (the
-# compositor sees an ordinary input device). Needs write access to /dev/uinput.
+# evdev: just the KEY_*/BTN_* keycode constants for remote-input injection.
+# Injection itself goes through Mutter's RemoteDesktop D-Bus API (no /dev/uinput,
+# no udev, no root); Mutter's NotifyKeyboardKeycode takes these evdev codes.
 evdev = "0.12"
 # ashpd: the full-desktop Screenshot-portal fallback (Linux screenshot path).
 # png: one-shot screenshot encoding (Linux screenshot fallback).

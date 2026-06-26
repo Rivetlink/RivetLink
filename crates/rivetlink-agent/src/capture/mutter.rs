@@ -90,6 +90,22 @@ pub fn list_displays() -> Vec<DisplayInfo> {
         .collect()
 }
 
+/// The `(connector, width, height)` of the shared monitor at index `display`
+/// (`None` = primary) — what the remote-input injector records so its absolute
+/// coordinates land on the same screen the viewer sees. `None` if no monitors.
+pub fn monitor_target(display: Option<u32>) -> Option<(String, u32, u32)> {
+    let mons = monitors().ok()?;
+    if mons.is_empty() {
+        return None;
+    }
+    let idx = display
+        .map(|d| d as usize)
+        .filter(|i| *i < mons.len())
+        .unwrap_or(0);
+    let m = &mons[idx];
+    Some((m.connector.clone(), m.width, m.height))
+}
+
 /// Capture `display` (a monitor index, `None` = first/primary) and push delta
 /// frames to `tx` until the consumer drops or capture ends. Blocking.
 #[allow(clippy::needless_pass_by_value)]
