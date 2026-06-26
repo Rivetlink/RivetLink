@@ -28,6 +28,9 @@ pub enum AgentError {
 
     #[error("direct-LAN error: {0}")]
     Lan(String),
+
+    #[error("input injection error: {0}")]
+    Input(String),
 }
 
 /// Result alias used throughout the agent.

@@ -49,6 +49,10 @@ workspace = true
 scap = "0.0.8"
 
 [target.'cfg(target_os = "linux")'.dependencies]
+# evdev: uinput virtual input device for remote-control injection. Injects at
+# the kernel evdev layer, so it works under both X11 AND Wayland/GNOME (the
+# compositor sees an ordinary input device). Needs write access to /dev/uinput.
+evdev = "0.12"
 # ashpd: the full-desktop Screenshot-portal fallback (Linux screenshot path).
 # png: one-shot screenshot encoding (Linux screenshot fallback).
 ashpd = { version = "0.9", default-features = false, features = ["tokio"] }

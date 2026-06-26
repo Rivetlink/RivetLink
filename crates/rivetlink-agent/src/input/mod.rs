@@ -1,19 +1,12 @@
-//! Input injection abstraction.
+//! Input injection: replay a remote controller's pointer/keyboard events onto
+//! the local OS.
 //!
-//! Platform backends (`SendInput` on Windows, `uinput` on Linux, `CGEvent`
-//! on macOS) implement [`InputInjector`]. No backends wired up yet — only
-//! the trait exists so the rest of the agent can be built against a stable
-//! API.
+//! Linux uses a uinput virtual device (kernel evdev layer — works under both
+//! X11 and Wayland/GNOME). macOS (`CGEvent`) and Windows (`SendInput`) backends
+//! are not implemented yet; on those platforms remote control is unavailable.
 
-use async_trait::async_trait;
-use rivetlink_protocol::packets::InputPacket;
+#[cfg(target_os = "linux")]
+mod uinput;
 
-use crate::error::AgentResult;
-
-/// Replays an [`InputPacket`] received from a remote controller onto the
-/// local OS.
-#[async_trait]
-pub trait InputInjector: Send + Sync {
-    /// Inject a single input event.
-    async fn inject(&self, packet: InputPacket) -> AgentResult<()>;
-}
+#[cfg(target_os = "linux")]
+pub use uinput::UinputInjector;

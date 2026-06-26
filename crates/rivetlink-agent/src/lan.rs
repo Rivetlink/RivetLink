@@ -87,7 +87,9 @@ pub async fn serve(
     port: u16,
     auth: LanAuth,
 ) -> AgentResult<()> {
-    serve_with_events(signing_key, device_name, port, auth, None, None, None, None).await
+    // CLI agent: no UI gates — `None` control means input control is open to any
+    // authenticated client (a headless agent's whole purpose is remote control).
+    serve_with_events(signing_key, device_name, port, auth, None, None, None, None, None).await
 }
 
 /// Like [`serve`], but reports session lifecycle on `events` (if given) so an
@@ -116,6 +118,7 @@ pub async fn serve_with_events(
     events: Option<Sender<HostEvent>>,
     kick: Option<watch::Receiver<u64>>,
     share_all: Option<watch::Receiver<bool>>,
+    control: Option<watch::Receiver<bool>>,
     consent: Option<Sender<ConsentRequest>>,
 ) -> AgentResult<()> {
     let listener = bind_listener(port).await?;
@@ -167,11 +170,18 @@ pub async fn serve_with_events(
                     let _ = rx.borrow_and_update();
                     rx
                 });
+                // Same catch-up: control is the remote-input gate (default off in
+                // the app; open for the CLI agent when `None`).
+                let control = control.clone().map(|mut rx| {
+                    let _ = rx.borrow_and_update();
+                    rx
+                });
                 let consent = consent.clone();
                 sessions.spawn(async move {
-                    if let Err(e) =
-                        handle(stream, signing_key, &auth, peer, events, kick, share_all, consent)
-                            .await
+                    if let Err(e) = handle(
+                        stream, signing_key, &auth, peer, events, kick, share_all, control, consent,
+                    )
+                    .await
                     {
                         tracing::warn!(%peer, error = %e, "LAN session ended with error");
                     }
@@ -206,6 +216,7 @@ async fn handle(
     events: Option<Sender<HostEvent>>,
     kick: Option<watch::Receiver<u64>>,
     share_all: Option<watch::Receiver<bool>>,
+    control: Option<watch::Receiver<bool>>,
     consent: Option<Sender<ConsentRequest>>,
 ) -> AgentResult<()> {
     // `needs_consent` = the client authenticated by PIN (not a remembered key),
@@ -269,6 +280,7 @@ async fn handle(
         label,
         kick,
         share_all,
+        control,
         needs_consent,
         consent,
     )
@@ -301,6 +313,7 @@ async fn serve_loop(
     label: String,
     kick: Option<watch::Receiver<u64>>,
     share_all: Option<watch::Receiver<bool>>,
+    control: Option<watch::Receiver<bool>>,
     needs_consent: bool,
     consent: Option<Sender<ConsentRequest>>,
 ) -> AgentResult<()> {
@@ -382,14 +395,19 @@ async fn serve_loop(
                     let _ = ev.send(HostEvent::ClientConnected { label: who, key }).await;
                 }
                 // The stream runs until the client disconnects or the host kicks.
-                let result = stream_screen(stream, channel, fps, display, kick, share_all).await;
+                let result =
+                    stream_screen(stream, channel, fps, display, kick, share_all, control).await;
                 if let Some(ev) = &events {
                     let _ = ev.send(HostEvent::ClientDisconnected).await;
                 }
                 return result;
             },
-            // Only meaningful while streaming; ignore it outside a stream.
-            LanRequest::SwitchDisplay { .. } => {},
+            // Only meaningful while streaming; ignore outside a stream.
+            LanRequest::SwitchDisplay { .. }
+            | LanRequest::PointerMove { .. }
+            | LanRequest::PointerButton { .. }
+            | LanRequest::Scroll { .. }
+            | LanRequest::Key { .. } => {},
         }
     }
 }
@@ -412,6 +430,47 @@ fn displays_for_host() -> Vec<DisplayInfo> {
 /// client sees and can switch every display; `false` restricts it to the primary.
 fn share_all_now(share_all: &Option<watch::Receiver<bool>>) -> bool {
     share_all.as_ref().is_none_or(|rx| *rx.borrow())
+}
+
+/// Whether the host currently grants remote *input* control. `None` (CLI agent)
+/// = open, since a headless agent's whole purpose is remote control; the desktop
+/// app passes `Some(false)` and flips it on explicitly (a viewer never controls
+/// the host until the person at the keyboard allows it).
+fn control_now(control: &Option<watch::Receiver<bool>>) -> bool {
+    control.as_ref().is_none_or(|rx| *rx.borrow())
+}
+
+/// Replay one remote input event via the (lazily created) uinput device. Creates
+/// the device on first use; logs and drops the event if uinput is unavailable
+/// (e.g. no `/dev/uinput` access). Linux only.
+#[cfg(target_os = "linux")]
+fn apply_input(injector: &mut Option<crate::input::UinputInjector>, req: &LanRequest) {
+    use rivetlink_sdk::lan::LanRequest as R;
+    if injector.is_none() {
+        // ponytail: UinputInjector::new sleeps ~200ms (device settle) — a one-off
+        // stall on the frame loop the first time control is used. Move to a
+        // blocking input task if that hiccup ever matters.
+        match crate::input::UinputInjector::new() {
+            Ok(inj) => *injector = Some(inj),
+            Err(e) => {
+                tracing::warn!(error = %e, "remote control: uinput unavailable, dropping input");
+                return;
+            },
+        }
+    }
+    let Some(inj) = injector.as_mut() else {
+        return;
+    };
+    let r = match req {
+        R::PointerMove { x, y } => inj.pointer_move(*x, *y),
+        R::PointerButton { button, down } => inj.pointer_button(*button, *down),
+        R::Scroll { dx, dy } => inj.scroll(*dx, *dy),
+        R::Key { code, down } => inj.key(code, *down),
+        _ => Ok(()),
+    };
+    if let Err(e) = r {
+        tracing::warn!(error = %e, "remote control: input injection failed");
+    }
 }
 
 /// Ask the host to accept a not-yet-trusted client; returns the decision
@@ -479,6 +538,7 @@ async fn stream_screen(
     mut display: Option<u32>,
     mut kick: Option<watch::Receiver<u64>>,
     mut share_all: Option<watch::Receiver<bool>>,
+    control: Option<watch::Receiver<bool>>,
 ) -> AgentResult<()> {
     use rivetlink_sdk::lan::FrameDelta;
 
@@ -489,7 +549,9 @@ async fn stream_screen(
     // Read client control messages in a side task and forward them over a
     // channel. That keeps the (non-cancel-safe) request read off the frame-send
     // path: the main loop only selects on cancel-safe mpsc receivers.
-    let (ctrl_tx, mut ctrl_rx) = tokio::sync::mpsc::channel::<LanRequest>(4);
+    // Sized for input bursts (mouse moves/keys) interleaved with the rare
+    // display switch, so high-frequency control doesn't head-of-line block.
+    let (ctrl_tx, mut ctrl_rx) = tokio::sync::mpsc::channel::<LanRequest>(64);
     let reader_ch = Arc::clone(&channel);
     let reader = tokio::spawn(async move {
         while let Ok(req) = lan::recv_request(&mut rd, &reader_ch).await {
@@ -499,6 +561,12 @@ async fn stream_screen(
         }
     });
     let _reader_guard = AbortOnDrop(reader.abort_handle());
+
+    // The uinput virtual device is created lazily on the first input event that
+    // the host has granted control for, then reused for the session. Linux only;
+    // macOS has no injector backend yet, so remote input is silently dropped.
+    #[cfg(target_os = "linux")]
+    let mut injector: Option<crate::input::UinputInjector> = None;
 
     // Re-enter on every display switch: tear down the capturer and start a new
     // one targeting the requested screen.
@@ -566,6 +634,20 @@ async fn stream_screen(
                         )
                         .await;
                     },
+                    // Remote input — only when the host has granted control.
+                    Some(
+                        req @ (LanRequest::PointerMove { .. }
+                        | LanRequest::PointerButton { .. }
+                        | LanRequest::Scroll { .. }
+                        | LanRequest::Key { .. }),
+                    ) => {
+                        if control_now(&control) {
+                            #[cfg(target_os = "linux")]
+                            apply_input(&mut injector, &req);
+                            #[cfg(not(target_os = "linux"))]
+                            let _ = req; // no host input backend on this platform
+                        }
+                    },
                     // Ignore a stray Screenshot/StartStream sent mid-stream.
                     Some(_) => {},
                     None => {
@@ -623,6 +705,7 @@ async fn stream_screen(
     _display: Option<u32>,
     _kick: Option<watch::Receiver<u64>>,
     _share_all: Option<watch::Receiver<bool>>,
+    _control: Option<watch::Receiver<bool>>,
 ) -> AgentResult<()> {
     let _ = lan::send_response(&mut stream, &channel, &LanResponse::Error {
         message: "live streaming is not supported on this platform yet".to_string(),

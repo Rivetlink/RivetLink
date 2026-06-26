@@ -388,6 +388,28 @@ pub enum LanRequest {
     /// While streaming, switch the capture to another display by its
     /// [`DisplayInfo::id`]. macOS switches seamlessly; ignored on Linux.
     SwitchDisplay { display: u32 },
+    /// Move the host cursor. `x`/`y` are normalized to `0..=10_000` of the
+    /// streamed frame's width/height, so the host maps them onto its own screen
+    /// resolution-independently. Only honoured when the host has granted control.
+    PointerMove { x: u16, y: u16 },
+    /// Press (`down = true`) or release a mouse button at the current position.
+    PointerButton { button: PtrButton, down: bool },
+    /// Scroll the wheel in notch units; `dy > 0` scrolls down, `dx > 0` right.
+    Scroll { dx: i16, dy: i16 },
+    /// Press/release a key. `code` is the browser `KeyboardEvent.code` (physical
+    /// position, layout-independent — e.g. `"KeyA"`, `"Enter"`, `"ShiftLeft"`),
+    /// or the literal `"CommandMod"` for the platform command modifier (⌘ on
+    /// macOS, Ctrl elsewhere), which the host maps onto *its own* command key.
+    Key { code: String, down: bool },
+}
+
+/// A mouse button, for [`LanRequest::PointerButton`].
+#[derive(Debug, Clone, Copy, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum PtrButton {
+    Left,
+    Right,
+    Middle,
 }
 
 /// A display the host can share: a stable `id` plus a human-readable `name`.
@@ -650,6 +672,7 @@ pub async fn stream_frames<F, D>(
     name: Option<String>,
     identity: Option<&Identity>,
     mut switch_rx: tokio::sync::mpsc::Receiver<u32>,
+    mut input_rx: tokio::sync::mpsc::Receiver<LanRequest>,
     mut on_frame: F,
     mut on_displays: D,
 ) -> SdkResult<()>
@@ -688,11 +711,16 @@ where
 
     let ch_w = Arc::clone(&channel);
     let writer = tokio::spawn(async move {
-        while let Some(display) = switch_rx.recv().await {
-            if send_request(&mut wr, &ch_w, &LanRequest::SwitchDisplay { display })
-                .await
-                .is_err()
-            {
+        // The writer owns the socket's write half: it relays display switches and
+        // remote-input events (mouse/keyboard) to the host. Both are rare-to-
+        // moderate compared to the inbound frame rate, so one task suffices.
+        loop {
+            let req = tokio::select! {
+                Some(display) = switch_rx.recv() => LanRequest::SwitchDisplay { display },
+                Some(req) = input_rx.recv() => req,
+                else => break,
+            };
+            if send_request(&mut wr, &ch_w, &req).await.is_err() {
                 break;
             }
         }
