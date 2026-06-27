@@ -11,4 +11,4 @@
 mod mutter;
 
 #[cfg(target_os = "linux")]
-pub use mutter::{set_overlay_protect, InputAction, InputHandle};
+pub use mutter::{injected_click_age_ms, InputAction, InputHandle};

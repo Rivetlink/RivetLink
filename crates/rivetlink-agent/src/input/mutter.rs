@@ -9,11 +9,12 @@
 //!
 //! GNOME/Mutter only; other compositors get no remote input.
 
-use std::cell::Cell;
 use std::collections::BTreeMap;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::mpsc;
+use std::sync::OnceLock;
 use std::thread;
+use std::time::Instant;
 
 use zbus::blocking::{Connection, Proxy};
 use zbus::zvariant::{OwnedObjectPath, Str, Value};
@@ -22,35 +23,41 @@ use rivetlink_sdk::lan::PtrButton;
 
 use crate::error::{AgentError, AgentResult};
 
-/// Packed normalized protect rect: `x_min<<48 | y_min<<32 | x_max<<16 | y_max`,
-/// each field 0..=10_000 (the same space the client sends pointer coords in).
-/// 0 = no protection. The app sets this while a host overlay badge is on screen
-/// so the controlling client can't click the host's own kick / control buttons
-/// by driving the host cursor; the CLI agent never sets it (no badge).
-static OVERLAY_PROTECT: AtomicU64 = AtomicU64::new(0);
-
-/// App-host only: shield the host's "being viewed" badge from injected clicks.
-/// `rect` is `(x_min, y_min, x_max, y_max)` in 0..=10_000 of the shared frame.
-/// `None` clears it. Set from the app (which knows the badge's real position and
-/// the monitor size, so this is correct at any display scale).
-pub fn set_overlay_protect(rect: Option<(u16, u16, u16, u16)>) {
-    let packed = match rect {
-        Some((a, b, c, d)) => {
-            (u64::from(a) << 48) | (u64::from(b) << 32) | (u64::from(c) << 16) | u64::from(d)
-        },
-        None => 0,
-    };
-    OVERLAY_PROTECT.store(packed, Ordering::Relaxed);
-    tracing::info!(?rect, "overlay-protect: rect set");
+/// Monotonic base for injection timestamps.
+fn inject_base() -> &'static Instant {
+    static BASE: OnceLock<Instant> = OnceLock::new();
+    BASE.get_or_init(Instant::now)
 }
 
-#[allow(clippy::cast_possible_truncation)] // each field was packed from a u16
-fn overlay_protect_rect() -> Option<(u16, u16, u16, u16)> {
-    let p = OVERLAY_PROTECT.load(Ordering::Relaxed);
-    if p == 0 {
-        return None;
+/// Millis (since `inject_base`) at the last injected pointer press; 0 = none yet.
+///
+/// On GNOME/Wayland we can't reliably place the host overlay badge nor query its
+/// real position, so we can't geometrically tell whether an injected click lands
+/// on it. Instead the badge's own buttons drop any click that arrives right after
+/// we injected one: the controlling client's press reaches the badge as a normal
+/// event, but the overlay sees a fresh injection and ignores it. A physical host
+/// click has no recent injection, so it goes through.
+static LAST_INJECT_MS: AtomicU64 = AtomicU64::new(0);
+
+#[allow(clippy::cast_possible_truncation)] // millis fit u64 for any real runtime
+fn now_ms() -> u64 {
+    inject_base().elapsed().as_millis() as u64
+}
+
+/// Note that we just injected a pointer press (the controlling client clicked).
+fn mark_injected_click() {
+    // +1 so the first injection is never stored as the 0 "never" sentinel.
+    LAST_INJECT_MS.store(now_ms() + 1, Ordering::Relaxed);
+}
+
+/// Milliseconds since the last injected pointer press — `u64::MAX` if none yet.
+/// The host overlay reads this to ignore clicks the client made on its own badge.
+pub fn injected_click_age_ms() -> u64 {
+    let last = LAST_INJECT_MS.load(Ordering::Relaxed);
+    if last == 0 {
+        return u64::MAX;
     }
-    Some(((p >> 48) as u16, (p >> 32) as u16, (p >> 16) as u16, p as u16))
+    now_ms().saturating_sub(last)
 }
 
 const RD_DEST: &str = "org.gnome.Mutter.RemoteDesktop";
@@ -121,10 +128,6 @@ struct MutterInjector {
     stream: String,
     width: f64,
     height: f64,
-    /// Last pointer position in normalized frame coords (0..=10_000) — clicks
-    /// carry no coordinates, so we remember where the last move landed to know
-    /// whether a press falls on the protected overlay badge.
-    last_pos: Cell<(u16, u16)>,
 }
 
 impl MutterInjector {
@@ -162,7 +165,6 @@ impl MutterInjector {
             stream: stream_path.as_str().to_owned(),
             width: f64::from(w.max(1)),
             height: f64::from(h.max(1)),
-            last_pos: Cell::new((0, 0)),
         })
     }
 
@@ -174,30 +176,17 @@ impl MutterInjector {
         let s = self.session()?;
         match action {
             InputAction::Move { x, y } => {
-                self.last_pos.set((*x, *y));
                 let px = f64::from(*x) / 10_000.0 * self.width;
                 let py = f64::from(*y) / 10_000.0 * self.height;
                 s.call::<_, _, ()>("NotifyPointerMotionAbsolute", &(self.stream.as_str(), px, py))
                     .map_err(dbus_err)
             },
             InputAction::Button { button, down } => {
-                // Swallow presses that land on the host's own overlay badge so the
-                // controlling client can't kick itself or flip control — only the
-                // physical host (which never goes through this injector) can. Block
-                // the press, not the release, so a drag that ends here can't leave a
-                // button stuck down.
+                // Stamp the press time so the host overlay can tell a click the
+                // client injected on its own badge from a physical host click and
+                // ignore the former (we can't block it geometrically on Wayland).
                 if *down {
-                    if let Some((x0, y0, x1, y1)) = overlay_protect_rect() {
-                        let (lx, ly) = self.last_pos.get();
-                        let blocked = lx >= x0 && lx <= x1 && ly >= y0 && ly <= y1;
-                        tracing::info!(
-                            x = lx, y = ly, x0, y0, x1, y1, blocked,
-                            "overlay-protect: injected click",
-                        );
-                        if blocked {
-                            return Ok(());
-                        }
-                    }
+                    mark_injected_click();
                 }
                 s.call::<_, _, ()>("NotifyPointerButton", &(button_code(*button), *down))
                     .map_err(dbus_err)
