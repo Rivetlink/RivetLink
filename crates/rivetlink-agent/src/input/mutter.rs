@@ -9,6 +9,7 @@
 //!
 //! GNOME/Mutter only; other compositors get no remote input.
 
+use std::cell::Cell;
 use std::collections::BTreeMap;
 use std::sync::mpsc;
 use std::thread;
@@ -48,9 +49,14 @@ impl InputHandle {
     /// Spawn the injector for the monitor at index `display` (`None` = primary).
     /// The thread sets up the Mutter session once, then replays actions until the
     /// handle drops. Cheap to call — real setup failures surface in its logs.
-    pub fn spawn(display: Option<u32>) -> Self {
+    ///
+    /// `protect_overlay` drops injected clicks that land on the host's "being
+    /// viewed" badge (bottom-right), so the controlling client can't operate the
+    /// host's own kick / grant-control buttons — those stay host-physical-only.
+    /// Set it only in app-host mode (the CLI agent has no such badge).
+    pub fn spawn(display: Option<u32>, protect_overlay: bool) -> Self {
         let (tx, rx) = mpsc::channel::<InputAction>();
-        thread::spawn(move || run(display, &rx));
+        thread::spawn(move || run(display, protect_overlay, &rx));
         Self { tx }
     }
 
@@ -62,8 +68,8 @@ impl InputHandle {
 
 /// Injector thread body: build the session, then drain actions until the handle
 /// (and thus the channel) is dropped.
-fn run(display: Option<u32>, rx: &mpsc::Receiver<InputAction>) {
-    let injector = match MutterInjector::new(display) {
+fn run(display: Option<u32>, protect_overlay: bool, rx: &mpsc::Receiver<InputAction>) {
+    let injector = match MutterInjector::new(display, protect_overlay) {
         Ok(inj) => inj,
         Err(e) => {
             tracing::warn!(error = %e, "remote control: Mutter RemoteDesktop unavailable");
@@ -88,10 +94,15 @@ struct MutterInjector {
     stream: String,
     width: f64,
     height: f64,
+    /// Drop clicks on the host's bottom-right overlay badge (app-host mode only).
+    protect_overlay: bool,
+    /// Last absolute pointer position in monitor pixels — to know where a click
+    /// lands without re-deriving it (clicks carry no coordinates of their own).
+    last_pos: Cell<(f64, f64)>,
 }
 
 impl MutterInjector {
-    fn new(display: Option<u32>) -> AgentResult<Self> {
+    fn new(display: Option<u32>, protect_overlay: bool) -> AgentResult<Self> {
         let (connector, w, h) = crate::capture::mutter::monitor_target(display)
             .ok_or_else(|| AgentError::Input("no monitor available to control".to_string()))?;
         let conn = Connection::session().map_err(dbus_err)?;
@@ -125,7 +136,30 @@ impl MutterInjector {
             stream: stream_path.as_str().to_owned(),
             width: f64::from(w.max(1)),
             height: f64::from(h.max(1)),
+            protect_overlay,
+            last_pos: Cell::new((0.0, 0.0)),
         })
+    }
+
+    /// Whether the last pointer position sits on the host's "being viewed" badge
+    /// (the kick / grant-control buttons, bottom-right of the primary monitor) —
+    /// where injected clicks must be ignored so only the physical host can press
+    /// them. The right-most collapse chevron stays clickable (left out of the box).
+    ///
+    /// Geometry mirrors the app's `OverlayPanel` badge in `RivetLink-Application`
+    /// (`lib.rs`: 400×64 window, 16px margin, raised 10% of screen height; the
+    /// pill right-hugs so the buttons sit at fixed offsets from the right edge).
+    /// ponytail: replicated constants, not plumbed live — drifts only if the badge
+    /// is resized, and the cost of being wrong is a self-harm click, not a leak.
+    fn on_protected_badge(&self) -> bool {
+        let (x, y) = self.last_pos.get();
+        let right = self.width - 16.0; // window right edge (16px screen margin)
+        // Cover the grant-control + kick buttons; stop short of the collapse
+        // chevron (right-most ~44px) so the client can still fold the badge.
+        let in_x = x >= right - 160.0 && x <= right - 50.0;
+        let badge_bottom = self.height * 0.90; // raised 10% off the screen bottom
+        let in_y = y >= badge_bottom - 68.0 && y <= badge_bottom + 4.0;
+        in_x && in_y
     }
 
     fn session(&self) -> AgentResult<Proxy<'_>> {
@@ -138,12 +172,22 @@ impl MutterInjector {
             InputAction::Move { x, y } => {
                 let px = f64::from(*x) / 10_000.0 * self.width;
                 let py = f64::from(*y) / 10_000.0 * self.height;
+                self.last_pos.set((px, py));
                 s.call::<_, _, ()>("NotifyPointerMotionAbsolute", &(self.stream.as_str(), px, py))
                     .map_err(dbus_err)
             },
-            InputAction::Button { button, down } => s
-                .call::<_, _, ()>("NotifyPointerButton", &(button_code(*button), *down))
-                .map_err(dbus_err),
+            InputAction::Button { button, down } => {
+                // Swallow presses that land on the host's own overlay badge so the
+                // controlling client can't kick itself or flip control — only the
+                // physical host (which never goes through this injector) can. Block
+                // the press, not the release, so a drag that ends here can't leave a
+                // button stuck down.
+                if *down && self.protect_overlay && self.on_protected_badge() {
+                    return Ok(());
+                }
+                s.call::<_, _, ()>("NotifyPointerButton", &(button_code(*button), *down))
+                    .map_err(dbus_err)
+            },
             InputAction::Scroll { dx, dy } => {
                 // Discrete wheel notches: axis 0 = vertical, 1 = horizontal.
                 if *dy != 0 {
