@@ -182,12 +182,13 @@ impl MutterInjector {
                     .map_err(dbus_err)
             },
             InputAction::Button { button, down } => {
-                // Stamp the press time so the host overlay can tell a click the
-                // client injected on its own badge from a physical host click and
-                // ignore the former (we can't block it geometrically on Wayland).
-                if *down {
-                    mark_injected_click();
-                }
+                // Stamp every injected press/release so the host overlay can tell a
+                // click the client made on its own badge from a physical host click
+                // and ignore the former (we can't block it geometrically on
+                // Wayland). Stamp on the *release* too: the badge button's `click`
+                // fires on release, and down→release spans the client's hold time +
+                // network — stamping only the press would look stale by then.
+                mark_injected_click();
                 s.call::<_, _, ()>("NotifyPointerButton", &(button_code(*button), *down))
                     .map_err(dbus_err)
             },
