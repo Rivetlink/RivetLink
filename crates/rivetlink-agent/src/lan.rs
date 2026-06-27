@@ -444,17 +444,12 @@ fn control_now(control: &Option<watch::Receiver<bool>>) -> bool {
 /// use (a Mutter RemoteDesktop session for the monitor being shared). Sending is
 /// non-blocking, so this never stalls the frame loop. Linux only.
 #[cfg(target_os = "linux")]
-fn apply_input(
-    handle: &mut Option<crate::input::InputHandle>,
-    display: Option<u32>,
-    protect_overlay: bool,
-    req: &LanRequest,
-) {
+fn apply_input(handle: &mut Option<crate::input::InputHandle>, display: Option<u32>, req: &LanRequest) {
     use rivetlink_sdk::lan::LanRequest as R;
 
     use crate::input::{InputAction, InputHandle};
 
-    let handle = handle.get_or_insert_with(|| InputHandle::spawn(display, protect_overlay));
+    let handle = handle.get_or_insert_with(|| InputHandle::spawn(display));
     let action = match req {
         R::PointerMove { x, y } => InputAction::Move { x: *x, y: *y },
         R::PointerButton { button, down } => InputAction::Button {
@@ -641,10 +636,8 @@ async fn stream_screen(
                         | LanRequest::Key { .. }),
                     ) => {
                         if control_now(&control) {
-                            // `control.is_some()` ⟺ app-host mode (the badge exists
-                            // there; the CLI agent passes `None` and has none).
                             #[cfg(target_os = "linux")]
-                            apply_input(&mut injector, display, control.is_some(), &req);
+                            apply_input(&mut injector, display, &req);
                             #[cfg(not(target_os = "linux"))]
                             let _ = req; // no host input backend on this platform
                         }
