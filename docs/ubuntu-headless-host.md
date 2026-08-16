@@ -210,6 +210,15 @@ supported security boundary for this phase.
 
 ## Uninstall
 
+When this host was installed from the RivetLink app, use **Settings → Headless
+Ubuntu-host → Headless host verwijderen**. This stops and removes only the two
+RivetLink user services and `~/.rivetlink`, including the local headless
+identity, keys, and configuration. It leaves installed GNOME/PipeWire packages,
+the app's saved controller allow-list, and any relay-side device record in
+place, so the host can be set up again cleanly.
+
+For a terminal-only recovery path:
+
 ```bash
 ./scripts/uninstall-host-ubuntu.sh          # removes services, keeps identity
 ./scripts/uninstall-host-ubuntu.sh --purge  # also deletes local keys/trust data
