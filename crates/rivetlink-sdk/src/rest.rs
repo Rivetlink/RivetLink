@@ -40,6 +40,39 @@ pub async fn list_devices(base_url: &str, token: &str) -> SdkResult<Vec<Device>>
     Ok(devices)
 }
 
+/// Register a host device for the authenticated user's organisation and
+/// return its relay-issued id. The caller retains the access token; this
+/// module never persists or exposes it.
+pub async fn register_device(
+    base_url: &str,
+    token: &str,
+    public_key: &str,
+    hostname: &str,
+    platform: Option<&str>,
+) -> SdkResult<String> {
+    let body = serde_json::json!({
+        "public_key": public_key,
+        "hostname": hostname,
+        "platform": platform,
+    });
+    let resp = request(
+        base_url,
+        "POST",
+        "/devices/register",
+        Some(token),
+        Some(&body),
+    )
+    .await?;
+    device_id_from_response(&resp)
+}
+
+fn device_id_from_response(resp: &Value) -> SdkResult<String> {
+    resp.get("id")
+        .and_then(Value::as_str)
+        .map(ToString::to_string)
+        .ok_or_else(|| SdkError::Http("device registration response missing id".to_string()))
+}
+
 /// Perform a single HTTP request and parse the JSON body.
 async fn request(
     base_url: &str,
@@ -58,7 +91,10 @@ async fn request(
         .map(|t| format!("Authorization: Bearer {t}\r\n"))
         .unwrap_or_default();
     let content_line = if body.is_some() {
-        format!("Content-Type: application/json\r\nContent-Length: {}\r\n", body_bytes.len())
+        format!(
+            "Content-Type: application/json\r\nContent-Length: {}\r\n",
+            body_bytes.len()
+        )
     } else {
         String::new()
     };
@@ -143,5 +179,14 @@ mod tests {
     #[test]
     fn parse_rejects_https() {
         assert!(parse_base_url("https://relay.lan").is_err());
+    }
+
+    #[test]
+    fn registration_response_requires_device_id() {
+        assert_eq!(
+            device_id_from_response(&serde_json::json!({ "id": "device-1" })).unwrap(),
+            "device-1"
+        );
+        assert!(device_id_from_response(&serde_json::json!({})).is_err());
     }
 }

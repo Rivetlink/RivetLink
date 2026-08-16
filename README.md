@@ -132,7 +132,9 @@ client (trust on first use). Approve it once and the host remembers your key.
 For a monitorless Ubuntu Desktop Home Node, the RivetLink AppImage offers an
 explicit **Settings → General → Headless Ubuntu-host** setup flow. It installs
 the required Ubuntu packages after owner approval and creates non-root user
-services; normal app updates never run it automatically. For unattended
+services. After signing in, the app uses its current authenticated session to
+register the Home Node without exposing or asking the user to paste a token;
+normal app updates never run setup automatically. For unattended
 provisioning, use the dedicated non-root GNOME
 Wayland virtual-monitor host. It supports only the existing encrypted
 on-demand screenshot flow; it enables neither RDP nor remote control. See

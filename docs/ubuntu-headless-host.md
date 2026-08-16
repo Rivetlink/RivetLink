@@ -39,14 +39,16 @@ RivetLink's trust model.
 Install and open the RivetLink AppImage on the intended Ubuntu Desktop user
 account. Add and select the relay under **Servers**, then open
 **Settings → General → Headless Ubuntu-host** and choose **Headless host
-instellen**. The visible confirmation dialog asks for:
+instellen**. First sign in to the selected relay in the app. The visible
+confirmation dialog asks for:
 
 - a Home Node name and virtual-monitor resolution;
-- a one-time device-registration token for the selected relay; and
 - Ubuntu's normal PolicyKit/system password prompt to install the required
   packages and enable user lingering.
 
-The token is used once for registration and is never saved or put in a log.
+The app registers the Home Node with its already authenticated relay session.
+Its short-lived access token remains inside the SDK: it is not shown in the
+UI, passed in process arguments, saved in configuration, or written to logs.
 The app pre-trusts only this AppImage user's existing RivetLink client identity
 for screenshot viewing. It writes a user service whose executable is the
 AppImage itself with an internal screenshot-agent argument. Consequently a
@@ -74,7 +76,7 @@ Then install on the Ubuntu Home Node. The default requires HTTPS/WSS; use
 ```bash
 ./scripts/install-host-ubuntu.sh \
   --relay-host relay.example.com \
-  --token '<one-time registration access token>' \
+  --token '<access token from login>' \
   --trusted-client-key '<base64 value from whoami>' \
   --trusted-client-name 'Owner laptop'
 ```
@@ -89,8 +91,9 @@ rivetlink-agent.service            RivetLink screenshot-only host
 ```
 
 It invokes `sudo` only for package installation and `loginctl enable-linger`.
-Neither service runs as root. The registration token is used once and is not
-stored.
+Neither service runs as root. The CLI access token is used for registration
+only and is not stored. This manual-token route is for unattended provisioning;
+the AppImage setup never asks the user to copy a token.
 
 For a different virtual resolution, pass for example `--resolution 2560x1440`.
 The agent caps the current screenshot capture path to a 1920×1080 bounding box

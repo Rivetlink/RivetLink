@@ -90,6 +90,24 @@ impl RivetClient {
         rest::list_devices(&self.config.relay_http_url, self.token()?).await
     }
 
+    /// Register a host device using this client's already-authenticated relay
+    /// session. The access token remains private to the SDK.
+    pub async fn register_device(
+        &self,
+        public_key: &str,
+        hostname: &str,
+        platform: Option<&str>,
+    ) -> SdkResult<String> {
+        rest::register_device(
+            &self.config.relay_http_url,
+            self.token()?,
+            public_key,
+            hostname,
+            platform,
+        )
+        .await
+    }
+
     /// Find one device by its id (lists and filters server-side results).
     pub async fn find_device(&self, device_id: &str) -> SdkResult<Device> {
         self.list_devices()
@@ -124,5 +142,31 @@ impl RivetClient {
     /// Internal: the stored token, or a `NotAuthenticated` error.
     fn token(&self) -> SdkResult<&str> {
         self.token.as_deref().ok_or(SdkError::NotAuthenticated)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[tokio::test]
+    async fn registration_requires_authenticated_session() {
+        let identity_path = std::env::temp_dir().join(format!(
+            "rivetlink-sdk-client-test-{}.json",
+            uuid::Uuid::now_v7()
+        ));
+        let client = RivetClient::new(ClientConfig {
+            relay_ws_url: "ws://127.0.0.1:8080/ws".into(),
+            relay_http_url: "http://127.0.0.1:8080".into(),
+            identity_path: identity_path.clone(),
+        })
+        .unwrap();
+
+        let err = client
+            .register_device("test-public-key", "Home Node", Some("linux"))
+            .await
+            .unwrap_err();
+        assert!(matches!(err, SdkError::NotAuthenticated));
+        std::fs::remove_file(identity_path).ok();
     }
 }
