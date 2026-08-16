@@ -37,28 +37,49 @@ RivetLink's trust model.
 ### RivetLink AppImage (recommended)
 
 Install and open the RivetLink AppImage on the intended Ubuntu Desktop user
-account. Add and select the relay under **Servers**, then open
-**Settings → General → Headless Ubuntu-host** and choose **Headless host
-instellen**. First sign in to the selected relay in the app. The visible
-confirmation dialog asks for:
+account, then open **Settings → General → Headless Ubuntu-host** and choose
+**Headless host instellen**. Choose one transport in the visible confirmation
+dialog:
+
+- **Lokaal netwerk** (the default) needs no RivetLink server or account. It
+  advertises the Home Node only with mDNS on the current LAN and allows only
+  the controller identity that the owner explicitly pastes into setup to
+  request encrypted screenshots.
+- **Via relay** is for access beyond the LAN. Add and select the relay under
+  **Servers**, then sign in to it in **Verbinden** before starting setup.
+
+The dialog then asks for:
 
 - a Home Node name and virtual-monitor resolution;
+- the public identity key of the RivetLink app on the laptop/phone that will
+  control this Home Node (copy it from **Instellingen → Beveiliging** there);
 - Ubuntu's normal PolicyKit/system password prompt to install the required
   packages and enable user lingering.
 
-The app registers the Home Node with its already authenticated relay session.
-Its short-lived access token remains inside the SDK: it is not shown in the
-UI, passed in process arguments, saved in configuration, or written to logs.
-The app pre-trusts only this AppImage user's existing RivetLink client identity
-for screenshot viewing. It writes a user service whose executable is the
-AppImage itself with an internal screenshot-agent argument. Consequently a
-normal signed AppImage update continues to use the updated AppImage at its
-stable path. An app update **never** starts this setup or changes trust on its
-own; it only exposes the setup option for an owner to confirm.
+In relay mode the app registers the Home Node with its already authenticated
+relay session. Its short-lived access token remains inside the SDK: it is not
+shown in the UI, passed in process arguments, saved in configuration, or
+written to logs. Local-network mode never contacts a relay.
+The app pre-trusts only that explicitly selected controller identity for
+screenshot viewing. It writes a user service whose executable is the AppImage
+itself with an internal screenshot-agent argument. Consequently a normal signed
+AppImage update continues to use the updated AppImage at its stable path. An
+app update **never** starts this setup or changes trust on its own; it only
+exposes the setup option for an owner to confirm.
 
 The setup is shown only on Ubuntu Desktop 24.04 LTS or newer. It may ask for
 the system password multiple times, depending on the local PolicyKit policy.
 Neither long-lived service runs as root.
+
+### Using the local-network option
+
+On the trusted RivetLink client, open **Verbinden → Lokaal netwerk**, choose
+**Scannen**, add the discovered Home Node, then use its **Screenshot** button.
+The mDNS advertisement includes the host's public identity, which the client
+pins during the direct encrypted handshake. The service accepts no PIN pairing,
+live stream, display switch, keyboard/mouse input, or shell request. A direct
+LAN connection from another app/device is rejected unless its exact Ed25519
+identity is added locally to `keys/trusted_clients.json` with `can_view: true`.
 
 ### CLI fallback
 
@@ -104,7 +125,8 @@ scope for this phase.
 
 The host's local `keys/trusted_clients.json` is authoritative. A client is
 eligible only if its exact Ed25519 key is present with `can_view: true`.
-Headless acceptance also requires this explicit owner-controlled config:
+Relay-mode headless acceptance also requires this explicit owner-controlled
+config:
 
 ```json
 "headless": {
@@ -113,8 +135,10 @@ Headless acceptance also requires this explicit owner-controlled config:
 }
 ```
 
-The installer creates it only after receiving `--trusted-client-key`. To add a
-client later, run locally on the host:
+The installer creates it only after receiving `--trusted-client-key`. The
+AppImage's Local-network mode instead has the equivalent explicit owner opt-in
+in its setup confirmation and starts a separate trusted-key-only screenshot
+service. To add a client later, run locally on the host:
 
 ```bash
 ~/.rivetlink/bin/rivet-agent --config ~/.rivetlink/agent.json trust-client \

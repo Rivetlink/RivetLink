@@ -65,6 +65,11 @@ pub async fn run(cli: Cli) -> AgentResult<()> {
             keystore_path,
             auto_accept,
         }) => lan(port, pin, device_name, keystore_path, auto_accept).await,
+        Some(Command::LanHeadless {
+            port,
+            device_name,
+            keystore_path,
+        }) => lan_headless(port, device_name, keystore_path).await,
         None => Err(AgentError::Config(
             "no subcommand given — use `rivet-agent --help`".to_string(),
         )),
@@ -255,6 +260,33 @@ async fn lan(
         },
     };
     lan::serve(signing_key, device_name, port, auth).await
+}
+
+async fn lan_headless(
+    port: u16,
+    device_name: String,
+    keystore_path: std::path::PathBuf,
+) -> AgentResult<()> {
+    if device_name.trim().is_empty() || device_name.len() > 100 {
+        return Err(AgentError::Config(
+            "headless LAN device name must be between 1 and 100 characters".to_string(),
+        ));
+    }
+    let store = FileKeyStore::new(keystore_path.clone())?;
+    let signing = store.ensure_signing_key().await?;
+    let signing_key = ed25519_signing_key(&signing)?;
+    let trusted = TrustedClients::load_or_empty(&keystore_path.join("trusted_clients.json"))?;
+    if trusted.is_empty() {
+        return Err(AgentError::Config(
+            "headless LAN mode requires at least one locally pre-trusted client".to_string(),
+        ));
+    }
+    let limits = HeadlessConfig {
+        enabled: true,
+        allow_trusted_clients: true,
+        ..HeadlessConfig::default()
+    };
+    lan::serve_headless_screenshot_only(signing_key, device_name, port, trusted, limits).await
 }
 
 fn ed25519_signing_key(stored: &KsSigningKey) -> AgentResult<SigningKey> {

@@ -6,6 +6,7 @@
 //! encrypted channel, then serves screenshot requests over it.
 
 use std::sync::Arc;
+use std::time::{Duration, Instant};
 
 use base64::engine::general_purpose::STANDARD as B64;
 use base64::Engine;
@@ -22,6 +23,7 @@ use rivetlink_sdk::lan::{
 };
 
 use crate::capture::screenshot;
+use crate::config::HeadlessConfig;
 use crate::error::{AgentError, AgentResult};
 use crate::trusted::TrustedClients;
 
@@ -98,6 +100,132 @@ pub async fn serve(
         None,
     )
     .await
+}
+
+/// Serve the dedicated virtual GNOME monitor directly on the local network.
+///
+/// This is deliberately a distinct, narrow server rather than a flag on the
+/// general LAN host: it admits only locally pre-trusted clients and understands
+/// only one request, an on-demand screenshot. It has no PIN fallback, stream,
+/// display-switch, or input path.
+pub async fn serve_headless_screenshot_only(
+    signing_key: SigningKey,
+    device_name: String,
+    port: u16,
+    trusted: TrustedClients,
+    limits: HeadlessConfig,
+) -> AgentResult<()> {
+    let listener = bind_listener(port).await?;
+    let local_port = listener.local_addr()?.port();
+    let public_key = B64.encode(signing_key.verifying_key().as_bytes());
+    let _advertiser = Advertiser::start(&device_name, local_port, &public_key, PROTOCOL_VERSION)
+        .map_err(|e| AgentError::Lan(e.to_string()))?;
+
+    tracing::info!(
+        port = local_port,
+        device = %device_name,
+        trusted_clients = trusted.len(),
+        "headless LAN screenshot host advertising"
+    );
+    let trusted = Arc::new(trusted);
+    let mut sessions = tokio::task::JoinSet::new();
+    loop {
+        tokio::select! {
+            accepted = listener.accept() => {
+                let (stream, peer) = accepted?;
+                let _ = stream.set_nodelay(true);
+                let signing_key = signing_key.clone();
+                let trusted = Arc::clone(&trusted);
+                let limits = limits.clone();
+                sessions.spawn(async move {
+                    if let Err(error) = serve_headless_client(stream, signing_key, trusted, limits).await {
+                        tracing::warn!(%peer, error = %error, "headless LAN session ended");
+                    }
+                });
+            },
+            Some(_) = sessions.join_next(), if !sessions.is_empty() => {},
+        }
+    }
+}
+
+async fn serve_headless_client(
+    mut stream: TcpStream,
+    signing_key: SigningKey,
+    trusted: Arc<TrustedClients>,
+    limits: HeadlessConfig,
+) -> AgentResult<()> {
+    let identity = Identity::from_signing_key(signing_key);
+    let (channel, client) = direct::host_accept_key(&mut stream, &identity, |id| {
+        headless_client_is_allowed(&trusted, id)
+    })
+    .await
+    .map_err(|e| AgentError::Lan(e.to_string()))?;
+    tracing::info!(client = %client, "headless LAN client accepted");
+
+    let mut last_capture = None;
+    loop {
+        let Ok(request) = lan::recv_request(&mut stream, &channel).await else {
+            return Ok(());
+        };
+        if !matches!(request, LanRequest::Screenshot) {
+            let _ = lan::send_response(
+                &mut stream,
+                &channel,
+                &LanResponse::Error {
+                    message: "this headless host supports on-demand screenshots only".to_string(),
+                },
+            )
+            .await;
+            return Ok(());
+        }
+
+        if last_capture.is_some_and(|at: Instant| {
+            at.elapsed() < Duration::from_secs(limits.min_capture_interval_secs)
+        }) {
+            let _ = lan::send_response(
+                &mut stream,
+                &channel,
+                &LanResponse::Error {
+                    message: "screenshot request rate limit reached; try again shortly".to_string(),
+                },
+            )
+            .await;
+            continue;
+        }
+        last_capture = Some(Instant::now());
+        let timeout = Duration::from_secs(limits.capture_timeout_secs);
+        let response =
+            match tokio::time::timeout(timeout, screenshot::capture_headless_png(timeout)).await {
+                Ok(Ok(png)) if png.len() <= limits.max_capture_bytes => LanResponse::Screenshot {
+                    png_b64: B64.encode(png),
+                },
+                Ok(Ok(_png)) => LanResponse::Error {
+                    message: format!(
+                        "screenshot exceeds the {} byte safety limit",
+                        limits.max_capture_bytes
+                    ),
+                },
+                Ok(Err(error)) => {
+                    tracing::warn!(client = %client, error = %error, "headless LAN capture failed");
+                    LanResponse::Error {
+                        message: "headless screenshot capture failed".to_string(),
+                    }
+                },
+                Err(_) => {
+                    tracing::warn!(client = %client, "headless LAN capture timed out");
+                    LanResponse::Error {
+                        message: "headless screenshot capture timed out".to_string(),
+                    }
+                },
+            };
+        lan::send_response(&mut stream, &channel, &response)
+            .await
+            .map_err(|e| AgentError::Lan(e.to_string()))?;
+    }
+}
+
+fn headless_client_is_allowed(trusted: &TrustedClients, client_id: &str) -> bool {
+    trusted.get(client_id).is_some_and(|entry| entry.can_view)
 }
 
 /// Like [`serve`], but reports session lifecycle on `events` (if given) so an
@@ -751,5 +879,39 @@ mod tests {
         assert!(!share_all_now(&Some(rx)));
         let (_tx2, rx2) = watch::channel(true);
         assert!(share_all_now(&Some(rx2)));
+    }
+
+    #[test]
+    fn headless_lan_requires_a_view_trusted_client() {
+        let path = std::env::temp_dir().join(format!(
+            "rivetlink-headless-lan-test-{}.json",
+            uuid::Uuid::now_v7()
+        ));
+        let mut trusted = TrustedClients::load_or_empty(&path).unwrap();
+        trusted
+            .trust(
+                "viewer",
+                crate::trusted::TrustedEntry {
+                    name: "Viewer".to_string(),
+                    can_view: true,
+                    can_control: false,
+                },
+            )
+            .unwrap();
+        trusted
+            .trust(
+                "control-only",
+                crate::trusted::TrustedEntry {
+                    name: "Control only".to_string(),
+                    can_view: false,
+                    can_control: true,
+                },
+            )
+            .unwrap();
+
+        assert!(headless_client_is_allowed(&trusted, "viewer"));
+        assert!(!headless_client_is_allowed(&trusted, "control-only"));
+        assert!(!headless_client_is_allowed(&trusted, "unknown"));
+        std::fs::remove_file(path).ok();
     }
 }

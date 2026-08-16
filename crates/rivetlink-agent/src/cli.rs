@@ -115,4 +115,21 @@ pub enum Command {
         #[arg(long)]
         auto_accept: bool,
     },
+
+    /// Serve only on-demand screenshots from the dedicated GNOME virtual
+    /// monitor on the local network. This requires a pre-trusted client key;
+    /// it never enables PIN pairing, live video, or remote input.
+    LanHeadless {
+        /// TCP port to listen on (0 = pick a free port, announced via mDNS).
+        #[arg(long, default_value_t = 47823)]
+        port: u16,
+
+        /// Friendly name advertised on the network.
+        #[arg(long)]
+        device_name: String,
+
+        /// Keystore directory containing the host keys and trusted clients.
+        #[arg(long, default_value = "keys")]
+        keystore_path: PathBuf,
+    },
 }
