@@ -125,6 +125,12 @@ scope for this phase.
 
 The host's local `keys/trusted_clients.json` is authoritative. A client is
 eligible only if its exact Ed25519 key is present with `can_view: true`.
+The AppImage seeds this file with every key already listed under
+**Instellingen → Beveiliging → Toegang tot dit apparaat**. Adding or revoking
+a key there updates and restarts the headless agent, so several owner devices
+can use the same Home Node. Saved LAN **hosts** are deliberately not copied:
+their public keys identify machines this client calls, not controllers that may
+call the Home Node.
 Relay-mode headless acceptance also requires this explicit owner-controlled
 config:
 
