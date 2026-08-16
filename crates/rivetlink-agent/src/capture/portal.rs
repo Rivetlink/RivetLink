@@ -34,7 +34,9 @@ pub async fn capture_png() -> AgentResult<Vec<u8>> {
     let _ = std::fs::remove_file(&path);
 
     if bytes.is_empty() {
-        return Err(AgentError::Config("portal capture produced no data".to_string()));
+        return Err(AgentError::Config(
+            "portal capture produced no data".to_string(),
+        ));
     }
     Ok(bytes)
 }

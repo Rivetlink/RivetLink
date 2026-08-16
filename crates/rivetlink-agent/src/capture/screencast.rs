@@ -127,7 +127,10 @@ impl TileEncoder {
             return true; // skip a malformed frame, keep going
         }
 
-        let dims_changed = self.prev.as_ref().is_none_or(|(pw, ph, _)| *pw != w || *ph != h);
+        let dims_changed = self
+            .prev
+            .as_ref()
+            .is_none_or(|(pw, ph, _)| *pw != w || *ph != h);
         let keyframe = dims_changed || self.counter.is_multiple_of(KEYFRAME_INTERVAL);
         self.counter = self.counter.wrapping_add(1);
 
@@ -146,7 +149,10 @@ impl TileEncoder {
                     h: TILE.min(h - y0),
                 };
                 let changed = keyframe
-                    || self.prev.as_ref().is_none_or(|(_, _, pd)| tile_differs(&data, pd, &rect));
+                    || self
+                        .prev
+                        .as_ref()
+                        .is_none_or(|(_, _, pd)| tile_differs(&data, pd, &rect));
                 if !changed {
                     continue;
                 }
@@ -245,7 +251,10 @@ fn encode_tile(frame: &[u8], r: &TileRect, quality: u8) -> AgentResult<Vec<u8>> 
         let start = ((r.y + row) * r.fw + r.x) * 4;
         buf.extend_from_slice(&frame[start..start + row_bytes]);
     }
-    let (tw16, th16) = (u16::try_from(r.w).unwrap_or(0), u16::try_from(r.h).unwrap_or(0));
+    let (tw16, th16) = (
+        u16::try_from(r.w).unwrap_or(0),
+        u16::try_from(r.h).unwrap_or(0),
+    );
     let mut out = Vec::new();
     Encoder::new(&mut out, quality)
         .encode(&buf, tw16, th16, ColorType::Bgra)
@@ -270,7 +279,10 @@ mod macos {
         scap::get_all_targets()
             .into_iter()
             .filter_map(|t| match t {
-                scap::Target::Display(d) => Some(DisplayInfo { id: d.id, name: d.title }),
+                scap::Target::Display(d) => Some(DisplayInfo {
+                    id: d.id,
+                    name: d.title,
+                }),
                 scap::Target::Window(_) => None,
             })
             .collect()
@@ -323,10 +335,14 @@ mod macos {
     /// Build a 720p BGRA capturer for the chosen display (`None` = first).
     fn build_capturer(fps: u16, display: Option<u32>) -> AgentResult<Capturer> {
         if !scap::is_supported() {
-            return Err(AgentError::Lan("screen capture not supported here".to_string()));
+            return Err(AgentError::Lan(
+                "screen capture not supported here".to_string(),
+            ));
         }
         let all = scap::get_all_targets();
-        let mut displays = all.into_iter().filter(|t| matches!(t, scap::Target::Display(_)));
+        let mut displays = all
+            .into_iter()
+            .filter(|t| matches!(t, scap::Target::Display(_)));
         let target = match display {
             Some(id) => displays.find(|t| matches!(t, scap::Target::Display(d) if d.id == id)),
             None => displays.next(),

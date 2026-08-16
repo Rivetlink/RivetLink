@@ -18,6 +18,7 @@ use rivetlink_core::{SessionId, SessionRole};
 use rivetlink_crypto::handshake::{self, LocalKeyExchange};
 use rivetlink_crypto::sealed::SealedChannel;
 use rivetlink_protocol::SignalPacket;
+use std::time::{Duration, Instant};
 
 use crate::capture::screenshot;
 use crate::error::{AgentError, AgentResult};
@@ -32,8 +33,14 @@ const CHUNK_CHARS: usize = 48 * 1024;
 pub enum ConsentPolicy {
     /// Prompt the operator on stdin for unknown clients (TOFU).
     Prompt,
-    /// Auto-accept and trust any client (unattended / testing only).
-    AutoAccept,
+    /// Screenshot-only unattended mode. This mode is intentionally narrower
+    /// than a generic auto-accept: only a locally pre-trusted key with
+    /// `can_view` is admitted and requests are bounded.
+    HeadlessTrustedOnly {
+        min_capture_interval: Duration,
+        capture_timeout: Duration,
+        max_capture_bytes: usize,
+    },
 }
 
 /// Per-connection host session state.
@@ -48,6 +55,7 @@ pub struct ScreenshotHost {
     client_identity: Option<VerifyingKey>,
     local_kex: Option<LocalKeyExchange>,
     channel: Option<SealedChannel>,
+    last_capture: Option<Instant>,
 }
 
 impl std::fmt::Debug for ScreenshotHost {
@@ -63,8 +71,8 @@ impl std::fmt::Debug for ScreenshotHost {
 impl ScreenshotHost {
     /// Create a host handler from the device signing key + trusted store.
     pub fn new(signing_key: SigningKey, trusted: TrustedClients, policy: ConsentPolicy) -> Self {
-        let identity_b64 =
-            base64::engine::general_purpose::STANDARD.encode(signing_key.verifying_key().as_bytes());
+        let identity_b64 = base64::engine::general_purpose::STANDARD
+            .encode(signing_key.verifying_key().as_bytes());
         Self {
             signing_key,
             identity_b64,
@@ -74,6 +82,7 @@ impl ScreenshotHost {
             client_identity: None,
             local_kex: None,
             channel: None,
+            last_capture: None,
         }
     }
 
@@ -83,24 +92,24 @@ impl ScreenshotHost {
         self.client_identity = None;
         self.local_kex = None;
         self.channel = None;
+        self.last_capture = None;
     }
 
     /// Decide whether to admit a client, prompting the operator if unknown.
     async fn consent(&mut self, client_key_b64: &str) -> AgentResult<bool> {
-        if self.trusted.is_trusted(client_key_b64) {
-            tracing::info!("client already trusted, auto-accepting");
-            return Ok(true);
+        if let Some(entry) = self.trusted.get(client_key_b64) {
+            if entry.can_view {
+                tracing::info!(client = %entry.name, "trusted client accepted for screenshot access");
+                return Ok(true);
+            }
+            tracing::warn!(client = %entry.name, "trusted client denied: view permission is disabled");
+            return Ok(false);
         }
-        if self.policy == ConsentPolicy::AutoAccept {
-            self.trusted.trust(
-                client_key_b64,
-                TrustedEntry {
-                    name: "auto-accepted".to_string(),
-                    can_view: true,
-                    can_control: false,
-                },
-            )?;
-            return Ok(true);
+        if matches!(self.policy, ConsentPolicy::HeadlessTrustedOnly { .. }) {
+            // A background systemd service cannot safely prompt; it also must
+            // not create trust through a connection attempt.
+            tracing::warn!("unknown client rejected in headless mode");
+            return Ok(false);
         }
 
         // Prompt the operator on stdin (blocking → off the async runtime).
@@ -133,6 +142,7 @@ impl ScreenshotHost {
             tracing::warn!("session request without session_id (relay should stamp it)");
             return Ok(Vec::new());
         };
+        tracing::info!(session = %sid, "session request received");
 
         let client_identity = match parse_identity(&client_public_key) {
             Ok(k) => k,
@@ -143,7 +153,7 @@ impl ScreenshotHost {
         };
 
         if !self.consent(&client_public_key).await? {
-            tracing::info!("operator denied the connection");
+            tracing::info!(session = %sid, "session request denied by local host policy");
             return Ok(vec![reject(sid, "host operator denied the connection")?]);
         }
 
@@ -199,13 +209,51 @@ impl ScreenshotHost {
 
     /// Handle a `ScreenshotRequest`: capture, seal, chunk.
     async fn on_screenshot_request(&mut self, session_id: SessionId) -> AgentResult<Vec<String>> {
-        let channel = self
-            .channel
-            .as_ref()
-            .ok_or_else(|| AgentError::Relay("screenshot requested before key exchange".to_string()))?;
+        if self.session_id != Some(session_id) {
+            tracing::warn!(session = %session_id, "rejecting screenshot request for inactive session");
+            return Err(AgentError::Relay(
+                "screenshot request does not match active session".to_string(),
+            ));
+        }
+        let channel = self.channel.as_ref().ok_or_else(|| {
+            AgentError::Relay("screenshot requested before key exchange".to_string())
+        })?;
 
-        let image = screenshot::capture_png().await?;
-        tracing::info!(bytes = image.len(), "captured screen");
+        let image = if let ConsentPolicy::HeadlessTrustedOnly {
+            min_capture_interval,
+            capture_timeout,
+            max_capture_bytes,
+        } = self.policy
+        {
+            if self
+                .last_capture
+                .is_some_and(|last| last.elapsed() < min_capture_interval)
+            {
+                tracing::warn!("headless screenshot rejected: request rate limit");
+                return Err(AgentError::Relay(
+                    "screenshot rate limited; wait before requesting another capture".to_string(),
+                ));
+            }
+            let image = screenshot::capture_headless_png(capture_timeout).await?;
+            if image.len() > max_capture_bytes {
+                tracing::warn!(
+                    bytes = image.len(),
+                    max_capture_bytes,
+                    "headless screenshot rejected: size limit"
+                );
+                return Err(AgentError::Relay(
+                    "captured screenshot exceeds configured size limit".to_string(),
+                ));
+            }
+            self.last_capture = Some(Instant::now());
+            image
+        } else {
+            screenshot::capture_png().await?
+        };
+        tracing::info!(
+            bytes = image.len(),
+            "captured screen (encrypted before relay forwarding)"
+        );
 
         let sealed = channel
             .seal(&image)
@@ -249,7 +297,21 @@ impl HostHandler for ScreenshotHost {
                 ..
             } => self.on_key_exchange(&ephemeral_public_key, &identity_public_key, &signature),
             SignalPacket::ScreenshotRequest { session_id } => {
-                self.on_screenshot_request(session_id).await
+                match self.on_screenshot_request(session_id).await {
+                    Ok(frames) => Ok(frames),
+                    Err(error) => {
+                        // Capture failures (missing virtual monitor, timeout, size
+                        // limit, etc.) are session failures, not agent failures.
+                        // Inform the already authenticated client and keep the
+                        // systemd service connected for the next request.
+                        tracing::warn!(session = %session_id, error = %error, "screenshot request failed safely");
+                        self.reset();
+                        Ok(vec![reject(
+                            session_id,
+                            &format!("screenshot unavailable: {error}"),
+                        )?])
+                    },
+                }
             },
             SignalPacket::SessionClosed { .. } => {
                 tracing::info!("session closed by client");
@@ -319,7 +381,10 @@ fn decode_32(b64: &str) -> AgentResult<[u8; 32]> {
         .decode(b64.trim())
         .map_err(|e| AgentError::Base64(e.to_string()))?;
     if raw.len() != 32 {
-        return Err(AgentError::Relay(format!("expected 32 bytes, got {}", raw.len())));
+        return Err(AgentError::Relay(format!(
+            "expected 32 bytes, got {}",
+            raw.len()
+        )));
     }
     let mut out = [0u8; 32];
     out.copy_from_slice(&raw);
@@ -331,7 +396,10 @@ fn decode_64(b64: &str) -> AgentResult<[u8; 64]> {
         .decode(b64.trim())
         .map_err(|e| AgentError::Base64(e.to_string()))?;
     if raw.len() != 64 {
-        return Err(AgentError::Relay(format!("expected 64 bytes, got {}", raw.len())));
+        return Err(AgentError::Relay(format!(
+            "expected 64 bytes, got {}",
+            raw.len()
+        )));
     }
     let mut out = [0u8; 64];
     out.copy_from_slice(&raw);
@@ -354,6 +422,19 @@ mod tests {
         ScreenshotHost::new(key, trusted, policy)
     }
 
+    fn trust_viewer(host: &mut ScreenshotHost, public_key_b64: &str) {
+        host.trusted
+            .trust(
+                public_key_b64,
+                TrustedEntry {
+                    name: "test viewer".to_string(),
+                    can_view: true,
+                    can_control: false,
+                },
+            )
+            .unwrap();
+    }
+
     #[test]
     fn chunking_marks_last_and_total() {
         let sid = SessionId::new();
@@ -362,7 +443,12 @@ mod tests {
         // Parse the last frame and confirm `last`/`total`.
         let last: SignalPacket = serde_json::from_str(frames.last().unwrap()).unwrap();
         match last {
-            SignalPacket::ScreenshotData { total, last, sequence, .. } => {
+            SignalPacket::ScreenshotData {
+                total,
+                last,
+                sequence,
+                ..
+            } => {
                 assert_eq!(total, 3);
                 assert_eq!(sequence, 2);
                 assert!(last);
@@ -378,16 +464,43 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn auto_accept_admits_unknown_client() {
-        let mut h = host(ConsentPolicy::AutoAccept);
-        let approved = h.consent("UNKNOWNKEY").await.unwrap();
-        assert!(approved);
-        assert!(h.trusted.is_trusted("UNKNOWNKEY"));
+    async fn headless_rejects_unknown_client_without_creating_trust() {
+        let mut h = host(ConsentPolicy::HeadlessTrustedOnly {
+            min_capture_interval: Duration::from_secs(1),
+            capture_timeout: Duration::from_secs(1),
+            max_capture_bytes: 1024,
+        });
+        assert!(!h.consent("UNKNOWNKEY").await.unwrap());
+        assert!(!h.trusted.is_trusted("UNKNOWNKEY"));
+    }
+
+    #[tokio::test]
+    async fn headless_rejects_trusted_client_without_view_permission() {
+        let mut h = host(ConsentPolicy::HeadlessTrustedOnly {
+            min_capture_interval: Duration::from_secs(1),
+            capture_timeout: Duration::from_secs(1),
+            max_capture_bytes: 1024,
+        });
+        h.trusted
+            .trust(
+                "KNOWN",
+                TrustedEntry {
+                    name: "restricted".to_string(),
+                    can_view: false,
+                    can_control: false,
+                },
+            )
+            .unwrap();
+        assert!(!h.consent("KNOWN").await.unwrap());
     }
 
     #[tokio::test]
     async fn rejects_bad_identity_key() {
-        let mut h = host(ConsentPolicy::AutoAccept);
+        let mut h = host(ConsentPolicy::HeadlessTrustedOnly {
+            min_capture_interval: Duration::from_secs(1),
+            capture_timeout: Duration::from_secs(1),
+            max_capture_bytes: 1024,
+        });
         let out = h
             .on_session_request("not-base64-!!".to_string(), Some(SessionId::new()))
             .await
@@ -399,11 +512,16 @@ mod tests {
 
     #[tokio::test]
     async fn accept_emits_accept_and_key_exchange() {
-        let mut h = host(ConsentPolicy::AutoAccept);
+        let mut h = host(ConsentPolicy::HeadlessTrustedOnly {
+            min_capture_interval: Duration::from_secs(1),
+            capture_timeout: Duration::from_secs(1),
+            max_capture_bytes: 1024,
+        });
         // A valid client identity key.
         let client = SigningKey::from_bytes(&[5u8; 32]);
-        let client_b64 = base64::engine::general_purpose::STANDARD
-            .encode(client.verifying_key().as_bytes());
+        let client_b64 =
+            base64::engine::general_purpose::STANDARD.encode(client.verifying_key().as_bytes());
+        trust_viewer(&mut h, &client_b64);
 
         let out = h
             .on_session_request(client_b64, Some(SessionId::new()))
@@ -414,5 +532,80 @@ mod tests {
         let kex: SignalPacket = serde_json::from_str(&out[1]).unwrap();
         assert!(matches!(accept, SignalPacket::SessionAccepted { .. }));
         assert!(matches!(kex, SignalPacket::SessionKeyExchange { .. }));
+    }
+
+    #[tokio::test]
+    async fn headless_screenshot_is_sealed_before_it_is_chunked() {
+        let client = SigningKey::from_bytes(&[7u8; 32]);
+        let client_b64 =
+            base64::engine::general_purpose::STANDARD.encode(client.verifying_key().as_bytes());
+        let mut h = host(ConsentPolicy::HeadlessTrustedOnly {
+            min_capture_interval: Duration::ZERO,
+            capture_timeout: Duration::from_secs(1),
+            max_capture_bytes: 1024,
+        });
+        trust_viewer(&mut h, &client_b64);
+        let sid = SessionId::new();
+        let host_frames = h
+            .on_session_request(client_b64.clone(), Some(sid))
+            .await
+            .unwrap();
+        let host_kex: SignalPacket = serde_json::from_str(&host_frames[1]).unwrap();
+        let SignalPacket::SessionKeyExchange {
+            ephemeral_public_key,
+            ..
+        } = host_kex
+        else {
+            panic!("host did not send its key exchange");
+        };
+
+        let client_kex = handshake::start(&client);
+        h.on_key_exchange(
+            &base64::engine::general_purpose::STANDARD.encode(client_kex.ephemeral_public()),
+            &client_b64,
+            &base64::engine::general_purpose::STANDARD.encode(client_kex.signature()),
+        )
+        .unwrap();
+        let host_ephemeral = decode_32(&ephemeral_public_key).unwrap();
+        let client_channel = client_kex.into_channel(&host_ephemeral);
+
+        std::env::set_var("RIVET_FAKE_CAPTURE", "128");
+        let frames = h.on_screenshot_request(sid).await.unwrap();
+        std::env::remove_var("RIVET_FAKE_CAPTURE");
+        let encoded = frames
+            .iter()
+            .map(
+                |frame| match serde_json::from_str::<SignalPacket>(frame).unwrap() {
+                    SignalPacket::ScreenshotData { payload, .. } => payload,
+                    _ => panic!("expected encrypted screenshot data"),
+                },
+            )
+            .collect::<String>();
+        let sealed = base64::engine::general_purpose::STANDARD
+            .decode(encoded)
+            .unwrap();
+        let plaintext = client_channel.open(&sealed).unwrap();
+        assert_eq!(plaintext.len(), 128);
+        assert_ne!(
+            sealed, plaintext,
+            "relay frames must not contain plaintext capture bytes"
+        );
+    }
+
+    #[tokio::test]
+    async fn capture_failure_returns_a_session_error_without_failing_the_agent() {
+        let mut h = host(ConsentPolicy::HeadlessTrustedOnly {
+            min_capture_interval: Duration::from_secs(1),
+            capture_timeout: Duration::from_secs(1),
+            max_capture_bytes: 1024,
+        });
+        let sid = SessionId::new();
+        let out = h
+            .handle(SignalPacket::ScreenshotRequest { session_id: sid })
+            .await
+            .unwrap();
+        assert_eq!(out.len(), 1);
+        let packet: SignalPacket = serde_json::from_str(&out[0]).unwrap();
+        assert!(matches!(packet, SignalPacket::SessionRejected { .. }));
     }
 }

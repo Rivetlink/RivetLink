@@ -106,6 +106,45 @@ pub fn monitor_target(display: Option<u32>) -> Option<(String, u32, u32)> {
     Some((m.connector.clone(), m.width, m.height))
 }
 
+/// Capture the primary monitor once and encode it as PNG. This is used only by
+/// the screenshot-only headless host path; it does not enable streaming or
+/// remote input. `timeout` is enforced by GNU coreutils' `timeout`, present on
+/// supported Ubuntu releases, so a wedged PipeWire source cannot keep an agent
+/// task alive indefinitely.
+pub fn capture_png(timeout: Duration) -> AgentResult<Vec<u8>> {
+    let mons = monitors()?;
+    let Some(monitor) = mons.first() else {
+        return Err(AgentError::Config(
+            "no virtual GNOME monitor is available; check rivetlink-headless-gnome.service"
+                .to_string(),
+        ));
+    };
+    let (width, height) = fit_output(monitor.width, monitor.height);
+    let session = MutterSession::record_monitor(&monitor.connector)?;
+    let mut child = spawn_one_frame_gst(session.node_id, width, height, timeout)?;
+    let mut stdout = child
+        .stdout
+        .take()
+        .ok_or_else(|| AgentError::Config("headless gstreamer stdout missing".to_string()))?;
+    let frame_bytes = width
+        .checked_mul(height)
+        .and_then(|v| v.checked_mul(4))
+        .ok_or_else(|| {
+            AgentError::Config("virtual monitor dimensions are too large".to_string())
+        })?;
+    let mut bgrx = vec![0u8; frame_bytes];
+    let read_result = stdout.read_exact(&mut bgrx);
+    let _ = child.kill();
+    let _ = child.wait();
+    read_result.map_err(|e| {
+        AgentError::Config(format!(
+            "headless capture did not produce a frame within {} seconds: {e}",
+            timeout.as_secs().max(1)
+        ))
+    })?;
+    encode_bgrx_png(width, height, &bgrx)
+}
+
 /// Capture `display` (a monitor index, `None` = first/primary) and push delta
 /// frames to `tx` until the consumer drops or capture ends. Blocking.
 #[allow(clippy::needless_pass_by_value)]
@@ -137,7 +176,10 @@ pub fn stream(
 
     // 1. Dialog-free Mutter session -> PipeWire node id.
     let session = MutterSession::record_monitor(&connector)?;
-    tracing::info!(node = session.node_id, "screencast(linux): got PipeWire node");
+    tracing::info!(
+        node = session.node_id,
+        "screencast(linux): got PipeWire node"
+    );
 
     // 2. gst-launch pulls that node and writes fixed-size BGRx frames to stdout.
     let mut child = spawn_gst(session.node_id, out_w, out_h)?;
@@ -154,7 +196,11 @@ pub fn stream(
     let latest: Arc<Mutex<Option<Vec<u8>>>> = Arc::new(Mutex::new(None));
     let alive = Arc::new(AtomicBool::new(true));
     let saw_frame = Arc::new(AtomicBool::new(false));
-    let (l2, a2, s2) = (Arc::clone(&latest), Arc::clone(&alive), Arc::clone(&saw_frame));
+    let (l2, a2, s2) = (
+        Arc::clone(&latest),
+        Arc::clone(&alive),
+        Arc::clone(&saw_frame),
+    );
     let reader = std::thread::spawn(move || {
         loop {
             let mut buf = vec![0u8; frame_bytes];
@@ -174,7 +220,10 @@ pub fn stream(
             break; // viewer disconnected
         }
         std::thread::sleep(interval);
-        let frame = latest.lock().unwrap_or_else(std::sync::PoisonError::into_inner).take();
+        let frame = latest
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .take();
         let keep_going = match frame {
             Some(buf) => enc.push(out_w, out_h, buf, quality, &tx),
             None => {
@@ -218,8 +267,9 @@ impl MutterSession {
 
         let screencast = Proxy::new(&conn, SC_DEST, SC_PATH, SC_DEST).map_err(dbus_err)?;
         let empty: BTreeMap<&str, Value> = BTreeMap::new();
-        let session_path: OwnedObjectPath =
-            screencast.call("CreateSession", &(empty,)).map_err(dbus_err)?;
+        let session_path: OwnedObjectPath = screencast
+            .call("CreateSession", &(empty,))
+            .map_err(dbus_err)?;
 
         let session = Proxy::new(
             &conn,
@@ -244,7 +294,9 @@ impl MutterSession {
             "org.gnome.Mutter.ScreenCast.Stream",
         )
         .map_err(dbus_err)?;
-        let mut signal = stream.receive_signal("PipeWireStreamAdded").map_err(dbus_err)?;
+        let mut signal = stream
+            .receive_signal("PipeWireStreamAdded")
+            .map_err(dbus_err)?;
 
         session.call::<_, _, ()>("Start", &()).map_err(dbus_err)?;
 
@@ -310,6 +362,62 @@ fn spawn_gst(node: u32, out_w: usize, out_h: usize) -> AgentResult<Child> {
     .stdout(Stdio::piped())
     .stderr(Stdio::piped());
 
+    configure_system_gstreamer(&mut cmd);
+
+    let mut child = cmd.spawn().map_err(|e| {
+        AgentError::Lan(format!(
+            "gst-launch-1.0 failed to start (install gstreamer1.0-tools + \
+             gstreamer1.0-pipewire): {e}"
+        ))
+    })?;
+    drain_gstreamer_stderr(&mut child);
+    Ok(child)
+}
+
+/// Spawn GStreamer through a bounded Ubuntu `timeout` wrapper and stop after
+/// its first PipeWire frame. This keeps one-shot capture bounded even when a
+/// compositor or PipeWire daemon stops responding.
+fn spawn_one_frame_gst(
+    node: u32,
+    out_w: usize,
+    out_h: usize,
+    timeout: Duration,
+) -> AgentResult<Child> {
+    let out_caps = format!("video/x-raw,format=BGRx,width={out_w},height={out_h}");
+    let mut cmd = Command::new("timeout");
+    cmd.args([
+        "--signal=TERM",
+        &format!("{}s", timeout.as_secs().max(1)),
+        "gst-launch-1.0",
+        "-q",
+        "pipewiresrc",
+        &format!("path={node}"),
+        "num-buffers=1",
+        "!",
+        "videoconvert",
+        "!",
+        &out_caps,
+        "!",
+        "fdsink",
+        "fd=1",
+        "sync=false",
+    ])
+    .stdout(Stdio::piped())
+    .stderr(Stdio::piped());
+    configure_system_gstreamer(&mut cmd);
+    let mut child = cmd.spawn().map_err(|e| {
+        AgentError::Config(format!(
+            "headless capture requires Ubuntu coreutils and gstreamer1.0-tools + \
+             gstreamer1.0-pipewire: {e}"
+        ))
+    })?;
+    drain_gstreamer_stderr(&mut child);
+    Ok(child)
+}
+
+/// Strip AppImage-specific library paths so the system GStreamer talks to the
+/// host PipeWire stack.
+fn configure_system_gstreamer(cmd: &mut Command) {
     // We run inside an AppImage, which exports LD_LIBRARY_PATH + GST_PLUGIN_*
     // pointing at its *bundled* libs. The system gst-launch-1.0 we spawn must
     // load the host's GLib/GStreamer, not ours — a version mismatch makes it
@@ -328,14 +436,9 @@ fn spawn_gst(node: u32, out_w: usize, out_h: usize) -> AgentResult<Child> {
     ] {
         cmd.env_remove(var);
     }
+}
 
-    let mut child = cmd.spawn().map_err(|e| {
-        AgentError::Lan(format!(
-            "gst-launch-1.0 failed to start (install gstreamer1.0-tools + \
-             gstreamer1.0-pipewire): {e}"
-        ))
-    })?;
-
+fn drain_gstreamer_stderr(child: &mut Child) {
     // Drain gst's stderr to the agent log so a setup failure (missing plugin,
     // bad pipewire node, lib mismatch) shows up instead of just "no frames".
     if let Some(err) = child.stderr.take() {
@@ -345,7 +448,31 @@ fn spawn_gst(node: u32, out_w: usize, out_h: usize) -> AgentResult<Child> {
             }
         });
     }
-    Ok(child)
+}
+
+/// Encode tightly packed BGRx data from PipeWire as a PNG without writing a
+/// plaintext image to disk.
+fn encode_bgrx_png(width: usize, height: usize, bgrx: &[u8]) -> AgentResult<Vec<u8>> {
+    let mut rgba = Vec::with_capacity(bgrx.len());
+    for pixel in bgrx.chunks_exact(4) {
+        rgba.extend_from_slice(&[pixel[2], pixel[1], pixel[0], 255]);
+    }
+    let width = u32::try_from(width)
+        .map_err(|_| AgentError::Config("virtual monitor width is invalid".to_string()))?;
+    let height = u32::try_from(height)
+        .map_err(|_| AgentError::Config("virtual monitor height is invalid".to_string()))?;
+    let mut out = Vec::new();
+    let mut encoder = png::Encoder::new(&mut out, width, height);
+    encoder.set_color(png::ColorType::Rgba);
+    encoder.set_depth(png::BitDepth::Eight);
+    let mut writer = encoder
+        .write_header()
+        .map_err(|e| AgentError::Config(format!("encode headless PNG header: {e}")))?;
+    writer
+        .write_image_data(&rgba)
+        .map_err(|e| AgentError::Config(format!("encode headless PNG data: {e}")))?;
+    drop(writer);
+    Ok(out)
 }
 
 // ---- Monitor enumeration (Mutter DisplayConfig) ----------------------------
@@ -354,9 +481,25 @@ fn spawn_gst(node: u32, out_w: usize, out_h: usize) -> AgentResult<Child> {
 /// pull each monitor's connector + model. The mode list and prop dicts are read
 /// but unused.
 type MonitorId = (String, String, String, String); // connector, vendor, product, serial
-type Mode = (String, i32, i32, f64, f64, Vec<f64>, BTreeMap<String, OwnedValue>);
+type Mode = (
+    String,
+    i32,
+    i32,
+    f64,
+    f64,
+    Vec<f64>,
+    BTreeMap<String, OwnedValue>,
+);
 type MonitorEntry = (MonitorId, Vec<Mode>, BTreeMap<String, OwnedValue>);
-type LogicalMonitor = (i32, i32, f64, u32, bool, Vec<MonitorId>, BTreeMap<String, OwnedValue>);
+type LogicalMonitor = (
+    i32,
+    i32,
+    f64,
+    u32,
+    bool,
+    Vec<MonitorId>,
+    BTreeMap<String, OwnedValue>,
+);
 type CurrentState = (
     u32,
     Vec<MonitorEntry>,

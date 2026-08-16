@@ -36,10 +36,7 @@ pub enum HostEvent {
     /// client's verified Ed25519 identity (base64) when it announced one with a
     /// valid proof-of-possession — what the host remembers for trust-on-connect;
     /// `None` for a bare PIN client that offered no (or an invalid) identity.
-    ClientConnected {
-        label: String,
-        key: Option<String>,
-    },
+    ClientConnected { label: String, key: Option<String> },
     /// A client's session ended (disconnect, error, or host-initiated kick).
     ClientDisconnected,
 }
@@ -89,7 +86,18 @@ pub async fn serve(
 ) -> AgentResult<()> {
     // CLI agent: no UI gates — `None` control means input control is open to any
     // authenticated client (a headless agent's whole purpose is remote control).
-    serve_with_events(signing_key, device_name, port, auth, None, None, None, None, None).await
+    serve_with_events(
+        signing_key,
+        device_name,
+        port,
+        auth,
+        None,
+        None,
+        None,
+        None,
+        None,
+    )
+    .await
 }
 
 /// Like [`serve`], but reports session lifecycle on `events` (if given) so an
@@ -233,12 +241,11 @@ async fn handle(
             auto_accept,
         } => {
             let identity = Identity::from_signing_key(signing_key);
-            let (channel, client_id) =
-                direct::host_accept_key(&mut stream, &identity, |id| {
-                    *auto_accept || trusted.is_trusted(id)
-                })
-                .await
-                .map_err(|e| AgentError::Lan(e.to_string()))?;
+            let (channel, client_id) = direct::host_accept_key(&mut stream, &identity, |id| {
+                *auto_accept || trusted.is_trusted(id)
+            })
+            .await
+            .map_err(|e| AgentError::Lan(e.to_string()))?;
             tracing::info!(client = %client_id, "LAN client accepted (key mode)");
             (channel, client_id.clone(), false)
         },
@@ -355,7 +362,11 @@ async fn serve_loop(
             } => {
                 // Honour the requested screen only when sharing all screens is on;
                 // otherwise pin to the primary (`None`).
-                let display = if share_all_now(&share_all) { display } else { None };
+                let display = if share_all_now(&share_all) {
+                    display
+                } else {
+                    None
+                };
                 let scr = display;
                 tracing::info!(fps, screen = ?scr, "LAN serve: StartStream request");
                 // Now the client is actually viewing: announce who, falling back
@@ -383,16 +394,22 @@ async fn serve_loop(
                     if let Some(tx) = &consent {
                         if !ask_consent(tx, key.clone(), who.clone()).await {
                             tracing::info!(%who, "LAN serve: host rejected (or timed out) the client");
-                            let _ = lan::send_response(&mut stream, &channel, &LanResponse::Error {
-                                message: "the host declined the connection".to_string(),
-                            })
+                            let _ = lan::send_response(
+                                &mut stream,
+                                &channel,
+                                &LanResponse::Error {
+                                    message: "the host declined the connection".to_string(),
+                                },
+                            )
                             .await;
                             return Ok(());
                         }
                     }
                 }
                 if let Some(ev) = &events {
-                    let _ = ev.send(HostEvent::ClientConnected { label: who, key }).await;
+                    let _ = ev
+                        .send(HostEvent::ClientConnected { label: who, key })
+                        .await;
                 }
                 // The stream runs until the client disconnects or the host kicks.
                 let result =
@@ -444,7 +461,11 @@ fn control_now(control: &Option<watch::Receiver<bool>>) -> bool {
 /// use (a Mutter RemoteDesktop session for the monitor being shared). Sending is
 /// non-blocking, so this never stalls the frame loop. Linux only.
 #[cfg(target_os = "linux")]
-fn apply_input(handle: &mut Option<crate::input::InputHandle>, display: Option<u32>, req: &LanRequest) {
+fn apply_input(
+    handle: &mut Option<crate::input::InputHandle>,
+    display: Option<u32>,
+    req: &LanRequest,
+) {
     use rivetlink_sdk::lan::LanRequest as R;
 
     use crate::input::{InputAction, InputHandle};
@@ -523,7 +544,11 @@ async fn wait_share_change(share_all: &mut Option<watch::Receiver<bool>>) {
 }
 
 #[cfg(any(target_os = "linux", target_os = "macos"))]
-#[allow(clippy::too_many_arguments, clippy::cognitive_complexity, clippy::too_many_lines)]
+#[allow(
+    clippy::too_many_arguments,
+    clippy::cognitive_complexity,
+    clippy::too_many_lines
+)]
 async fn stream_screen(
     stream: TcpStream,
     channel: Arc<SealedChannel>,
@@ -701,9 +726,13 @@ async fn stream_screen(
     _share_all: Option<watch::Receiver<bool>>,
     _control: Option<watch::Receiver<bool>>,
 ) -> AgentResult<()> {
-    let _ = lan::send_response(&mut stream, &channel, &LanResponse::Error {
-        message: "live streaming is not supported on this platform yet".to_string(),
-    })
+    let _ = lan::send_response(
+        &mut stream,
+        &channel,
+        &LanResponse::Error {
+            message: "live streaming is not supported on this platform yet".to_string(),
+        },
+    )
     .await;
     Ok(())
 }

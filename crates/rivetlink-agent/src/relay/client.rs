@@ -196,7 +196,9 @@ impl RelayClient {
                     heartbeat_interval,
                 })
             },
-            AuthAck::Other => Err(AgentError::Relay(format!("DEVICE_AUTH rejected: {ack_text}"))),
+            AuthAck::Other => Err(AgentError::Relay(format!(
+                "DEVICE_AUTH rejected: {ack_text}"
+            ))),
         }
     }
 

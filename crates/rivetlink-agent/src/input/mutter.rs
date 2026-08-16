@@ -71,10 +71,22 @@ const SC_SESSION_IFACE: &str = "org.gnome.Mutter.ScreenCast.Session";
 #[derive(Debug)]
 pub enum InputAction {
     /// Absolute cursor position, normalized `0..=10_000` of the frame.
-    Move { x: u16, y: u16 },
-    Button { button: PtrButton, down: bool },
-    Scroll { dx: i16, dy: i16 },
-    Key { code: String, down: bool },
+    Move {
+        x: u16,
+        y: u16,
+    },
+    Button {
+        button: PtrButton,
+        down: bool,
+    },
+    Scroll {
+        dx: i16,
+        dy: i16,
+    },
+    Key {
+        code: String,
+        down: bool,
+    },
 }
 
 /// Handle to the dedicated injection thread. Sending is non-blocking; dropping
@@ -139,15 +151,18 @@ impl MutterInjector {
         // 1. RemoteDesktop session + its id.
         let rd = Proxy::new(&conn, RD_DEST, RD_PATH, RD_DEST).map_err(dbus_err)?;
         let rd_session: OwnedObjectPath = rd.call("CreateSession", &()).map_err(dbus_err)?;
-        let rd_sess = Proxy::new(&conn, RD_DEST, rd_session.clone(), RD_SESSION_IFACE)
-            .map_err(dbus_err)?;
+        let rd_sess =
+            Proxy::new(&conn, RD_DEST, rd_session.clone(), RD_SESSION_IFACE).map_err(dbus_err)?;
         let session_id: String = rd_sess.get_property("SessionId").map_err(dbus_err)?;
 
         // 2. ScreenCast session bound to it (anchors absolute coords). We never
         //    consume its PipeWire node — capture has its own session.
         let sc = Proxy::new(&conn, SC_DEST, SC_PATH, SC_DEST).map_err(dbus_err)?;
         let mut sc_opts: BTreeMap<&str, Value> = BTreeMap::new();
-        sc_opts.insert("remote-desktop-session-id", Value::Str(Str::from(session_id)));
+        sc_opts.insert(
+            "remote-desktop-session-id",
+            Value::Str(Str::from(session_id)),
+        );
         let sc_session: OwnedObjectPath =
             sc.call("CreateSession", &(sc_opts,)).map_err(dbus_err)?;
         let sc_sess = Proxy::new(&conn, SC_DEST, sc_session, SC_SESSION_IFACE).map_err(dbus_err)?;
@@ -169,7 +184,13 @@ impl MutterInjector {
     }
 
     fn session(&self) -> AgentResult<Proxy<'_>> {
-        Proxy::new(&self.conn, RD_DEST, self.rd_session.clone(), RD_SESSION_IFACE).map_err(dbus_err)
+        Proxy::new(
+            &self.conn,
+            RD_DEST,
+            self.rd_session.clone(),
+            RD_SESSION_IFACE,
+        )
+        .map_err(dbus_err)
     }
 
     fn apply(&self, action: &InputAction) -> AgentResult<()> {
@@ -178,8 +199,11 @@ impl MutterInjector {
             InputAction::Move { x, y } => {
                 let px = f64::from(*x) / 10_000.0 * self.width;
                 let py = f64::from(*y) / 10_000.0 * self.height;
-                s.call::<_, _, ()>("NotifyPointerMotionAbsolute", &(self.stream.as_str(), px, py))
-                    .map_err(dbus_err)
+                s.call::<_, _, ()>(
+                    "NotifyPointerMotionAbsolute",
+                    &(self.stream.as_str(), px, py),
+                )
+                .map_err(dbus_err)
             },
             InputAction::Button { button, down } => {
                 // Stamp every injected press/release so the host overlay can tell a

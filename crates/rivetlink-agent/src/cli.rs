@@ -35,6 +35,16 @@ pub enum Command {
         /// Keystore directory.
         #[arg(long, default_value = "keys")]
         keystore_path: PathBuf,
+
+        /// Configure this host for the dedicated virtual GNOME monitor. This
+        /// alone does not grant unattended access.
+        #[arg(long)]
+        headless: bool,
+
+        /// Explicitly permit already trusted, view-authorized clients when
+        /// running in headless mode. Requires `--headless`.
+        #[arg(long, requires = "headless")]
+        allow_trusted_headless: bool,
     },
 
     /// Enroll this agent as a device on the relay.
@@ -53,16 +63,29 @@ pub enum Command {
         platform: Option<String>,
     },
 
+    /// Locally pre-trust a support-client identity for screenshot viewing.
+    /// This command never grants input, file, shell, or administrative access.
+    TrustClient {
+        /// Base64 Ed25519 public identity from `rivet-client whoami`.
+        #[arg(long)]
+        public_key: String,
+
+        /// Human-readable local label written to the trusted-client store.
+        #[arg(long)]
+        name: String,
+    },
+
     /// Connect to the relay and run until disconnected (device auth).
     ///
     /// The agent must have been registered first — `device_id` is read
     /// from the config file and the agent's stored Ed25519 key signs the
     /// challenge.
     Run {
-        /// Auto-accept (and trust) any client without prompting. Unattended /
-        /// testing only — bypasses the operator consent prompt.
+        /// Use the locally configured virtual GNOME monitor. Only a known
+        /// client with `can_view` can be admitted, and only after the owner has
+        /// enabled `allow_trusted_clients` in the local config.
         #[arg(long)]
-        auto_accept: bool,
+        headless: bool,
     },
 
     /// Serve direct-LAN sessions: advertise on the local network and accept

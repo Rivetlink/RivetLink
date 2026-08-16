@@ -127,6 +127,18 @@ client (trust on first use). Approve it once and the host remembers your key.
    HTTP — put them behind the same nginx, or keep them on the LAN until TLS
    client support lands.)
 
+## Ubuntu headless screenshot host
+
+For a monitorless Ubuntu Desktop Home Node, the RivetLink AppImage offers an
+explicit **Settings → General → Headless Ubuntu-host** setup flow. It installs
+the required Ubuntu packages after owner approval and creates non-root user
+services; normal app updates never run it automatically. For unattended
+provisioning, use the dedicated non-root GNOME
+Wayland virtual-monitor host. It supports only the existing encrypted
+on-demand screenshot flow; it enables neither RDP nor remote control. See
+[the Ubuntu headless host guide](docs/ubuntu-headless-host.md) for installation,
+trusted-client setup, reboot recovery and troubleshooting.
+
 ## Development
 
 ```bash

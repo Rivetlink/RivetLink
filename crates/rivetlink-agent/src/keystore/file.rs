@@ -58,7 +58,6 @@ impl FileKeyStore {
     /// Create a new keystore rooted at `dir`. The directory is created if it
     /// does not already exist.
     pub fn new(dir: PathBuf) -> AgentResult<Self> {
-        std::fs::create_dir_all(&dir)?;
         Ok(Self { dir })
     }
 

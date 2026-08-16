@@ -34,6 +34,51 @@ pub struct AgentConfig {
     /// Reconnect backoff cap in seconds.
     #[serde(default = "default_reconnect_cap")]
     pub reconnect_cap_secs: u64,
+
+    /// Explicit owner-controlled settings for the dedicated headless GNOME
+    /// session. Disabled by default: a background service must never turn a
+    /// previously trusted key into unattended access by accident.
+    #[serde(default)]
+    pub headless: HeadlessConfig,
+}
+
+/// Limits and consent opt-in for a headless screenshot-only host.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct HeadlessConfig {
+    /// Enables use of the virtual GNOME monitor when `rivet-agent run
+    /// --headless` is used.
+    #[serde(default)]
+    pub enabled: bool,
+
+    /// The local owner's explicit permission for an already trusted,
+    /// view-authorized client to start a headless session. Unknown clients are
+    /// always rejected; this is deliberately not a general auto-accept flag.
+    #[serde(default)]
+    pub allow_trusted_clients: bool,
+
+    /// Maximum time a one-shot screenshot capture may occupy the agent.
+    #[serde(default = "default_capture_timeout")]
+    pub capture_timeout_secs: u64,
+
+    /// Minimum gap between captures within one encrypted session.
+    #[serde(default = "default_capture_interval")]
+    pub min_capture_interval_secs: u64,
+
+    /// Refuse a screenshot larger than this after PNG encoding.
+    #[serde(default = "default_max_capture_bytes")]
+    pub max_capture_bytes: usize,
+}
+
+impl Default for HeadlessConfig {
+    fn default() -> Self {
+        Self {
+            enabled: false,
+            allow_trusted_clients: false,
+            capture_timeout_secs: default_capture_timeout(),
+            min_capture_interval_secs: default_capture_interval(),
+            max_capture_bytes: default_max_capture_bytes(),
+        }
+    }
 }
 
 fn default_heartbeat() -> u64 {
@@ -42,6 +87,18 @@ fn default_heartbeat() -> u64 {
 
 fn default_reconnect_cap() -> u64 {
     60
+}
+
+fn default_capture_timeout() -> u64 {
+    10
+}
+
+fn default_capture_interval() -> u64 {
+    2
+}
+
+fn default_max_capture_bytes() -> usize {
+    8 * 1024 * 1024
 }
 
 impl AgentConfig {
@@ -57,10 +114,9 @@ impl AgentConfig {
     /// Persist configuration to disk as pretty-printed JSON.
     pub fn save(&self, path: &std::path::Path) -> AgentResult<()> {
         let body = serde_json::to_string_pretty(self)?;
-        if let Some(parent) = path.parent() {
-            std::fs::create_dir_all(parent)?;
-        }
-        std::fs::write(path, body)?;
+        // The config records the agent identity's location and headless-access
+        // policy. Keep it owner-only alongside the private-key files.
+        rivetlink_core::secure_file::write_secret(path, body.as_bytes())?;
         Ok(())
     }
 
@@ -82,8 +138,21 @@ impl AgentConfig {
             return Err(AgentError::Config("device_name is required".to_string()));
         }
         if self.heartbeat_secs == 0 {
+            return Err(AgentError::Config("heartbeat_secs must be > 0".to_string()));
+        }
+        if self.headless.capture_timeout_secs == 0 {
             return Err(AgentError::Config(
-                "heartbeat_secs must be > 0".to_string(),
+                "headless.capture_timeout_secs must be > 0".to_string(),
+            ));
+        }
+        if self.headless.min_capture_interval_secs == 0 {
+            return Err(AgentError::Config(
+                "headless.min_capture_interval_secs must be > 0".to_string(),
+            ));
+        }
+        if self.headless.max_capture_bytes == 0 {
+            return Err(AgentError::Config(
+                "headless.max_capture_bytes must be > 0".to_string(),
             ));
         }
         Ok(())
@@ -103,6 +172,7 @@ mod tests {
             device_id: None,
             heartbeat_secs: 10,
             reconnect_cap_secs: 60,
+            headless: HeadlessConfig::default(),
         }
     }
 
@@ -143,6 +213,20 @@ mod tests {
     fn validate_rejects_zero_heartbeat() {
         let mut cfg = sample();
         cfg.heartbeat_secs = 0;
+        assert!(cfg.validate().is_err());
+    }
+
+    #[test]
+    fn default_headless_mode_never_allows_unattended_access() {
+        let cfg = sample();
+        assert!(!cfg.headless.enabled);
+        assert!(!cfg.headless.allow_trusted_clients);
+    }
+
+    #[test]
+    fn validate_rejects_unlimited_headless_capture_rate() {
+        let mut cfg = sample();
+        cfg.headless.min_capture_interval_secs = 0;
         assert!(cfg.validate().is_err());
     }
 }

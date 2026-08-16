@@ -13,5 +13,6 @@ pub mod keystore;
 pub mod lan;
 pub mod registration;
 pub mod relay;
+pub mod runner;
 pub mod session;
 pub mod trusted;

@@ -14,6 +14,7 @@
 //! for headless CI / e2e tests where no display is available.
 
 use crate::error::{AgentError, AgentResult};
+use std::time::Duration;
 
 /// Capture the primary screen and return PNG (or fake) bytes.
 pub async fn capture_png() -> AgentResult<Vec<u8>> {
@@ -39,6 +40,31 @@ pub async fn capture_png() -> AgentResult<Vec<u8>> {
     tokio::task::spawn_blocking(capture_blocking)
         .await
         .map_err(|e| AgentError::Config(format!("capture task join error: {e}")))?
+}
+
+/// Capture the dedicated virtual GNOME monitor used by the headless service.
+/// This deliberately does not fall back to X11 command-line tools: a headless
+/// host must either capture its configured Mutter virtual monitor or fail
+/// closed with a useful error.
+pub async fn capture_headless_png(timeout: Duration) -> AgentResult<Vec<u8>> {
+    if let Some(size) = fake_capture_size() {
+        return Ok(synthetic_blob(size));
+    }
+
+    #[cfg(target_os = "linux")]
+    {
+        tokio::task::spawn_blocking(move || super::mutter::capture_png(timeout))
+            .await
+            .map_err(|e| AgentError::Config(format!("headless capture task join error: {e}")))?
+    }
+
+    #[cfg(not(target_os = "linux"))]
+    {
+        let _ = timeout;
+        Err(AgentError::Config(
+            "headless capture is currently supported on Ubuntu GNOME only".to_string(),
+        ))
+    }
 }
 
 /// Read `RIVET_FAKE_CAPTURE` — if set, returns the requested blob size
@@ -116,7 +142,10 @@ fn capture_blocking() -> AgentResult<Vec<u8>> {
 /// Build a unique temp PNG path.
 fn temp_png_path() -> std::path::PathBuf {
     let mut p = std::env::temp_dir();
-    p.push(format!("rivet-capture-{}.png", uuid::Uuid::now_v7().simple()));
+    p.push(format!(
+        "rivet-capture-{}.png",
+        uuid::Uuid::now_v7().simple()
+    ));
     p
 }
 

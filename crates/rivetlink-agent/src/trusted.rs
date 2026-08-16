@@ -64,7 +64,8 @@ impl TrustedClients {
 
     /// Add (or replace) a trusted client and persist immediately.
     pub fn trust(&mut self, public_key_b64: &str, entry: TrustedEntry) -> AgentResult<()> {
-        self.entries.insert(public_key_b64.trim().to_string(), entry);
+        self.entries
+            .insert(public_key_b64.trim().to_string(), entry);
         self.save()
     }
 
@@ -85,14 +86,14 @@ impl TrustedClients {
     }
 
     fn save(&self) -> AgentResult<()> {
-        if let Some(parent) = self.path.parent() {
-            std::fs::create_dir_all(parent)?;
-        }
         let stored = StoredFile {
             clients: self.entries.clone(),
         };
-        std::fs::write(&self.path, serde_json::to_string_pretty(&stored)?)
-            .map_err(AgentError::Io)
+        rivetlink_core::secure_file::write_secret(
+            &self.path,
+            serde_json::to_string_pretty(&stored)?.as_bytes(),
+        )
+        .map_err(AgentError::Io)
     }
 }
 
@@ -102,7 +103,10 @@ mod tests {
 
     fn tmp(name: &str) -> PathBuf {
         let mut p = std::env::temp_dir();
-        p.push(format!("rivet-trusted-{}-{name}.json", uuid::Uuid::now_v7().simple()));
+        p.push(format!(
+            "rivet-trusted-{}-{name}.json",
+            uuid::Uuid::now_v7().simple()
+        ));
         p
     }
 
