@@ -2,4 +2,7 @@
 
 pub mod host;
 
-pub use host::{ConsentPolicy, ScreenshotHost};
+pub(crate) use host::LocalScreenshotCapturer;
+pub use host::{
+    ConsentPolicy, ConsoleInputSink, ConsoleStateProvider, ScreenshotCapturer, ScreenshotHost,
+};

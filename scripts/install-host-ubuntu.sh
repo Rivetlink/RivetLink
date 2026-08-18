@@ -1,4 +1,7 @@
 #!/usr/bin/env bash
+# Deprecated: the virtual GNOME monitor cannot expose the real GDM console.
+echo "This virtual-monitor installer is retired. Use RivetLink Application → Settings → Ubuntu physical console." >&2
+exit 2
 #
 # Install RivetLink's screenshot-only, headless GNOME host on Ubuntu Desktop
 # 24.04 LTS or newer. Run this as the desktop user, never as root.

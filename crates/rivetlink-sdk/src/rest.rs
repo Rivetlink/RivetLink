@@ -19,6 +19,10 @@ pub struct Device {
     pub hostname: Option<String>,
     pub platform: Option<String>,
     pub last_seen: Option<String>,
+    /// Live relay presence. Missing on older relays, where it safely defaults
+    /// to offline rather than claiming that a host can be reached.
+    #[serde(default)]
+    pub online: bool,
     /// Base64 Ed25519 identity key — used to pin the host during the handshake.
     pub public_key: String,
 }

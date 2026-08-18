@@ -66,7 +66,9 @@ impl SealedChannel {
     /// Decrypt a `nonce || ciphertext` blob produced by [`SealedChannel::seal`].
     pub fn open(&self, sealed: &[u8]) -> CryptoResult<Vec<u8>> {
         if sealed.len() < NONCE_LEN {
-            return Err(CryptoError::Decryption("sealed message too short".to_string()));
+            return Err(CryptoError::Decryption(
+                "sealed message too short".to_string(),
+            ));
         }
         let (nonce_bytes, ciphertext) = sealed.split_at(NONCE_LEN);
 

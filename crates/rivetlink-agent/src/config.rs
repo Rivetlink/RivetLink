@@ -35,18 +35,20 @@ pub struct AgentConfig {
     #[serde(default = "default_reconnect_cap")]
     pub reconnect_cap_secs: u64,
 
-    /// Explicit owner-controlled settings for the dedicated headless GNOME
-    /// session. Disabled by default: a background service must never turn a
+    /// Explicit owner-controlled limits and opt-in for an unattended physical
+    /// console. Disabled by default: a background service must never turn a
     /// previously trusted key into unattended access by accident.
-    #[serde(default)]
-    pub headless: HeadlessConfig,
+    ///
+    /// `headless` is accepted only when reading configurations created by the
+    /// retired virtual-monitor implementation.
+    #[serde(default, alias = "headless")]
+    pub unattended_console: UnattendedConsoleConfig,
 }
 
-/// Limits and consent opt-in for a headless screenshot-only host.
+/// Limits and consent opt-in for an unattended physical-console host.
 #[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct HeadlessConfig {
-    /// Enables use of the virtual GNOME monitor when `rivet-agent run
-    /// --headless` is used.
+pub struct UnattendedConsoleConfig {
+    /// Enables explicit unattended-console access.
     #[serde(default)]
     pub enabled: bool,
 
@@ -69,7 +71,7 @@ pub struct HeadlessConfig {
     pub max_capture_bytes: usize,
 }
 
-impl Default for HeadlessConfig {
+impl Default for UnattendedConsoleConfig {
     fn default() -> Self {
         Self {
             enabled: false,
@@ -114,7 +116,7 @@ impl AgentConfig {
     /// Persist configuration to disk as pretty-printed JSON.
     pub fn save(&self, path: &std::path::Path) -> AgentResult<()> {
         let body = serde_json::to_string_pretty(self)?;
-        // The config records the agent identity's location and headless-access
+        // The config records the agent identity's location and unattended-access
         // policy. Keep it owner-only alongside the private-key files.
         rivetlink_core::secure_file::write_secret(path, body.as_bytes())?;
         Ok(())
@@ -140,19 +142,19 @@ impl AgentConfig {
         if self.heartbeat_secs == 0 {
             return Err(AgentError::Config("heartbeat_secs must be > 0".to_string()));
         }
-        if self.headless.capture_timeout_secs == 0 {
+        if self.unattended_console.capture_timeout_secs == 0 {
             return Err(AgentError::Config(
-                "headless.capture_timeout_secs must be > 0".to_string(),
+                "unattended_console.capture_timeout_secs must be > 0".to_string(),
             ));
         }
-        if self.headless.min_capture_interval_secs == 0 {
+        if self.unattended_console.min_capture_interval_secs == 0 {
             return Err(AgentError::Config(
-                "headless.min_capture_interval_secs must be > 0".to_string(),
+                "unattended_console.min_capture_interval_secs must be > 0".to_string(),
             ));
         }
-        if self.headless.max_capture_bytes == 0 {
+        if self.unattended_console.max_capture_bytes == 0 {
             return Err(AgentError::Config(
-                "headless.max_capture_bytes must be > 0".to_string(),
+                "unattended_console.max_capture_bytes must be > 0".to_string(),
             ));
         }
         Ok(())
@@ -172,7 +174,7 @@ mod tests {
             device_id: None,
             heartbeat_secs: 10,
             reconnect_cap_secs: 60,
-            headless: HeadlessConfig::default(),
+            unattended_console: UnattendedConsoleConfig::default(),
         }
     }
 
@@ -217,16 +219,32 @@ mod tests {
     }
 
     #[test]
-    fn default_headless_mode_never_allows_unattended_access() {
+    fn default_unattended_console_never_allows_access() {
         let cfg = sample();
-        assert!(!cfg.headless.enabled);
-        assert!(!cfg.headless.allow_trusted_clients);
+        assert!(!cfg.unattended_console.enabled);
+        assert!(!cfg.unattended_console.allow_trusted_clients);
     }
 
     #[test]
-    fn validate_rejects_unlimited_headless_capture_rate() {
+    fn validate_rejects_unlimited_unattended_capture_rate() {
         let mut cfg = sample();
-        cfg.headless.min_capture_interval_secs = 0;
+        cfg.unattended_console.min_capture_interval_secs = 0;
         assert!(cfg.validate().is_err());
+    }
+
+    #[test]
+    fn reads_legacy_headless_configuration_as_unattended_console() {
+        let cfg: AgentConfig = serde_json::from_str(
+            r#"{
+                "relay_url":"wss://relay.test/ws",
+                "relay_http_url":"https://relay.test",
+                "device_name":"host-1",
+                "keystore_path":"/tmp/keys",
+                "headless":{"enabled":true,"allow_trusted_clients":true}
+            }"#,
+        )
+        .unwrap();
+        assert!(cfg.unattended_console.enabled);
+        assert!(cfg.unattended_console.allow_trusted_clients);
     }
 }

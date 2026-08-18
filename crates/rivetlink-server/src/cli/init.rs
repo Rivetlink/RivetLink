@@ -106,13 +106,24 @@ fn write_env_file(path: &Path, contents: &str, force: bool) -> Result<(), InitEr
 #[allow(clippy::needless_pass_by_value)] // clap subcommand handlers idiomatically take args by value
 pub fn run(args: InitArgs) -> Result<(), InitError> {
     let secret = generate_secret()?;
-    let body = render_env(&secret, &args.database_url, &args.redis_url, &args.bind_addr);
+    let body = render_env(
+        &secret,
+        &args.database_url,
+        &args.redis_url,
+        &args.bind_addr,
+    );
     write_env_file(&args.output, &body, args.force)?;
 
-    println!("Wrote {} with a freshly generated JWT_SECRET.", args.output.display());
+    println!(
+        "Wrote {} with a freshly generated JWT_SECRET.",
+        args.output.display()
+    );
     println!();
     println!("Next steps:");
-    println!("  1. Review {} and adjust DATABASE_URL / REDIS_URL if needed.", args.output.display());
+    println!(
+        "  1. Review {} and adjust DATABASE_URL / REDIS_URL if needed.",
+        args.output.display()
+    );
     println!("  2. Start dependencies:   docker compose -f docker/docker-compose.yml up -d");
     println!("  3. Run the server:       rivet-relay serve");
     Ok(())

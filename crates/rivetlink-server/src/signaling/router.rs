@@ -55,6 +55,7 @@ fn route_packet(
         SignalPacket::SessionRequest {
             device_id,
             client_public_key,
+            requested_capability,
             ..
         } => {
             // Verify target device is in same org (cross-tenant check)
@@ -88,6 +89,7 @@ fn route_packet(
             let enriched = SignalPacket::SessionRequest {
                 device_id: *device_id,
                 client_public_key: client_public_key.clone(),
+                requested_capability: *requested_capability,
                 session_id: Some(rivetlink_core::SessionId(session_id)),
             };
             match serde_json::to_string(&enriched) {
@@ -152,6 +154,26 @@ fn route_packet(
                 return;
             }
             tracing::trace!(session = %session_id, "forwarding screenshot data chunk");
+            forward_to_peer(connections, sessions, sender_id, raw_message);
+        },
+        SignalPacket::HostConsoleState {
+            session_id,
+            state,
+            generation,
+        } => {
+            if !verify_session_member(sessions, sender_id, &session_id.0) {
+                return;
+            }
+            tracing::info!(session = %session_id, ?state, generation, "forwarding host console state");
+            forward_to_peer(connections, sessions, sender_id, raw_message);
+        },
+        SignalPacket::ConsoleInput { session_id, .. } => {
+            if !verify_session_member(sessions, sender_id, &session_id.0) {
+                return;
+            }
+            // Payload is end-to-end sealed and may contain password keystrokes;
+            // never inspect or log it at the relay.
+            tracing::trace!(session = %session_id, "forwarding sealed console input");
             forward_to_peer(connections, sessions, sender_id, raw_message);
         },
         SignalPacket::Heartbeat => {},
@@ -248,6 +270,7 @@ mod tests {
         let packet = SignalPacket::SessionRequest {
             device_id: DeviceId(device_user_id),
             client_public_key: "test_key".to_string(),
+            requested_capability: rivetlink_protocol::SessionCapability::Screenshot,
             session_id: None,
         };
         let message = serde_json::to_string(&packet).unwrap();
@@ -264,6 +287,59 @@ mod tests {
 
         tokio::time::sleep(std::time::Duration::from_millis(20)).await;
         assert_eq!(sessions.active_count(), 1);
+
+        drop(sig_tx);
+        let _ = router_handle.await;
+    }
+
+    #[tokio::test]
+    async fn relay_preserves_requested_capability_for_host_authorization() {
+        let (connections, sessions) = setup();
+        let (sig_tx, sig_rx) = mpsc::unbounded_channel::<SignalingMessage>();
+        let shared_org = org_id();
+        let device_id = Uuid::now_v7();
+        let (host_tx, mut host_rx) = mpsc::unbounded_channel();
+        connections.insert(
+            device_id,
+            ConnectedClient {
+                user_id: device_id,
+                org_id: shared_org,
+                kind: PrincipalKind::Device,
+                sender: host_tx,
+            },
+        );
+        let router_handle = tokio::spawn(run_signaling_router(
+            sig_rx,
+            connections.clone(),
+            sessions.clone(),
+        ));
+
+        let request = SignalPacket::SessionRequest {
+            device_id: DeviceId(device_id),
+            client_public_key: "controller-key".to_string(),
+            requested_capability: rivetlink_protocol::SessionCapability::ConsoleControl,
+            session_id: None,
+        };
+        sig_tx
+            .send((
+                Uuid::now_v7(),
+                shared_org,
+                serde_json::to_string(&request).unwrap(),
+            ))
+            .unwrap();
+        let raw = tokio::time::timeout(std::time::Duration::from_millis(100), host_rx.recv())
+            .await
+            .unwrap()
+            .unwrap();
+        let forwarded: SignalPacket = serde_json::from_str(&raw).unwrap();
+        assert!(matches!(
+            forwarded,
+            SignalPacket::SessionRequest {
+                requested_capability: rivetlink_protocol::SessionCapability::ConsoleControl,
+                session_id: Some(_),
+                ..
+            }
+        ));
 
         drop(sig_tx);
         let _ = router_handle.await;
@@ -298,6 +374,7 @@ mod tests {
         let packet = SignalPacket::SessionRequest {
             device_id: DeviceId(device_user_id),
             client_public_key: "attacker_key".to_string(),
+            requested_capability: rivetlink_protocol::SessionCapability::Screenshot,
             session_id: None,
         };
         let message = serde_json::to_string(&packet).unwrap();
@@ -400,6 +477,72 @@ mod tests {
 
         // Session should be removed
         assert_eq!(sessions.active_count(), 0);
+
+        drop(sig_tx);
+        let _ = router_handle.await;
+    }
+
+    #[tokio::test]
+    async fn console_state_is_forwarded_only_to_the_authenticated_session_peer() {
+        let (connections, sessions) = setup();
+        let (sig_tx, sig_rx) = mpsc::unbounded_channel::<SignalingMessage>();
+        let shared_org = org_id();
+        let client_id = Uuid::now_v7();
+        let device_id = Uuid::now_v7();
+        let session_id = Uuid::now_v7();
+        sessions.create_session(session_id, shared_org, device_id, client_id);
+
+        let (client_tx, mut client_rx) = mpsc::unbounded_channel();
+        connections.insert(
+            client_id,
+            ConnectedClient {
+                user_id: client_id,
+                org_id: shared_org,
+                kind: PrincipalKind::User,
+                sender: client_tx,
+            },
+        );
+
+        let router_handle = tokio::spawn(run_signaling_router(
+            sig_rx,
+            connections.clone(),
+            sessions.clone(),
+        ));
+        let packet = SignalPacket::HostConsoleState {
+            session_id: rivetlink_core::SessionId(session_id),
+            state: rivetlink_protocol::HostConsoleState::GdmLogin,
+            generation: 1,
+        };
+        sig_tx
+            .send((
+                device_id,
+                shared_org,
+                serde_json::to_string(&packet).unwrap(),
+            ))
+            .unwrap();
+
+        let forwarded =
+            tokio::time::timeout(std::time::Duration::from_millis(100), client_rx.recv())
+                .await
+                .unwrap()
+                .unwrap();
+        assert!(forwarded.contains("HOST_CONSOLE_STATE"));
+        assert!(forwarded.contains("gdm_login"));
+
+        // An arbitrary tenant peer cannot inject visible console state.
+        let outsider = Uuid::now_v7();
+        sig_tx
+            .send((
+                outsider,
+                shared_org,
+                serde_json::to_string(&packet).unwrap(),
+            ))
+            .unwrap();
+        assert!(
+            tokio::time::timeout(std::time::Duration::from_millis(50), client_rx.recv())
+                .await
+                .is_err()
+        );
 
         drop(sig_tx);
         let _ = router_handle.await;

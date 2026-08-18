@@ -106,17 +106,16 @@ pub fn monitor_target(display: Option<u32>) -> Option<(String, u32, u32)> {
     Some((m.connector.clone(), m.width, m.height))
 }
 
-/// Capture the primary monitor once and encode it as PNG. This is used only by
-/// the screenshot-only headless host path; it does not enable streaming or
-/// remote input. `timeout` is enforced by GNU coreutils' `timeout`, present on
-/// supported Ubuntu releases, so a wedged PipeWire source cannot keep an agent
-/// task alive indefinitely.
+/// Capture the primary monitor in the current Mutter session once and encode it
+/// as PNG. The caller may be a normal GNOME desktop or the actual GDM greeter;
+/// it does not create a virtual display. `timeout` is enforced by GNU
+/// coreutils' `timeout`, present on supported Ubuntu releases, so a wedged
+/// PipeWire source cannot keep an agent task alive indefinitely.
 pub fn capture_png(timeout: Duration) -> AgentResult<Vec<u8>> {
     let mons = monitors()?;
     let Some(monitor) = mons.first() else {
         return Err(AgentError::Config(
-            "no virtual GNOME monitor is available; check rivetlink-headless-gnome.service"
-                .to_string(),
+            "no active GNOME monitor is available in this graphical session".to_string(),
         ));
     };
     let (width, height) = fit_output(monitor.width, monitor.height);
@@ -125,7 +124,7 @@ pub fn capture_png(timeout: Duration) -> AgentResult<Vec<u8>> {
     let mut stdout = child
         .stdout
         .take()
-        .ok_or_else(|| AgentError::Config("headless gstreamer stdout missing".to_string()))?;
+        .ok_or_else(|| AgentError::Config("Mutter capture stdout missing".to_string()))?;
     let frame_bytes = width
         .checked_mul(height)
         .and_then(|v| v.checked_mul(4))
@@ -138,7 +137,7 @@ pub fn capture_png(timeout: Duration) -> AgentResult<Vec<u8>> {
     let _ = child.wait();
     read_result.map_err(|e| {
         AgentError::Config(format!(
-            "headless capture did not produce a frame within {} seconds: {e}",
+            "Mutter capture did not produce a frame within {} seconds: {e}",
             timeout.as_secs().max(1)
         ))
     })?;

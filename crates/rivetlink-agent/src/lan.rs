@@ -23,7 +23,7 @@ use rivetlink_sdk::lan::{
 };
 
 use crate::capture::screenshot;
-use crate::config::HeadlessConfig;
+use crate::config::UnattendedConsoleConfig;
 use crate::error::{AgentError, AgentResult};
 use crate::trusted::TrustedClients;
 
@@ -113,7 +113,7 @@ pub async fn serve_headless_screenshot_only(
     device_name: String,
     port: u16,
     trusted: TrustedClients,
-    limits: HeadlessConfig,
+    limits: UnattendedConsoleConfig,
 ) -> AgentResult<()> {
     let listener = bind_listener(port).await?;
     let local_port = listener.local_addr()?.port();
@@ -152,7 +152,7 @@ async fn serve_headless_client(
     mut stream: TcpStream,
     signing_key: SigningKey,
     trusted: Arc<TrustedClients>,
-    limits: HeadlessConfig,
+    limits: UnattendedConsoleConfig,
 ) -> AgentResult<()> {
     let identity = Identity::from_signing_key(signing_key);
     let (channel, client) = direct::host_accept_key(&mut stream, &identity, |id| {
@@ -895,6 +895,7 @@ mod tests {
                     name: "Viewer".to_string(),
                     can_view: true,
                     can_control: false,
+                    can_unattended_console: false,
                 },
             )
             .unwrap();
@@ -905,6 +906,7 @@ mod tests {
                     name: "Control only".to_string(),
                     can_view: false,
                     can_control: true,
+                    can_unattended_console: false,
                 },
             )
             .unwrap();

@@ -75,7 +75,9 @@ pub fn verify_identity(public_key_b64: &str, sig_b64: &str) -> Option<String> {
     let pubkey = VerifyingKey::from_bytes(&key_bytes).ok()?;
     let mut msg = IDENTITY_CONTEXT.to_vec();
     msg.extend_from_slice(&key_bytes);
-    pubkey.verify(&msg, &Signature::from_bytes(&sig_bytes)).ok()?;
+    pubkey
+        .verify(&msg, &Signature::from_bytes(&sig_bytes))
+        .ok()?;
     Some(B64.encode(key_bytes))
 }
 
@@ -185,8 +187,10 @@ fn discover_blocking(timeout: Duration) -> SdkResult<Vec<LanDevice>> {
             "discovery: resolved host"
         );
     }
-    let devices: Vec<LanDevice> =
-        found.into_values().filter_map(HostAccumulator::into_device).collect();
+    let devices: Vec<LanDevice> = found
+        .into_values()
+        .filter_map(HostAccumulator::into_device)
+        .collect();
     tracing::info!(hosts = devices.len(), "discovery: done");
     Ok(devices)
 }
@@ -246,7 +250,11 @@ impl HostAccumulator {
         // loopback, and crucially `fe80::` link-local IPv6 — it can't be reached
         // without a scope/zone id, so surfacing it only spawns a phantom IPv6
         // entry next to the real IPv4 one (and "bad address" on connect).
-        let best = self.addresses.iter().min_by_key(|ip| addr_rank(ip)).copied()?;
+        let best = self
+            .addresses
+            .iter()
+            .min_by_key(|ip| addr_rank(ip))
+            .copied()?;
         if addr_rank(&best) >= 4 {
             tracing::debug!(
                 name = self.name.as_deref().unwrap_or("?"),
@@ -280,8 +288,8 @@ fn addr_rank(ip: &IpAddr) -> u8 {
         // undialable. Drop it (rank 4) rather than rank it just below loopback.
         IpAddr::V6(v6) if (v6.segments()[0] & 0xffc0) == 0xfe80 => 4,
         IpAddr::V4(v4) if v4.is_link_local() => 2, // 169.254.0.0/16 — dialable APIPA
-        IpAddr::V4(_) => 0,                         // routable IPv4 — best
-        IpAddr::V6(_) => 1,                         // routable IPv6
+        IpAddr::V4(_) => 0,                        // routable IPv4 — best
+        IpAddr::V6(_) => 1,                        // routable IPv6
     }
 }
 
@@ -460,7 +468,9 @@ async fn write_sealed<W>(w: &mut W, ch: &SealedChannel, plain: &[u8]) -> SdkResu
 where
     W: AsyncWrite + Unpin,
 {
-    let sealed = ch.seal(plain).map_err(|e| SdkError::Crypto(e.to_string()))?;
+    let sealed = ch
+        .seal(plain)
+        .map_err(|e| SdkError::Crypto(e.to_string()))?;
     let len = u32::try_from(sealed.len())
         .map_err(|_| SdkError::Crypto("sealed frame too large".to_string()))?;
     w.write_all(&len.to_be_bytes()).await?;
@@ -616,10 +626,9 @@ fn parse_pinned_host(pinned_host_b64: Option<&str>) -> SdkResult<Option<Verifyin
                 .as_slice()
                 .try_into()
                 .map_err(|_| SdkError::Crypto("host key must be 32 bytes".to_string()))?;
-            Ok(Some(
-                VerifyingKey::from_bytes(&bytes)
-                    .map_err(|e| SdkError::Crypto(format!("bad host key: {e}")))?,
-            ))
+            Ok(Some(VerifyingKey::from_bytes(&bytes).map_err(|e| {
+                SdkError::Crypto(format!("bad host key: {e}"))
+            })?))
         },
         None => Ok(None),
     }
@@ -631,9 +640,9 @@ async fn fetch_screenshot(stream: &mut TcpStream, channel: &SealedChannel) -> Sd
         LanResponse::Screenshot { png_b64 } => B64
             .decode(png_b64.trim())
             .map_err(|e| SdkError::Base64(e.to_string())),
-        LanResponse::Frame(_) | LanResponse::Displays { .. } => {
-            Err(SdkError::Crypto("expected screenshot, got another response".to_string()))
-        },
+        LanResponse::Frame(_) | LanResponse::Displays { .. } => Err(SdkError::Crypto(
+            "expected screenshot, got another response".to_string(),
+        )),
         LanResponse::Error { message } => Err(SdkError::Relay(message)),
     }
 }
@@ -699,13 +708,17 @@ where
         },
         None => (None, None),
     };
-    send_request(&mut wr, &channel, &LanRequest::StartStream {
-        fps,
-        display,
-        name,
-        identity_key,
-        identity_sig,
-    })
+    send_request(
+        &mut wr,
+        &channel,
+        &LanRequest::StartStream {
+            fps,
+            display,
+            name,
+            identity_key,
+            identity_sig,
+        },
+    )
     .await?;
     let mut first = true;
 
@@ -807,14 +820,20 @@ mod tests {
         let host = tokio::spawn(async move {
             let req = recv_request(&mut h, &ch_h).await.unwrap();
             assert!(matches!(req, LanRequest::Screenshot));
-            send_response(&mut h, &ch_h, &LanResponse::Screenshot {
-                png_b64: B64.encode(b"PNGDATA"),
-            })
+            send_response(
+                &mut h,
+                &ch_h,
+                &LanResponse::Screenshot {
+                    png_b64: B64.encode(b"PNGDATA"),
+                },
+            )
             .await
             .unwrap();
         });
 
-        send_request(&mut c, &ch_c, &LanRequest::Screenshot).await.unwrap();
+        send_request(&mut c, &ch_c, &LanRequest::Screenshot)
+            .await
+            .unwrap();
         let resp = recv_response(&mut c, &ch_c).await.unwrap();
         host.await.unwrap();
         match resp {
@@ -835,12 +854,18 @@ mod tests {
         let addr = listener.local_addr().unwrap();
         let host = tokio::spawn(async move {
             let (mut stream, _) = listener.accept().await.unwrap();
-            let channel = direct::host_accept_password(&mut stream, "1234").await.unwrap();
+            let channel = direct::host_accept_password(&mut stream, "1234")
+                .await
+                .unwrap();
             let req = recv_request(&mut stream, &channel).await.unwrap();
             assert!(matches!(req, LanRequest::Screenshot));
-            send_response(&mut stream, &channel, &LanResponse::Screenshot {
-                png_b64: B64.encode(b"\x89PNG-fake"),
-            })
+            send_response(
+                &mut stream,
+                &channel,
+                &LanResponse::Screenshot {
+                    png_b64: B64.encode(b"\x89PNG-fake"),
+                },
+            )
             .await
             .unwrap();
         });

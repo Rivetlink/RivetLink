@@ -67,11 +67,7 @@ pub async fn get_by_jti(pool: &PgPool, jti: Uuid) -> ServerResult<Option<Refresh
 }
 
 /// Mark a single token as revoked and (optionally) record its successor.
-pub async fn mark_revoked(
-    pool: &PgPool,
-    jti: Uuid,
-    replaced_by: Option<Uuid>,
-) -> ServerResult<()> {
+pub async fn mark_revoked(pool: &PgPool, jti: Uuid, replaced_by: Option<Uuid>) -> ServerResult<()> {
     sqlx::query(
         "UPDATE refresh_tokens SET revoked_at = now(), replaced_by_jti = $2 \
          WHERE jti = $1 AND revoked_at IS NULL",
@@ -116,9 +112,7 @@ pub enum RotationError {
     /// Row exists but `expires_at` has passed.
     Expired,
     /// Row was already marked revoked. The caller should revoke the family.
-    Reused {
-        family_id: Uuid,
-    },
+    Reused { family_id: Uuid },
 }
 
 /// Validate a presented refresh token jti and return its row for rotation.

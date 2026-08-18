@@ -27,10 +27,13 @@ pub struct DeviceResponse {
     pub public_key: String,
     pub created_at: String,
     pub last_seen: Option<String>,
+    /// True only while this exact device has an authenticated relay websocket.
+    /// It is deliberately live state, not an inference from `last_seen`.
+    pub online: bool,
 }
 
-impl From<crate::db::models::Device> for DeviceResponse {
-    fn from(d: crate::db::models::Device) -> Self {
+impl DeviceResponse {
+    fn from_device(d: crate::db::models::Device, online: bool) -> Self {
         Self {
             id: d.id.to_string(),
             organization_id: d.organization_id.to_string(),
@@ -39,6 +42,7 @@ impl From<crate::db::models::Device> for DeviceResponse {
             public_key: d.public_key,
             created_at: d.created_at.to_rfc3339(),
             last_seen: d.last_seen.map(|t| t.to_rfc3339()),
+            online,
         }
     }
 }
@@ -71,7 +75,7 @@ pub async fn register_device(
     )
     .await?;
 
-    Ok(Json(DeviceResponse::from(device)))
+    Ok(Json(DeviceResponse::from_device(device, false)))
 }
 
 fn validate_device_request(req: &RegisterDeviceRequest) -> ServerResult<()> {
@@ -98,6 +102,12 @@ pub async fn list_devices(
 ) -> ServerResult<Json<Vec<DeviceResponse>>> {
     auth.require(Permission::DevicesList)?;
     let device_list = devices::list_devices_by_org(&state.db, auth.org_id).await?;
-    let response: Vec<DeviceResponse> = device_list.into_iter().map(DeviceResponse::from).collect();
+    let response: Vec<DeviceResponse> = device_list
+        .into_iter()
+        .map(|device| {
+            let online = state.connections.device_is_connected(&device.id);
+            DeviceResponse::from_device(device, online)
+        })
+        .collect();
     Ok(Json(response))
 }

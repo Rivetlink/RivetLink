@@ -12,11 +12,11 @@
 
 use base64::Engine;
 use ed25519_dalek::VerifyingKey;
+use futures_util::{SinkExt, StreamExt};
 use rivetlink_core::{DeviceId, SessionId};
 use rivetlink_crypto::handshake::{self, LocalKeyExchange};
 use rivetlink_crypto::sealed::SealedChannel;
-use rivetlink_protocol::SignalPacket;
-use futures_util::{SinkExt, StreamExt};
+use rivetlink_protocol::{ConsoleInputPacket, HostConsoleState, SessionCapability, SignalPacket};
 use std::path::PathBuf;
 use tokio_tungstenite::tungstenite::Message;
 use uuid::Uuid;
@@ -34,18 +34,38 @@ pub struct CaptureParams<'a> {
     /// Base64 Ed25519 identity key of the host, from the authenticated REST API.
     pub host_public_key_b64: &'a str,
     pub output_path: PathBuf,
+    /// Defaults to screenshot-only at every caller. Console control is opt-in
+    /// and requires a locally configured physical-console broker on the host.
+    pub requested_capability: SessionCapability,
+    /// At most one sealed event is sent before the capture. This stateless
+    /// primitive gives the UI a safe refresh-after-input building block; it
+    /// never logs, stores, or semantically interprets typed characters.
+    pub console_input: Option<ConsoleInputPacket>,
+}
+
+/// Result of one encrypted capture, including the non-sensitive physical
+/// console state asserted by the authenticated host when available.
+#[derive(Debug)]
+pub struct CaptureOutcome {
+    pub path: PathBuf,
+    pub console_state: Option<(HostConsoleState, u64)>,
 }
 
 /// Run a single screenshot session end to end. Returns the path written.
-pub async fn capture_screenshot(req: CaptureParams<'_>) -> SdkResult<PathBuf> {
+// The protocol handshake is intentionally kept in one ordered routine; splitting
+// it would obscure which checks must happen before decrypting screenshot data.
+#[allow(clippy::too_many_lines)]
+pub async fn capture_screenshot(req: CaptureParams<'_>) -> SdkResult<CaptureOutcome> {
     let host_identity = parse_identity(req.host_public_key_b64)?;
-
     let (mut ws, _resp) = tokio_tungstenite::connect_async(req.relay_ws_url)
         .await
         .map_err(|e| SdkError::Relay(format!("connect failed: {e}")))?;
-
     // 1. User auth.
-    send(&mut ws, &serde_json::json!({"type": "AUTH", "token": req.token})).await?;
+    send(
+        &mut ws,
+        &serde_json::json!({"type": "AUTH", "token": req.token}),
+    )
+    .await?;
     let ack = recv_text(&mut ws).await?;
     let ack_json: serde_json::Value = serde_json::from_str(&ack)?;
     if ack_json.get("type").and_then(|v| v.as_str()) != Some("AUTHENTICATED") {
@@ -56,6 +76,7 @@ pub async fn capture_screenshot(req: CaptureParams<'_>) -> SdkResult<PathBuf> {
     let session_request = SignalPacket::SessionRequest {
         device_id: DeviceId(req.device_id),
         client_public_key: req.identity.public_key_b64(),
+        requested_capability: req.requested_capability,
         session_id: None,
     };
     send_packet(&mut ws, &session_request).await?;
@@ -65,6 +86,7 @@ pub async fn capture_screenshot(req: CaptureParams<'_>) -> SdkResult<PathBuf> {
     let mut channel: Option<SealedChannel> = None;
     let mut session_id: Option<SessionId> = None;
     let mut chunks: Vec<(u32, String)> = Vec::new();
+    let mut console_state = None;
 
     loop {
         let text = recv_text(&mut ws).await?;
@@ -74,7 +96,10 @@ pub async fn capture_screenshot(req: CaptureParams<'_>) -> SdkResult<PathBuf> {
         };
 
         match packet {
-            SignalPacket::SessionAccepted { session_id: sid, role } => {
+            SignalPacket::SessionAccepted {
+                session_id: sid,
+                role,
+            } => {
                 tracing::info!(session = %sid, ?role, "host accepted session");
                 session_id = Some(sid);
                 let kex = handshake::start(req.identity.signing_key());
@@ -102,14 +127,44 @@ pub async fn capture_screenshot(req: CaptureParams<'_>) -> SdkResult<PathBuf> {
                 handshake::verify_peer(&host_identity, &peer_eph, &peer_sig)
                     .map_err(|e| SdkError::Crypto(format!("host key exchange invalid: {e}")))?;
 
-                let kex = local_kex
-                    .take()
-                    .ok_or_else(|| SdkError::Crypto("host key exchange arrived before accept".to_string()))?;
+                let kex = local_kex.take().ok_or_else(|| {
+                    SdkError::Crypto("host key exchange arrived before accept".to_string())
+                })?;
                 channel = Some(kex.into_channel(&peer_eph));
                 session_id = Some(sid);
 
+                if let Some(event) = &req.console_input {
+                    if req.requested_capability != SessionCapability::ConsoleControl {
+                        return Err(SdkError::Config(
+                            "console input requires the console-control capability".to_string(),
+                        ));
+                    }
+                    let plaintext = serde_json::to_vec(event)?;
+                    let sealed = channel
+                        .as_ref()
+                        .ok_or_else(|| {
+                            SdkError::Crypto("missing console input channel".to_string())
+                        })?
+                        .seal(&plaintext)
+                        .map_err(|error| {
+                            SdkError::Crypto(format!("seal console input failed: {error}"))
+                        })?;
+                    send_packet(
+                        &mut ws,
+                        &SignalPacket::ConsoleInput {
+                            session_id: sid,
+                            payload: base64::engine::general_purpose::STANDARD.encode(sealed),
+                        },
+                    )
+                    .await?;
+                }
+
                 // 5. Ask for the screenshot.
-                send_packet(&mut ws, &SignalPacket::ScreenshotRequest { session_id: sid }).await?;
+                send_packet(
+                    &mut ws,
+                    &SignalPacket::ScreenshotRequest { session_id: sid },
+                )
+                .await?;
                 tracing::info!("secure channel established, requested screenshot");
             },
             SignalPacket::ScreenshotData {
@@ -127,10 +182,21 @@ pub async fn capture_screenshot(req: CaptureParams<'_>) -> SdkResult<PathBuf> {
                     let path = finalize(&mut chunks, Some(total), channel, &req.output_path)?;
                     // Politely close the session.
                     if let Some(sid) = session_id {
-                        let _ = send_packet(&mut ws, &SignalPacket::SessionClosed { session_id: sid }).await;
+                        let _ =
+                            send_packet(&mut ws, &SignalPacket::SessionClosed { session_id: sid })
+                                .await;
                     }
                     let _ = ws.close(None).await;
-                    return Ok(path);
+                    return Ok(CaptureOutcome { path, console_state });
+                }
+            },
+            SignalPacket::HostConsoleState {
+                state, generation, ..
+            } => {
+                // State is session-bound by the relay and carries no screen
+                // content. Retain only the newest generation.
+                if console_state.is_none_or(|(_, current)| generation >= current) {
+                    console_state = Some((state, generation));
                 }
             },
             SignalPacket::SessionClosed { .. } => {
@@ -199,7 +265,10 @@ fn decode_32(b64: &str) -> SdkResult<[u8; 32]> {
         .decode(b64.trim())
         .map_err(|e| SdkError::Base64(e.to_string()))?;
     if raw.len() != 32 {
-        return Err(SdkError::Crypto(format!("expected 32 bytes, got {}", raw.len())));
+        return Err(SdkError::Crypto(format!(
+            "expected 32 bytes, got {}",
+            raw.len()
+        )));
     }
     let mut out = [0u8; 32];
     out.copy_from_slice(&raw);
@@ -211,7 +280,10 @@ fn decode_64(b64: &str) -> SdkResult<[u8; 64]> {
         .decode(b64.trim())
         .map_err(|e| SdkError::Base64(e.to_string()))?;
     if raw.len() != 64 {
-        return Err(SdkError::Crypto(format!("expected 64 bytes, got {}", raw.len())));
+        return Err(SdkError::Crypto(format!(
+            "expected 64 bytes, got {}",
+            raw.len()
+        )));
     }
     let mut out = [0u8; 64];
     out.copy_from_slice(&raw);

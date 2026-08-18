@@ -1092,7 +1092,10 @@ mod ws {
             other => panic!("expected text message, got {other:?}"),
         };
         let parsed: Value = serde_json::from_str(&text).unwrap();
-        assert_eq!(parsed.get("type").and_then(Value::as_str), Some("AUTHENTICATED"));
+        assert_eq!(
+            parsed.get("type").and_then(Value::as_str),
+            Some("AUTHENTICATED")
+        );
         assert!(parsed.get("user_id").and_then(Value::as_str).is_some());
 
         ws.close(None).await.ok();
@@ -1191,7 +1194,9 @@ mod rbac {
         .await
         .unwrap();
         assert_eq!(response.status(), StatusCode::OK);
-        let body = axum::body::to_bytes(response.into_body(), 1024 * 1024).await.unwrap();
+        let body = axum::body::to_bytes(response.into_body(), 1024 * 1024)
+            .await
+            .unwrap();
         let json: Value = serde_json::from_slice(&body).unwrap();
         json["access_token"].as_str().unwrap().to_string()
     }
@@ -1212,7 +1217,9 @@ mod rbac {
         .await
         .unwrap();
         assert_eq!(response.status(), StatusCode::OK);
-        let body = axum::body::to_bytes(response.into_body(), 1024 * 1024).await.unwrap();
+        let body = axum::body::to_bytes(response.into_body(), 1024 * 1024)
+            .await
+            .unwrap();
         let json: Value = serde_json::from_slice(&body).unwrap();
         json["access_token"].as_str().unwrap().to_string()
     }
@@ -1242,9 +1249,18 @@ mod rbac {
         let email = unique_email("rbac-owner");
         let token = register_owner(&state, &email).await;
 
-        assert_eq!(call(&state, "GET", "/audit-logs", &token).await, StatusCode::OK);
-        assert_eq!(call(&state, "GET", "/devices", &token).await, StatusCode::OK);
-        assert_eq!(call(&state, "GET", "/sessions", &token).await, StatusCode::OK);
+        assert_eq!(
+            call(&state, "GET", "/audit-logs", &token).await,
+            StatusCode::OK
+        );
+        assert_eq!(
+            call(&state, "GET", "/devices", &token).await,
+            StatusCode::OK
+        );
+        assert_eq!(
+            call(&state, "GET", "/sessions", &token).await,
+            StatusCode::OK
+        );
 
         cleanup_test_data(&state, &email).await;
     }
@@ -1260,8 +1276,14 @@ mod rbac {
         let op_token = login_operator(&state, &email).await;
 
         // Operators can list but not read audit
-        assert_eq!(call(&state, "GET", "/devices", &op_token).await, StatusCode::OK);
-        assert_eq!(call(&state, "GET", "/sessions", &op_token).await, StatusCode::OK);
+        assert_eq!(
+            call(&state, "GET", "/devices", &op_token).await,
+            StatusCode::OK
+        );
+        assert_eq!(
+            call(&state, "GET", "/sessions", &op_token).await,
+            StatusCode::OK
+        );
         assert_eq!(
             call(&state, "GET", "/audit-logs", &op_token).await,
             StatusCode::FORBIDDEN,
@@ -1443,8 +1465,8 @@ mod device_auth {
         // Register device with key A, but sign with key B
         let real_key = fresh_signing_key();
         let attacker_key = fresh_signing_key();
-        let pk_b64 = base64::engine::general_purpose::STANDARD
-            .encode(real_key.verifying_key().as_bytes());
+        let pk_b64 =
+            base64::engine::general_purpose::STANDARD.encode(real_key.verifying_key().as_bytes());
 
         let dev_resp = http_post(
             addr,
@@ -1521,7 +1543,10 @@ mod device_auth {
         let frame = ws.next().await.unwrap().unwrap();
         if let Message::Text(t) = frame {
             let v: Value = serde_json::from_str(&t).unwrap();
-            assert!(v.get("error").is_some(), "expected error for unknown device");
+            assert!(
+                v.get("error").is_some(),
+                "expected error for unknown device"
+            );
         }
 
         handle.abort();

@@ -81,7 +81,8 @@ impl Identity {
 
     /// Base64 of the 32-byte Ed25519 public key — what the host trusts.
     pub fn public_key_b64(&self) -> String {
-        base64::engine::general_purpose::STANDARD.encode(self.signing_key.verifying_key().as_bytes())
+        base64::engine::general_purpose::STANDARD
+            .encode(self.signing_key.verifying_key().as_bytes())
     }
 
     /// Default identity path inside a data directory.
@@ -96,7 +97,10 @@ mod tests {
 
     fn tmp(name: &str) -> PathBuf {
         let mut p = std::env::temp_dir();
-        p.push(format!("rivet-sdk-id-{}-{name}.json", uuid::Uuid::now_v7().simple()));
+        p.push(format!(
+            "rivet-sdk-id-{}-{name}.json",
+            uuid::Uuid::now_v7().simple()
+        ));
         p
     }
 

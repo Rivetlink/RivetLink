@@ -69,7 +69,7 @@ pub fn stream_tiles_blocking(
 ) -> AgentResult<()> {
     #[cfg(target_os = "macos")]
     {
-        macos::stream(fps, quality, display, tx)
+        macos::stream(fps, quality, display, &tx)
     }
     #[cfg(target_os = "linux")]
     {
@@ -292,7 +292,7 @@ mod macos {
         fps: u16,
         quality: u8,
         display: Option<u32>,
-        tx: Sender<FrameDelta>,
+        tx: &Sender<FrameDelta>,
     ) -> AgentResult<()> {
         let mut capturer = build_capturer(fps, display)?;
         capturer.start_capture();
@@ -323,7 +323,7 @@ mod macos {
             };
             got_frame = true;
             if let Some((w, h, data)) = frame_to_bgra(frame) {
-                if !enc.push(w, h, data, quality, &tx) {
+                if !enc.push(w, h, data, quality, tx) {
                     break;
                 }
             }

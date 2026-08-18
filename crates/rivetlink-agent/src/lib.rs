@@ -7,6 +7,7 @@
 pub mod capture;
 pub mod cli;
 pub mod config;
+pub mod console;
 pub mod error;
 pub mod input;
 pub mod keystore;

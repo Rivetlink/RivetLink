@@ -17,7 +17,7 @@ use ed25519_dalek::{SigningKey, VerifyingKey};
 use rivetlink_core::{SessionId, SessionRole};
 use rivetlink_crypto::handshake::{self, LocalKeyExchange};
 use rivetlink_crypto::sealed::SealedChannel;
-use rivetlink_protocol::SignalPacket;
+use rivetlink_protocol::{ConsoleInputPacket, HostConsoleState, SessionCapability, SignalPacket};
 use std::time::{Duration, Instant};
 
 use crate::capture::screenshot;
@@ -41,6 +41,58 @@ pub enum ConsentPolicy {
         capture_timeout: Duration,
         max_capture_bytes: usize,
     },
+    /// Capture from the physical GDM/GNOME console via a locally authenticated
+    /// session worker. This requires the additional `can_unattended_console`
+    /// owner opt-in; ordinary screenshot trust is not enough.
+    UnattendedConsole {
+        min_capture_interval: Duration,
+        capture_timeout: Duration,
+        max_capture_bytes: usize,
+    },
+}
+
+/// Source of a single capture for an authenticated screenshot session.
+///
+/// The normal host captures from its own desktop. A boot-time broker instead
+/// supplies a narrowly scoped IPC source backed by the active GDM/GNOME
+/// worker. In both cases the host seals bytes before they leave the machine.
+#[async_trait]
+pub trait ScreenshotCapturer: Send {
+    /// Capture one PNG while applying the requested unattended timeout.
+    async fn capture(&mut self, policy: ConsentPolicy) -> AgentResult<Vec<u8>>;
+}
+
+/// Narrow companion to a capture source. An ordinary screenshot host has no
+/// such sink, so it can never acquire remote-input capability by accident.
+#[async_trait]
+pub trait ConsoleInputSink: Send {
+    /// Replay one previously authenticated, decrypted normalized event.
+    async fn inject(&mut self, event: ConsoleInputPacket) -> AgentResult<()>;
+}
+
+#[async_trait]
+pub trait ConsoleStateProvider: Send + Sync {
+    /// Returns only lifecycle state and a capture generation, never a session
+    /// identifier, account name, display address, or screen content.
+    async fn console_state(&self) -> Option<(HostConsoleState, u64)>;
+}
+
+#[derive(Debug, Default)]
+pub(crate) struct LocalScreenshotCapturer;
+
+#[async_trait]
+impl ScreenshotCapturer for LocalScreenshotCapturer {
+    async fn capture(&mut self, policy: ConsentPolicy) -> AgentResult<Vec<u8>> {
+        match policy {
+            ConsentPolicy::HeadlessTrustedOnly {
+                capture_timeout, ..
+            }
+            | ConsentPolicy::UnattendedConsole {
+                capture_timeout, ..
+            } => screenshot::capture_headless_png(capture_timeout).await,
+            ConsentPolicy::Prompt => screenshot::capture_png().await,
+        }
+    }
 }
 
 /// Per-connection host session state.
@@ -49,9 +101,13 @@ pub struct ScreenshotHost {
     identity_b64: String,
     trusted: TrustedClients,
     policy: ConsentPolicy,
+    capturer: Box<dyn ScreenshotCapturer>,
+    input_sink: Option<Box<dyn ConsoleInputSink>>,
+    console_state_provider: Option<Box<dyn ConsoleStateProvider>>,
 
     // Active session state (single session at a time for the MVP).
     session_id: Option<SessionId>,
+    capability: Option<SessionCapability>,
     client_identity: Option<VerifyingKey>,
     local_kex: Option<LocalKeyExchange>,
     channel: Option<SealedChannel>,
@@ -78,7 +134,11 @@ impl ScreenshotHost {
             identity_b64,
             trusted,
             policy,
+            capturer: Box::<LocalScreenshotCapturer>::default(),
+            input_sink: None,
+            console_state_provider: None,
             session_id: None,
+            capability: None,
             client_identity: None,
             local_kex: None,
             channel: None,
@@ -86,9 +146,32 @@ impl ScreenshotHost {
         }
     }
 
+    /// Replace the capture source. Used by the non-root console broker after a
+    /// GDM/GNOME worker authenticated itself on the local Unix socket.
+    #[must_use]
+    pub fn with_capturer(mut self, capturer: Box<dyn ScreenshotCapturer>) -> Self {
+        self.capturer = capturer;
+        self
+    }
+
+    /// Attach a physical-console input sink. This is used only by the local
+    /// GDM/GNOME broker after peer-credential validation.
+    #[must_use]
+    pub fn with_console_input_sink(mut self, sink: Box<dyn ConsoleInputSink>) -> Self {
+        self.input_sink = Some(sink);
+        self
+    }
+
+    #[must_use]
+    pub fn with_console_state_provider(mut self, provider: Box<dyn ConsoleStateProvider>) -> Self {
+        self.console_state_provider = Some(provider);
+        self
+    }
+
     /// Reset all per-session state (after close or rejection).
     fn reset(&mut self) {
         self.session_id = None;
+        self.capability = None;
         self.client_identity = None;
         self.local_kex = None;
         self.channel = None;
@@ -98,6 +181,14 @@ impl ScreenshotHost {
     /// Decide whether to admit a client, prompting the operator if unknown.
     async fn consent(&mut self, client_key_b64: &str) -> AgentResult<bool> {
         if let Some(entry) = self.trusted.get(client_key_b64) {
+            if matches!(self.policy, ConsentPolicy::UnattendedConsole { .. }) {
+                if self.trusted.may_view_unattended_console(client_key_b64) {
+                    tracing::info!(client = %entry.name, "trusted client accepted for unattended console viewing");
+                    return Ok(true);
+                }
+                tracing::warn!(client = %entry.name, "trusted client denied: unattended console opt-in is disabled");
+                return Ok(false);
+            }
             if entry.can_view {
                 tracing::info!(client = %entry.name, "trusted client accepted for screenshot access");
                 return Ok(true);
@@ -105,7 +196,10 @@ impl ScreenshotHost {
             tracing::warn!(client = %entry.name, "trusted client denied: view permission is disabled");
             return Ok(false);
         }
-        if matches!(self.policy, ConsentPolicy::HeadlessTrustedOnly { .. }) {
+        if matches!(
+            self.policy,
+            ConsentPolicy::HeadlessTrustedOnly { .. } | ConsentPolicy::UnattendedConsole { .. }
+        ) {
             // A background systemd service cannot safely prompt; it also must
             // not create trust through a connection attempt.
             tracing::warn!("unknown client rejected in headless mode");
@@ -125,6 +219,7 @@ impl ScreenshotHost {
                     name: "approved-on-connect".to_string(),
                     can_view: true,
                     can_control: false,
+                    can_unattended_console: false,
                 },
             )?;
         }
@@ -136,6 +231,7 @@ impl ScreenshotHost {
     async fn on_session_request(
         &mut self,
         client_public_key: String,
+        requested_capability: SessionCapability,
         session_id: Option<SessionId>,
     ) -> AgentResult<Vec<String>> {
         let Some(sid) = session_id else {
@@ -143,6 +239,16 @@ impl ScreenshotHost {
             return Ok(Vec::new());
         };
         tracing::info!(session = %sid, "session request received");
+
+        if requested_capability == SessionCapability::ConsoleControl
+            && !matches!(self.policy, ConsentPolicy::UnattendedConsole { .. })
+        {
+            tracing::warn!(session = %sid, ?requested_capability, "unsupported session capability rejected");
+            return Ok(vec![reject(
+                sid,
+                "this host only permits screenshot sessions",
+            )?]);
+        }
 
         let client_identity = match parse_identity(&client_public_key) {
             Ok(k) => k,
@@ -152,6 +258,18 @@ impl ScreenshotHost {
             },
         };
 
+        if requested_capability == SessionCapability::ConsoleControl
+            && !self
+                .trusted
+                .may_control_unattended_console(&client_public_key)
+        {
+            tracing::warn!(session = %sid, "console control denied by local trust policy");
+            return Ok(vec![reject(
+                sid,
+                "local console-control permission is required",
+            )?]);
+        }
+
         if !self.consent(&client_public_key).await? {
             tracing::info!(session = %sid, "session request denied by local host policy");
             return Ok(vec![reject(sid, "host operator denied the connection")?]);
@@ -160,6 +278,7 @@ impl ScreenshotHost {
         // Accepted: set up state and our half of the key exchange.
         self.reset();
         self.session_id = Some(sid);
+        self.capability = Some(requested_capability);
         self.client_identity = Some(client_identity);
         let kex = handshake::start(&self.signing_key);
         let kex_frame = self.key_exchange_frame(sid, &kex)?;
@@ -171,7 +290,17 @@ impl ScreenshotHost {
         })?;
 
         tracing::info!(session = %sid, "session accepted");
-        Ok(vec![accept, kex_frame])
+        let mut outgoing = vec![accept, kex_frame];
+        if let Some(provider) = &self.console_state_provider {
+            if let Some((state, generation)) = provider.console_state().await {
+                outgoing.push(serde_json::to_string(&SignalPacket::HostConsoleState {
+                    session_id: sid,
+                    state,
+                    generation,
+                })?);
+            }
+        }
+        Ok(outgoing)
     }
 
     /// Handle the client's `SessionKeyExchange`.
@@ -219,27 +348,24 @@ impl ScreenshotHost {
             AgentError::Relay("screenshot requested before key exchange".to_string())
         })?;
 
-        let image = if let ConsentPolicy::HeadlessTrustedOnly {
-            min_capture_interval,
-            capture_timeout,
-            max_capture_bytes,
-        } = self.policy
+        let image = if let Some((min_capture_interval, max_capture_bytes)) =
+            capture_limits(self.policy)
         {
             if self
                 .last_capture
                 .is_some_and(|last| last.elapsed() < min_capture_interval)
             {
-                tracing::warn!("headless screenshot rejected: request rate limit");
+                tracing::warn!("unattended screenshot rejected: request rate limit");
                 return Err(AgentError::Relay(
                     "screenshot rate limited; wait before requesting another capture".to_string(),
                 ));
             }
-            let image = screenshot::capture_headless_png(capture_timeout).await?;
+            let image = self.capturer.capture(self.policy).await?;
             if image.len() > max_capture_bytes {
                 tracing::warn!(
                     bytes = image.len(),
                     max_capture_bytes,
-                    "headless screenshot rejected: size limit"
+                    "unattended screenshot rejected: size limit"
                 );
                 return Err(AgentError::Relay(
                     "captured screenshot exceeds configured size limit".to_string(),
@@ -248,7 +374,7 @@ impl ScreenshotHost {
             self.last_capture = Some(Instant::now());
             image
         } else {
-            screenshot::capture_png().await?
+            self.capturer.capture(self.policy).await?
         };
         tracing::info!(
             bytes = image.len(),
@@ -263,6 +389,48 @@ impl ScreenshotHost {
         let frames = chunk_payload(session_id, &b64)?;
         tracing::info!(chunks = frames.len(), "sending encrypted screenshot");
         Ok(frames)
+    }
+
+    async fn on_console_input(
+        &mut self,
+        session_id: SessionId,
+        payload: String,
+    ) -> AgentResult<()> {
+        if self.session_id != Some(session_id)
+            || self.capability != Some(SessionCapability::ConsoleControl)
+        {
+            return Err(AgentError::Relay(
+                "console input does not match an active control session".to_string(),
+            ));
+        }
+        if !matches!(self.policy, ConsentPolicy::UnattendedConsole { .. }) {
+            return Err(AgentError::Relay(
+                "console input is unavailable for this host".to_string(),
+            ));
+        }
+        // The relay may supply arbitrary ciphertext. Bound it before decoding;
+        // do not log either ciphertext or the decrypted input event.
+        if payload.len() > 8 * 1024 {
+            return Err(AgentError::Relay(
+                "console input exceeds size limit".to_string(),
+            ));
+        }
+        let channel = self.channel.as_ref().ok_or_else(|| {
+            AgentError::Relay("console input arrived before key exchange".to_string())
+        })?;
+        let sealed = base64::engine::general_purpose::STANDARD
+            .decode(payload)
+            .map_err(|error| AgentError::Base64(error.to_string()))?;
+        let plaintext = channel
+            .open(&sealed)
+            .map_err(|error| AgentError::Relay(format!("console input decrypt failed: {error}")))?;
+        let event: ConsoleInputPacket = serde_json::from_slice(&plaintext)?;
+        validate_console_input(&event)?;
+        let sink = self
+            .input_sink
+            .as_mut()
+            .ok_or_else(|| AgentError::Relay("console input sink is unavailable".to_string()))?;
+        sink.inject(event).await
     }
 
     fn key_exchange_frame(
@@ -281,15 +449,49 @@ impl ScreenshotHost {
     }
 }
 
+fn validate_console_input(event: &ConsoleInputPacket) -> AgentResult<()> {
+    if let ConsoleInputPacket::Key { code, .. } = event {
+        if code.is_empty()
+            || code.len() > 64
+            || !code
+                .bytes()
+                .all(|byte| byte.is_ascii_alphanumeric() || byte == b'-')
+        {
+            return Err(AgentError::Relay("invalid console key code".to_string()));
+        }
+    }
+    Ok(())
+}
+
+fn capture_limits(policy: ConsentPolicy) -> Option<(Duration, usize)> {
+    match policy {
+        ConsentPolicy::HeadlessTrustedOnly {
+            min_capture_interval,
+            max_capture_bytes,
+            ..
+        }
+        | ConsentPolicy::UnattendedConsole {
+            min_capture_interval,
+            max_capture_bytes,
+            ..
+        } => Some((min_capture_interval, max_capture_bytes)),
+        ConsentPolicy::Prompt => None,
+    }
+}
+
 #[async_trait]
 impl HostHandler for ScreenshotHost {
     async fn handle(&mut self, packet: SignalPacket) -> AgentResult<Vec<String>> {
         match packet {
             SignalPacket::SessionRequest {
                 client_public_key,
+                requested_capability,
                 session_id,
                 ..
-            } => self.on_session_request(client_public_key, session_id).await,
+            } => {
+                self.on_session_request(client_public_key, requested_capability, session_id)
+                    .await
+            },
             SignalPacket::SessionKeyExchange {
                 ephemeral_public_key,
                 identity_public_key,
@@ -312,6 +514,17 @@ impl HostHandler for ScreenshotHost {
                         )?])
                     },
                 }
+            },
+            SignalPacket::ConsoleInput {
+                session_id,
+                payload,
+            } => {
+                if let Err(error) = self.on_console_input(session_id, payload).await {
+                    // Keystrokes may be an Ubuntu password. Never log their
+                    // ciphertext, plaintext, key code, or pointer coordinates.
+                    tracing::warn!(session = %session_id, error = %error, "console input rejected safely");
+                }
+                Ok(Vec::new())
             },
             SignalPacket::SessionClosed { .. } => {
                 tracing::info!("session closed by client");
@@ -409,6 +622,17 @@ fn decode_64(b64: &str) -> AgentResult<[u8; 64]> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::sync::{Arc, Mutex};
+
+    struct RecordingInputSink(Arc<Mutex<Vec<ConsoleInputPacket>>>);
+
+    #[async_trait]
+    impl ConsoleInputSink for RecordingInputSink {
+        async fn inject(&mut self, event: ConsoleInputPacket) -> AgentResult<()> {
+            self.0.lock().unwrap().push(event);
+            Ok(())
+        }
+    }
 
     fn host(policy: ConsentPolicy) -> ScreenshotHost {
         let mut seed = [9u8; 32];
@@ -430,6 +654,7 @@ mod tests {
                     name: "test viewer".to_string(),
                     can_view: true,
                     can_control: false,
+                    can_unattended_console: false,
                 },
             )
             .unwrap();
@@ -488,10 +713,64 @@ mod tests {
                     name: "restricted".to_string(),
                     can_view: false,
                     can_control: false,
+                    can_unattended_console: false,
                 },
             )
             .unwrap();
         assert!(!h.consent("KNOWN").await.unwrap());
+    }
+
+    #[tokio::test]
+    async fn physical_console_requires_its_own_owner_opt_in() {
+        let mut h = host(ConsentPolicy::UnattendedConsole {
+            min_capture_interval: Duration::from_secs(1),
+            capture_timeout: Duration::from_secs(1),
+            max_capture_bytes: 1024,
+        });
+        h.trusted
+            .trust(
+                "KNOWN",
+                TrustedEntry {
+                    name: "ordinary viewer".to_string(),
+                    can_view: true,
+                    can_control: true,
+                    can_unattended_console: false,
+                },
+            )
+            .unwrap();
+        assert!(!h.consent("KNOWN").await.unwrap());
+
+        h.trusted
+            .trust(
+                "KNOWN",
+                TrustedEntry {
+                    name: "owner laptop".to_string(),
+                    can_view: true,
+                    can_control: true,
+                    can_unattended_console: true,
+                },
+            )
+            .unwrap();
+        assert!(h.consent("KNOWN").await.unwrap());
+    }
+
+    #[test]
+    fn console_input_validation_rejects_non_keycode_data() {
+        assert!(validate_console_input(&ConsoleInputPacket::Key {
+            code: "Enter".to_string(),
+            down: true,
+        })
+        .is_ok());
+        assert!(validate_console_input(&ConsoleInputPacket::Key {
+            code: "password with spaces".to_string(),
+            down: true,
+        })
+        .is_err());
+        assert!(validate_console_input(&ConsoleInputPacket::Key {
+            code: "x".repeat(65),
+            down: true,
+        })
+        .is_err());
     }
 
     #[tokio::test]
@@ -502,7 +781,11 @@ mod tests {
             max_capture_bytes: 1024,
         });
         let out = h
-            .on_session_request("not-base64-!!".to_string(), Some(SessionId::new()))
+            .on_session_request(
+                "not-base64-!!".to_string(),
+                SessionCapability::Screenshot,
+                Some(SessionId::new()),
+            )
             .await
             .unwrap();
         assert_eq!(out.len(), 1);
@@ -524,7 +807,11 @@ mod tests {
         trust_viewer(&mut h, &client_b64);
 
         let out = h
-            .on_session_request(client_b64, Some(SessionId::new()))
+            .on_session_request(
+                client_b64,
+                SessionCapability::Screenshot,
+                Some(SessionId::new()),
+            )
             .await
             .unwrap();
         assert_eq!(out.len(), 2);
@@ -532,6 +819,94 @@ mod tests {
         let kex: SignalPacket = serde_json::from_str(&out[1]).unwrap();
         assert!(matches!(accept, SignalPacket::SessionAccepted { .. }));
         assert!(matches!(kex, SignalPacket::SessionKeyExchange { .. }));
+    }
+
+    #[tokio::test]
+    async fn screenshot_host_rejects_console_control_even_for_a_trusted_client() {
+        let mut h = host(ConsentPolicy::HeadlessTrustedOnly {
+            min_capture_interval: Duration::from_secs(1),
+            capture_timeout: Duration::from_secs(1),
+            max_capture_bytes: 1024,
+        });
+        let client = SigningKey::from_bytes(&[6u8; 32]);
+        let client_b64 =
+            base64::engine::general_purpose::STANDARD.encode(client.verifying_key().as_bytes());
+        trust_viewer(&mut h, &client_b64);
+
+        let out = h
+            .on_session_request(
+                client_b64,
+                SessionCapability::ConsoleControl,
+                Some(SessionId::new()),
+            )
+            .await
+            .unwrap();
+        let packet: SignalPacket = serde_json::from_str(&out[0]).unwrap();
+        assert!(matches!(packet, SignalPacket::SessionRejected { .. }));
+        assert!(h.session_id.is_none());
+    }
+
+    #[tokio::test]
+    async fn encrypted_console_input_reaches_only_an_authorized_physical_sink() {
+        let client = SigningKey::from_bytes(&[8u8; 32]);
+        let client_b64 =
+            base64::engine::general_purpose::STANDARD.encode(client.verifying_key().as_bytes());
+        let received = Arc::new(Mutex::new(Vec::new()));
+        let mut h = host(ConsentPolicy::UnattendedConsole {
+            min_capture_interval: Duration::ZERO,
+            capture_timeout: Duration::from_secs(1),
+            max_capture_bytes: 1024,
+        })
+        .with_console_input_sink(Box::new(RecordingInputSink(received.clone())));
+        h.trusted
+            .trust(
+                &client_b64,
+                TrustedEntry {
+                    name: "owner".to_string(),
+                    can_view: true,
+                    can_control: true,
+                    can_unattended_console: true,
+                },
+            )
+            .unwrap();
+        let session_id = SessionId::new();
+        let frames = h
+            .on_session_request(
+                client_b64.clone(),
+                SessionCapability::ConsoleControl,
+                Some(session_id),
+            )
+            .await
+            .unwrap();
+        let SignalPacket::SessionKeyExchange {
+            ephemeral_public_key,
+            ..
+        } = serde_json::from_str(&frames[1]).unwrap()
+        else {
+            panic!("host did not send a key exchange");
+        };
+        let client_kex = handshake::start(&client);
+        h.on_key_exchange(
+            &base64::engine::general_purpose::STANDARD.encode(client_kex.ephemeral_public()),
+            &client_b64,
+            &base64::engine::general_purpose::STANDARD.encode(client_kex.signature()),
+        )
+        .unwrap();
+        let channel = client_kex.into_channel(&decode_32(&ephemeral_public_key).unwrap());
+        let encoded_event = serde_json::to_vec(&ConsoleInputPacket::Key {
+            code: "Enter".to_string(),
+            down: true,
+        })
+        .unwrap();
+        let ciphertext =
+            base64::engine::general_purpose::STANDARD.encode(channel.seal(&encoded_event).unwrap());
+        h.on_console_input(session_id, ciphertext).await.unwrap();
+        let received = received.lock().unwrap();
+        assert_eq!(received.len(), 1);
+        assert!(matches!(
+            &received[0],
+            ConsoleInputPacket::Key { code, down: true } if code == "Enter"
+        ));
     }
 
     #[tokio::test]
@@ -547,7 +922,7 @@ mod tests {
         trust_viewer(&mut h, &client_b64);
         let sid = SessionId::new();
         let host_frames = h
-            .on_session_request(client_b64.clone(), Some(sid))
+            .on_session_request(client_b64.clone(), SessionCapability::Screenshot, Some(sid))
             .await
             .unwrap();
         let host_kex: SignalPacket = serde_json::from_str(&host_frames[1]).unwrap();

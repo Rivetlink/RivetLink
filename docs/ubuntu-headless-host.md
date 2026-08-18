@@ -1,4 +1,9 @@
-# Ubuntu Desktop headless screenshot host
+# Deprecated: Ubuntu virtual-monitor screenshot host
+
+> This document describes the old `gnome-shell --headless --virtual-monitor`
+> deployment. It creates a separate desktop and **cannot** capture the real
+> GDM/HDMI console. Do not use it for an unattended Home Node; use
+> [the physical-console broker](ubuntu-physical-console-broker.md) instead.
 
 This guide installs the first RivetLink Linux Host phase: a non-root,
 reboot-persistent Ubuntu Desktop host that serves **only on-demand encrypted

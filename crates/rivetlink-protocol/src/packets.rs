@@ -3,6 +3,44 @@
 use rivetlink_core::{DeviceId, SessionId, SessionRole};
 use serde::{Deserialize, Serialize};
 
+/// The graphical-console state a Linux host reports to an authenticated
+/// RivetLink client. These states describe the *physical* console on seat0;
+/// they never imply that RivetLink knows an Ubuntu account password.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum HostConsoleState {
+    /// The boot-time broker is up but the display manager is not ready yet.
+    Booting,
+    /// GDM owns the physical console and can be controlled by a trusted client.
+    GdmLogin,
+    /// GDM accepted credentials and is replacing the greeter with a desktop.
+    SessionStarting,
+    /// A normal graphical user session owns the physical console.
+    DesktopReady,
+    /// The graphical user session owns the console but is locked.
+    SessionLocked,
+    /// The console owner is changing (logout, user switch, or display restart).
+    SessionSwitching,
+    /// The host is intentionally not able to serve the physical console.
+    Offline,
+}
+
+/// Privileged capability requested when opening a session.
+///
+/// The default deliberately remains screenshot-only so clients built before
+/// console support can never acquire pre-login input merely by upgrading the
+/// host or relay. A host must make a second, local authorization decision for
+/// [`ConsoleControl`](Self::ConsoleControl).
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum SessionCapability {
+    /// One or more encrypted on-demand captures, without remote input.
+    #[default]
+    Screenshot,
+    /// View and input for the physical Linux console, including GDM.
+    ConsoleControl,
+}
+
 /// Session signaling packet for establishing and maintaining connections.
 ///
 /// Handles session lifecycle, authentication, and peer discovery.
@@ -18,6 +56,10 @@ pub enum SignalPacket {
     SessionRequest {
         device_id: DeviceId,
         client_public_key: String,
+        /// Kept optional on the wire for compatibility with screenshot-only
+        /// clients. Missing means `Screenshot`, never `ConsoleControl`.
+        #[serde(default)]
+        requested_capability: SessionCapability,
         #[serde(default)]
         session_id: Option<SessionId>,
     },
@@ -79,6 +121,23 @@ pub enum SignalPacket {
         /// Base64 of the sealed chunk bytes.
         payload: String,
     },
+    /// Host → client: non-sensitive physical-console lifecycle state. It is
+    /// session-bound so the relay forwards it only to the already authenticated
+    /// controller; it contains no display pixels, credentials, or key material.
+    HostConsoleState {
+        session_id: SessionId,
+        state: HostConsoleState,
+        /// Increments whenever console ownership changes (for example GDM →
+        /// GNOME). A client discards frames from an earlier generation.
+        generation: u64,
+    },
+    /// Controller → host: a sealed, session-bound physical-console input event.
+    /// `payload` is a `SealedChannel` ciphertext; the relay cannot inspect
+    /// keystrokes or infer an Ubuntu password from it.
+    ConsoleInput {
+        session_id: SessionId,
+        payload: String,
+    },
     /// Keepalive signal to maintain connection.
     Heartbeat,
     /// Notification that session has been closed.
@@ -100,6 +159,18 @@ pub enum InputPacket {
     KeyboardInput { scan_code: u32, state: ButtonState },
     /// Clipboard content synchronization.
     ClipboardSync { content: String },
+}
+
+/// The deliberately small input vocabulary accepted for the physical console.
+/// Clipboard and text-paste are excluded so the broker never becomes a generic
+/// data-transfer channel; password entry remains ordinary key events in GDM.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(tag = "type", rename_all = "snake_case")]
+pub enum ConsoleInputPacket {
+    PointerMove { x: u16, y: u16 },
+    PointerButton { button: MouseButton, down: bool },
+    Scroll { dx: i16, dy: i16 },
+    Key { code: String, down: bool },
 }
 
 /// Mouse button identifier.
@@ -141,6 +212,7 @@ mod tests {
         let packet = SignalPacket::SessionRequest {
             device_id: DeviceId::new(),
             client_public_key: "test_key".to_string(),
+            requested_capability: SessionCapability::Screenshot,
             session_id: None,
         };
         let json = serde_json::to_string(&packet).unwrap();
@@ -167,10 +239,7 @@ mod tests {
         let json = serde_json::to_string(&packet).unwrap();
         assert!(json.contains("SESSION_KEY_EXCHANGE"));
         let parsed: SignalPacket = serde_json::from_str(&json).unwrap();
-        assert!(matches!(
-            parsed,
-            SignalPacket::SessionKeyExchange { .. }
-        ));
+        assert!(matches!(parsed, SignalPacket::SessionKeyExchange { .. }));
     }
 
     #[test]
@@ -209,5 +278,52 @@ mod tests {
             },
             other => panic!("wrong variant: {other:?}"),
         }
+    }
+
+    #[test]
+    fn console_state_roundtrip() {
+        let packet = SignalPacket::HostConsoleState {
+            session_id: SessionId::new(),
+            state: HostConsoleState::GdmLogin,
+            generation: 7,
+        };
+        let json = serde_json::to_string(&packet).unwrap();
+        assert!(json.contains("HOST_CONSOLE_STATE"));
+        assert!(json.contains("gdm_login"));
+        let parsed: SignalPacket = serde_json::from_str(&json).unwrap();
+        assert!(matches!(
+            parsed,
+            SignalPacket::HostConsoleState {
+                state: HostConsoleState::GdmLogin,
+                generation: 7,
+                ..
+            }
+        ));
+    }
+
+    #[test]
+    fn old_session_request_defaults_to_screenshot_capability() {
+        let parsed: SignalPacket = serde_json::from_str(
+            r#"{"type":"SESSION_REQUEST","device_id":"00000000-0000-0000-0000-000000000001","client_public_key":"test"}"#,
+        )
+        .unwrap();
+        assert!(matches!(
+            parsed,
+            SignalPacket::SessionRequest {
+                requested_capability: SessionCapability::Screenshot,
+                ..
+            }
+        ));
+    }
+
+    #[test]
+    fn console_input_is_a_separate_sealed_signal() {
+        let packet = SignalPacket::ConsoleInput {
+            session_id: SessionId::new(),
+            payload: "ciphertext-only".to_string(),
+        };
+        let json = serde_json::to_string(&packet).unwrap();
+        assert!(json.contains("CONSOLE_INPUT"));
+        assert!(!json.contains("KeyA"));
     }
 }

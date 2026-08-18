@@ -42,10 +42,11 @@ pub async fn capture_png() -> AgentResult<Vec<u8>> {
         .map_err(|e| AgentError::Config(format!("capture task join error: {e}")))?
 }
 
-/// Capture the dedicated virtual GNOME monitor used by the headless service.
-/// This deliberately does not fall back to X11 command-line tools: a headless
-/// host must either capture its configured Mutter virtual monitor or fail
-/// closed with a useful error.
+/// Capture the active monitor in the current GNOME/Mutter session.
+///
+/// This deliberately does not fall back to X11 command-line tools: an
+/// unattended GDM/desktop worker must capture the session that owns the real
+/// HDMI-backed console or fail closed with a useful error.
 pub async fn capture_headless_png(timeout: Duration) -> AgentResult<Vec<u8>> {
     if let Some(size) = fake_capture_size() {
         return Ok(synthetic_blob(size));
@@ -55,14 +56,14 @@ pub async fn capture_headless_png(timeout: Duration) -> AgentResult<Vec<u8>> {
     {
         tokio::task::spawn_blocking(move || super::mutter::capture_png(timeout))
             .await
-            .map_err(|e| AgentError::Config(format!("headless capture task join error: {e}")))?
+            .map_err(|e| AgentError::Config(format!("Mutter capture task join error: {e}")))?
     }
 
     #[cfg(not(target_os = "linux"))]
     {
         let _ = timeout;
         Err(AgentError::Config(
-            "headless capture is currently supported on Ubuntu GNOME only".to_string(),
+            "Mutter capture is currently supported on Ubuntu GNOME only".to_string(),
         ))
     }
 }

@@ -59,7 +59,10 @@ mod tests {
 
     fn tmp(name: &str) -> PathBuf {
         let mut p = std::env::temp_dir();
-        p.push(format!("rivet-sdk-cfg-{}-{name}.json", uuid::Uuid::now_v7().simple()));
+        p.push(format!(
+            "rivet-sdk-cfg-{}-{name}.json",
+            uuid::Uuid::now_v7().simple()
+        ));
         p
     }
 

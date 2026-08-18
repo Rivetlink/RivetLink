@@ -22,6 +22,12 @@ pub struct TrustedEntry {
     pub can_view: bool,
     /// May send input (control). Not used by the screenshot MVP.
     pub can_control: bool,
+    /// Explicit local owner opt-in for unattended access to the physical
+    /// console (including the GDM login screen). This is intentionally false
+    /// for older trust records and must never be inferred from `can_view` or
+    /// `can_control` alone.
+    #[serde(default)]
+    pub can_unattended_console: bool,
 }
 
 /// File-backed map of trusted client identity keys (base64) → entry.
@@ -85,6 +91,23 @@ impl TrustedClients {
         self.entries.is_empty()
     }
 
+    /// Whether this key has every permission needed for unattended physical
+    /// console access. Keeping this check at the trust-store boundary makes it
+    /// harder for a future broker or session worker to accidentally treat a
+    /// normal trusted viewer as a pre-login controller.
+    pub fn may_control_unattended_console(&self, public_key_b64: &str) -> bool {
+        self.get(public_key_b64).is_some_and(|entry| {
+            entry.can_view && entry.can_control && entry.can_unattended_console
+        })
+    }
+
+    /// Whether this key may view an unattended physical console. Input remains
+    /// separately gated by [`Self::may_control_unattended_console`].
+    pub fn may_view_unattended_console(&self, public_key_b64: &str) -> bool {
+        self.get(public_key_b64)
+            .is_some_and(|entry| entry.can_view && entry.can_unattended_console)
+    }
+
     fn save(&self) -> AgentResult<()> {
         let stored = StoredFile {
             clients: self.entries.clone(),
@@ -115,6 +138,7 @@ mod tests {
             name: "laptop".to_string(),
             can_view: true,
             can_control: false,
+            can_unattended_console: false,
         }
     }
 
@@ -156,6 +180,57 @@ mod tests {
         store.trust("K", entry()).unwrap();
         store.revoke("K").unwrap();
         assert!(!store.is_trusted("K"));
+        let _ = std::fs::remove_file(&path);
+    }
+
+    #[test]
+    fn unattended_console_requires_explicit_owner_opt_in() {
+        let path = tmp("unattended-console");
+        let mut store = TrustedClients::load_or_empty(&path).unwrap();
+        store
+            .trust(
+                "K",
+                TrustedEntry {
+                    name: "laptop".to_string(),
+                    can_view: true,
+                    can_control: true,
+                    can_unattended_console: false,
+                },
+            )
+            .unwrap();
+        assert!(!store.may_control_unattended_console("K"));
+        assert!(!store.may_view_unattended_console("K"));
+        assert!(!store.may_control_unattended_console("UNKNOWN"));
+
+        store
+            .trust(
+                "K",
+                TrustedEntry {
+                    can_unattended_console: true,
+                    ..entry()
+                },
+            )
+            .unwrap();
+        // `entry()` intentionally lacks normal control permission too.
+        assert!(!store.may_control_unattended_console("K"));
+        assert!(store.may_view_unattended_console("K"));
+
+        store
+            .trust(
+                "K",
+                TrustedEntry {
+                    name: "laptop".to_string(),
+                    can_view: true,
+                    can_control: true,
+                    can_unattended_console: true,
+                },
+            )
+            .unwrap();
+        assert!(store.may_control_unattended_console("K"));
+        assert!(store.may_view_unattended_console("K"));
+        store.revoke("K").unwrap();
+        assert!(!store.may_control_unattended_console("K"));
+        assert!(!store.may_view_unattended_console("K"));
         let _ = std::fs::remove_file(&path);
     }
 }

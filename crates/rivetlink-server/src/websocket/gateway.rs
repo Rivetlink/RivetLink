@@ -228,8 +228,8 @@ async fn authenticate_device(
         .map_err(|e| format!("send DEVICE_CHALLENGE failed: {e}"))?;
 
     let text = read_text(stream).await?;
-    let followup: WsDeviceFollowup = serde_json::from_str(&text)
-        .map_err(|e| format!("invalid DEVICE_AUTH frame: {e}"))?;
+    let followup: WsDeviceFollowup =
+        serde_json::from_str(&text).map_err(|e| format!("invalid DEVICE_AUTH frame: {e}"))?;
     let WsDeviceFollowup::DeviceAuth { signature } = followup;
 
     let sig_bytes = base64::engine::general_purpose::STANDARD
@@ -301,7 +301,8 @@ mod tests {
         let mut bytes = [0u8; 32];
         OsRng.fill_bytes(&mut bytes);
         let sk = ed25519_dalek::SigningKey::from_bytes(&bytes);
-        let pk_b64 = base64::engine::general_purpose::STANDARD.encode(sk.verifying_key().as_bytes());
+        let pk_b64 =
+            base64::engine::general_purpose::STANDARD.encode(sk.verifying_key().as_bytes());
         let decoded = parse_public_key(&pk_b64).expect("must parse");
         assert_eq!(decoded.as_bytes(), sk.verifying_key().as_bytes());
     }

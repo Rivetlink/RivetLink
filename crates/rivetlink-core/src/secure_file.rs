@@ -64,7 +64,10 @@ mod tests {
 
     fn tmp(name: &str) -> std::path::PathBuf {
         let mut p = std::env::temp_dir();
-        p.push(format!("rivet-secure-{}-{name}", uuid::Uuid::now_v7().simple()));
+        p.push(format!(
+            "rivet-secure-{}-{name}",
+            uuid::Uuid::now_v7().simple()
+        ));
         p
     }
 

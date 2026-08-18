@@ -32,6 +32,7 @@ use crate::error::{SdkError, SdkResult};
 use crate::identity::Identity;
 use crate::rest::{self, Device};
 use crate::session::{self, CaptureParams};
+use rivetlink_protocol::{ConsoleInputPacket, SessionCapability};
 
 /// A support client bound to one identity and one relay.
 ///
@@ -135,6 +136,79 @@ impl RivetClient {
             device_id,
             host_public_key_b64: &device.public_key,
             output_path,
+            requested_capability: SessionCapability::Screenshot,
+            console_input: None,
+        })
+        .await
+        .map(|outcome| outcome.path)
+    }
+
+    /// As [`Self::capture_screenshot`], retaining the authenticated host
+    /// lifecycle state for a remote-console UI.
+    pub async fn capture_screenshot_outcome(
+        &self,
+        device: &Device,
+        output_path: PathBuf,
+    ) -> SdkResult<session::CaptureOutcome> {
+        let device_id = uuid::Uuid::parse_str(&device.id)
+            .map_err(|e| SdkError::Config(format!("invalid device id: {e}")))?;
+        session::capture_screenshot(CaptureParams {
+            relay_ws_url: &self.config.relay_ws_url,
+            token: self.token()?,
+            identity: &self.identity,
+            device_id,
+            host_public_key_b64: &device.public_key,
+            output_path,
+            requested_capability: SessionCapability::Screenshot,
+            console_input: None,
+        })
+        .await
+    }
+
+    /// Send one normalized physical-console event through the E2E channel,
+    /// then capture the resulting screen. This is intentionally stateless: a
+    /// reboot closes the operation and a caller explicitly reconnects.
+    pub async fn console_input_and_capture(
+        &self,
+        device: &Device,
+        event: ConsoleInputPacket,
+        output_path: PathBuf,
+    ) -> SdkResult<PathBuf> {
+        let device_id = uuid::Uuid::parse_str(&device.id)
+            .map_err(|e| SdkError::Config(format!("invalid device id: {e}")))?;
+        session::capture_screenshot(CaptureParams {
+            relay_ws_url: &self.config.relay_ws_url,
+            token: self.token()?,
+            identity: &self.identity,
+            device_id,
+            host_public_key_b64: &device.public_key,
+            output_path,
+            requested_capability: SessionCapability::ConsoleControl,
+            console_input: Some(event),
+        })
+        .await
+        .map(|outcome| outcome.path)
+    }
+
+    /// As [`Self::console_input_and_capture`], but preserves the host's
+    /// authenticated physical-console state for UI lifecycle reporting.
+    pub async fn console_input_and_capture_outcome(
+        &self,
+        device: &Device,
+        event: ConsoleInputPacket,
+        output_path: PathBuf,
+    ) -> SdkResult<session::CaptureOutcome> {
+        let device_id = uuid::Uuid::parse_str(&device.id)
+            .map_err(|e| SdkError::Config(format!("invalid device id: {e}")))?;
+        session::capture_screenshot(CaptureParams {
+            relay_ws_url: &self.config.relay_ws_url,
+            token: self.token()?,
+            identity: &self.identity,
+            device_id,
+            host_public_key_b64: &device.public_key,
+            output_path,
+            requested_capability: SessionCapability::ConsoleControl,
+            console_input: Some(event),
         })
         .await
     }

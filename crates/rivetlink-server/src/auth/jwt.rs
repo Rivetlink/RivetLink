@@ -263,16 +263,8 @@ mod tests {
         let user_id = Uuid::now_v7();
         let org_id = Uuid::now_v7();
         let family = Uuid::now_v7();
-        let pair = create_token_pair(
-            user_id,
-            org_id,
-            vec![],
-            family,
-            TEST_SECRET,
-            -300,
-            -300,
-        )
-        .unwrap();
+        let pair =
+            create_token_pair(user_id, org_id, vec![], family, TEST_SECRET, -300, -300).unwrap();
 
         let result = decode_access_token(&pair.access_token, TEST_SECRET);
         assert!(matches!(result, Err(ServerError::TokenExpired)));

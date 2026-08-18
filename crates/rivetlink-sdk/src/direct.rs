@@ -40,7 +40,11 @@ enum Wire {
     /// SPAKE2 message (password mode).
     Pake { msg: String },
     /// Signed ephemeral key exchange (key mode).
-    Kex { eph: String, id: String, sig: String },
+    Kex {
+        eph: String,
+        id: String,
+        sig: String,
+    },
     /// Sealed confirmation token.
     Confirm { sealed: String },
 }
@@ -68,7 +72,8 @@ async fn read_msg<R: AsyncRead + Unpin>(r: &mut R) -> SdkResult<Wire> {
 }
 
 fn decode(b64: &str) -> SdkResult<Vec<u8>> {
-    B64.decode(b64.trim()).map_err(|e| SdkError::Base64(e.to_string()))
+    B64.decode(b64.trim())
+        .map_err(|e| SdkError::Base64(e.to_string()))
 }
 
 /// Short, log-safe prefix of a base64 key (identity keys aren't secret, but the
@@ -94,7 +99,9 @@ fn seal_token(ch: &SealedChannel) -> SdkResult<Wire> {
     let sealed = ch
         .seal(CONFIRM_TOKEN)
         .map_err(|e| SdkError::Crypto(e.to_string()))?;
-    Ok(Wire::Confirm { sealed: B64.encode(sealed) })
+    Ok(Wire::Confirm {
+        sealed: B64.encode(sealed),
+    })
 }
 
 fn open_token(ch: &SealedChannel, msg: Wire) -> SdkResult<()> {
@@ -119,7 +126,13 @@ where
 {
     tracing::debug!("handshake[pake/client]: start, sending pake");
     let started = pake::start(password.as_bytes());
-    write_msg(stream, &Wire::Pake { msg: B64.encode(&started.message) }).await?;
+    write_msg(
+        stream,
+        &Wire::Pake {
+            msg: B64.encode(&started.message),
+        },
+    )
+    .await?;
 
     let Wire::Pake { msg } = read_msg(stream).await? else {
         tracing::warn!("handshake[pake/client]: expected pake, got other message");
@@ -164,7 +177,13 @@ where
     let peer_msg = decode(peer_msg_b64)?;
 
     let started = pake::start(password.as_bytes());
-    write_msg(stream, &Wire::Pake { msg: B64.encode(&started.message) }).await?;
+    write_msg(
+        stream,
+        &Wire::Pake {
+            msg: B64.encode(&started.message),
+        },
+    )
+    .await?;
     let channel = started
         .handshake
         .finish(&peer_msg)
@@ -324,7 +343,9 @@ where
         },
         Wire::Confirm { .. } => {
             tracing::warn!("handshake[auto/host]: unexpected confirmation as first message");
-            Err(SdkError::Crypto("unexpected confirmation as first message".to_string()))
+            Err(SdkError::Crypto(
+                "unexpected confirmation as first message".to_string(),
+            ))
         },
     }
 }
@@ -335,7 +356,10 @@ mod tests {
 
     fn temp_identity(tag: &str) -> Identity {
         let mut p = std::env::temp_dir();
-        p.push(format!("rivet-direct-{}-{tag}.json", uuid::Uuid::now_v7().simple()));
+        p.push(format!(
+            "rivet-direct-{}-{tag}.json",
+            uuid::Uuid::now_v7().simple()
+        ));
         let id = Identity::load_or_create(&p).unwrap();
         let _ = std::fs::remove_file(&p);
         id
@@ -372,9 +396,7 @@ mod tests {
         let client_pub = client_id.public_key_b64();
 
         let (mut c, mut h) = pipe();
-        let host = tokio::spawn(async move {
-            host_accept_key(&mut h, &host_id, |_| true).await
-        });
+        let host = tokio::spawn(async move { host_accept_key(&mut h, &host_id, |_| true).await });
         let client_ch = client_connect_key(&mut c, &client_id, None).await.unwrap();
         let (host_ch, seen) = host.await.unwrap().unwrap();
 
@@ -389,9 +411,7 @@ mod tests {
         let host_id = temp_identity("h2");
 
         let (mut c, mut h) = pipe();
-        let host = tokio::spawn(async move {
-            host_accept_key(&mut h, &host_id, |_| false).await
-        });
+        let host = tokio::spawn(async move { host_accept_key(&mut h, &host_id, |_| false).await });
         // Host rejects, so the client's read of the host's Kex fails (EOF).
         let client = client_connect_key(&mut c, &client_id, None).await;
         assert!(host.await.unwrap().is_err());
@@ -402,9 +422,10 @@ mod tests {
     async fn auto_accepts_password_client() {
         let host_id = temp_identity("ha");
         let (mut c, mut h) = pipe();
-        let host = tokio::spawn(async move {
-            host_accept_auto(&mut h, &host_id, "4821", |_| false).await
-        });
+        let host =
+            tokio::spawn(
+                async move { host_accept_auto(&mut h, &host_id, "4821", |_| false).await },
+            );
         let client_ch = client_connect_password(&mut c, "4821").await.unwrap();
         let (host_ch, who) = host.await.unwrap().unwrap();
 
@@ -437,9 +458,10 @@ mod tests {
         let client_id = temp_identity("cc");
         let host_id = temp_identity("hc");
         let (mut c, mut h) = pipe();
-        let host = tokio::spawn(async move {
-            host_accept_auto(&mut h, &host_id, "4821", |_| false).await
-        });
+        let host =
+            tokio::spawn(
+                async move { host_accept_auto(&mut h, &host_id, "4821", |_| false).await },
+            );
         let client = client_connect_key(&mut c, &client_id, None).await;
         assert!(host.await.unwrap().is_err());
         assert!(client.is_err());

@@ -74,6 +74,16 @@ impl ConnectionMap {
         self.inner.get(user_id).map(|c| c.clone())
     }
 
+    /// Whether this exact principal currently has an authenticated device
+    /// websocket. A connected user with the same organisation is not evidence
+    /// that a Home Node is online.
+    #[must_use]
+    pub fn device_is_connected(&self, device_id: &Uuid) -> bool {
+        self.inner
+            .get(device_id)
+            .is_some_and(|client| client.kind == PrincipalKind::Device)
+    }
+
     /// Send message to connected client; returns false if send fails or client disconnected.
     pub fn send_to(&self, user_id: &Uuid, message: &str) -> bool {
         if let Some(client) = self.inner.get(user_id) {
@@ -175,5 +185,22 @@ mod tests {
         assert_eq!(user.kind, PrincipalKind::User);
         assert_eq!(device.kind, PrincipalKind::Device);
         assert_ne!(user.kind, device.kind);
+    }
+
+    #[test]
+    fn device_presence_does_not_confuse_a_user_with_a_device() {
+        let map = ConnectionMap::new();
+        let id = Uuid::now_v7();
+        let (tx, _rx) = mpsc::unbounded_channel();
+        map.insert(
+            id,
+            ConnectedClient {
+                user_id: id,
+                org_id: Uuid::now_v7(),
+                kind: PrincipalKind::User,
+                sender: tx,
+            },
+        );
+        assert!(!map.device_is_connected(&id));
     }
 }

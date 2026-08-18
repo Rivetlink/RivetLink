@@ -1,4 +1,8 @@
 #!/usr/bin/env bash
+# Deprecated alongside the virtual-monitor installer. The physical-console
+# setup retires existing virtual-monitor service units automatically.
+echo "This virtual-monitor uninstaller is retired; use the physical-console migration." >&2
+exit 2
 # Remove RivetLink's Ubuntu user services. Run as the same non-root user that
 # installed the host. `--purge` additionally deletes the device identity and
 # trusted-client store; without it those owner-only files are retained.

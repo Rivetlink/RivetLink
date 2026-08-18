@@ -127,22 +127,14 @@ client (trust on first use). Approve it once and the host remembers your key.
    HTTP — put them behind the same nginx, or keep them on the LAN until TLS
    client support lands.)
 
-## Ubuntu headless screenshot host
+## Ubuntu unattended physical console
 
-For a monitorless Ubuntu Desktop Home Node, the RivetLink AppImage offers an
-explicit **Settings → General → Headless Ubuntu-host** setup flow. It installs
-the required Ubuntu packages after owner approval and creates non-root user
-services. For devices on the same network, choose **Lokaal netwerk**: it needs
-no relay, server, or account and permits encrypted screenshots only from the
-pre-trusted app identity. For away-from-home use, choose **Via relay**; after
-signing in, the app uses its current authenticated session to register the Home
-Node without exposing or asking the user to paste a token. Normal app updates
-never run setup automatically. For unattended
-provisioning, use the dedicated non-root GNOME
-Wayland virtual-monitor host. It supports only the existing encrypted
-on-demand screenshot flow; it enables neither RDP nor remote control. See
-[the Ubuntu headless host guide](docs/ubuntu-headless-host.md) for installation,
-trusted-client setup, reboot recovery and troubleshooting.
+For an Ubuntu Desktop Home Node, use a permanent HDMI dummy/EDID emulator and
+the App's **Settings → Ubuntu physical console** installation flow. It installs
+a non-root system broker before login plus a narrow worker in GDM/GNOME's real
+seat0 session. The owner signs into the relay in the app; no registration token
+is copied to a script or service. It does not enable auto-login, RDP/VNC, shell
+or file access. See [the physical-console guide](docs/ubuntu-physical-console-broker.md).
 
 ## Development
 

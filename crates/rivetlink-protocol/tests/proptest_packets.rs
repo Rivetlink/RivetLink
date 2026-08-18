@@ -5,9 +5,9 @@
 
 #![allow(clippy::unwrap_used)] // proptest strategies are helper code, unwrap is fine
 
+use proptest::prelude::*;
 use rivetlink_core::{DeviceId, SessionId, SessionRole};
 use rivetlink_protocol::packets::{ButtonState, InputPacket, MouseButton, SignalPacket};
-use proptest::prelude::*;
 
 // ─── Strategies ──────────────────────────────────────────
 
@@ -69,6 +69,7 @@ fn any_signal_packet() -> impl Strategy<Value = SignalPacket> {
             SignalPacket::SessionRequest {
                 device_id,
                 client_public_key,
+                requested_capability: SessionCapability::Screenshot,
                 session_id: None,
             }
         }),

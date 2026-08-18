@@ -91,7 +91,10 @@ async fn devices(config_path: &Path, email: &str, password: &str) -> SdkResult<(
         return Ok(());
     }
 
-    println!("{:<38}  {:<20}  {:<10}  LAST SEEN", "DEVICE ID", "HOSTNAME", "PLATFORM");
+    println!(
+        "{:<38}  {:<20}  {:<10}  LAST SEEN",
+        "DEVICE ID", "HOSTNAME", "PLATFORM"
+    );
     for d in devices {
         println!(
             "{:<38}  {:<20}  {:<10}  {}",
