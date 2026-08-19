@@ -132,9 +132,11 @@ client (trust on first use). Approve it once and the host remembers your key.
 For an Ubuntu Desktop Home Node, use a permanent HDMI dummy/EDID emulator and
 the App's **Settings → Ubuntu physical console** installation flow. It installs
 a non-root system broker before login plus a narrow worker in GDM/GNOME's real
-seat0 session. The owner signs into the relay in the app; no registration token
-is copied to a script or service. It does not enable auto-login, RDP/VNC, shell
-or file access. See [the physical-console guide](docs/ubuntu-physical-console-broker.md).
+seat0 session. Choose direct authenticated **Local network**, **Via relay**, or
+both: LAN needs no server/account/internet; relay registration uses the current
+signed-in app session and never copies a token to a script or service. It does
+not enable auto-login, RDP/VNC, shell or file access. See [the physical-console
+guide](docs/ubuntu-physical-console-broker.md).
 
 ## Development
 

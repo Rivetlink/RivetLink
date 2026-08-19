@@ -187,7 +187,10 @@ pub async fn capture_screenshot(req: CaptureParams<'_>) -> SdkResult<CaptureOutc
                                 .await;
                     }
                     let _ = ws.close(None).await;
-                    return Ok(CaptureOutcome { path, console_state });
+                    return Ok(CaptureOutcome {
+                        path,
+                        console_state,
+                    });
                 }
             },
             SignalPacket::HostConsoleState {

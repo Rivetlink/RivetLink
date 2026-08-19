@@ -351,9 +351,14 @@ impl ScreenshotHost {
         let image = if let Some((min_capture_interval, max_capture_bytes)) =
             capture_limits(self.policy)
         {
-            if self
-                .last_capture
-                .is_some_and(|last| last.elapsed() < min_capture_interval)
+            // A console-control transaction carries one input event followed by
+            // a fresh frame. It is serialized by the session protocol and has
+            // the same timeout/size bounds; applying the screenshot-only
+            // throttle here would make normal password typing unusable.
+            if self.capability != Some(SessionCapability::ConsoleControl)
+                && self
+                    .last_capture
+                    .is_some_and(|last| last.elapsed() < min_capture_interval)
             {
                 tracing::warn!("unattended screenshot rejected: request rate limit");
                 return Err(AgentError::Relay(

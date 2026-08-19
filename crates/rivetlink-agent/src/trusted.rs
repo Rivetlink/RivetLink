@@ -86,6 +86,12 @@ impl TrustedClients {
         self.entries.len()
     }
 
+    /// The secure file containing this store. Used only to reload policy at a
+    /// sensitive input boundary; the path never leaves the host process.
+    pub fn path(&self) -> &Path {
+        &self.path
+    }
+
     /// True if no clients are trusted yet.
     pub fn is_empty(&self) -> bool {
         self.entries.is_empty()

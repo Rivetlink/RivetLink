@@ -50,6 +50,20 @@ pub enum Command {
             requires = "unattended_console"
         )]
         allow_trusted_unattended_console: bool,
+
+        /// Also expose the physical console over the authenticated direct LAN
+        /// transport. This never enables PIN/TOFU pairing.
+        #[arg(long)]
+        enable_lan: bool,
+
+        /// Do not enable the relay transport. Required for a LAN-only install
+        /// without relay credentials.
+        #[arg(long)]
+        disable_relay: bool,
+
+        /// TCP port for direct-LAN physical-console access.
+        #[arg(long, default_value_t = 47823)]
+        lan_port: u16,
     },
 
     /// Enroll this agent as a device on the relay.
@@ -83,6 +97,17 @@ pub enum Command {
     /// Print the already registered device id. This exposes no secret and is
     /// used by the desktop installer to repair an interrupted enrolment.
     DeviceId,
+
+    /// Set the explicit transport exposure of an existing physical-console
+    /// broker. This command changes no trust entries or relay registration.
+    ConfigureConsoleTransports {
+        #[arg(long)]
+        lan: bool,
+        #[arg(long)]
+        relay: bool,
+        #[arg(long, default_value_t = 47823)]
+        lan_port: u16,
+    },
 
     /// Locally pre-trust a support-client identity. Console input is impossible
     /// unless both explicit unattended flags are supplied; file, shell, and
@@ -145,23 +170,6 @@ pub enum Command {
         /// Unattended / testing only.
         #[arg(long)]
         auto_accept: bool,
-    },
-
-    /// Serve only on-demand screenshots from the dedicated GNOME virtual
-    /// monitor on the local network. This requires a pre-trusted client key;
-    /// it never enables PIN pairing, live video, or remote input.
-    LanHeadless {
-        /// TCP port to listen on (0 = pick a free port, announced via mDNS).
-        #[arg(long, default_value_t = 47823)]
-        port: u16,
-
-        /// Friendly name advertised on the network.
-        #[arg(long)]
-        device_name: String,
-
-        /// Keystore directory containing the host keys and trusted clients.
-        #[arg(long, default_value = "keys")]
-        keystore_path: PathBuf,
     },
 
     /// Run the narrow GDM/GNOME session worker for a system console broker.

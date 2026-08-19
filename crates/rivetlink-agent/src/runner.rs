@@ -7,7 +7,10 @@ use ed25519_dalek::SigningKey;
 use std::time::Duration;
 
 use crate::cli::{Cli, Command};
-use crate::config::{AgentConfig, UnattendedConsoleConfig};
+use crate::config::{
+    AgentConfig, ConsoleTransportConfig, LanConsoleTransportConfig, RelayConsoleTransportConfig,
+    UnattendedConsoleConfig,
+};
 use crate::error::{AgentError, AgentResult};
 use crate::keystore::file::FileKeyStore;
 use crate::keystore::{KeyStore, SigningKey as KsSigningKey};
@@ -15,7 +18,8 @@ use crate::lan::{self, LanAuth};
 use crate::registration;
 use crate::relay::RelayClient;
 use crate::session::{
-    ConsentPolicy, ConsoleInputSink, ConsoleStateProvider, LocalScreenshotCapturer, ScreenshotCapturer, ScreenshotHost,
+    ConsentPolicy, ConsoleInputSink, ConsoleStateProvider, LocalScreenshotCapturer,
+    ScreenshotCapturer, ScreenshotHost,
 };
 use crate::trusted::TrustedClients;
 
@@ -39,6 +43,9 @@ pub async fn run(cli: Cli) -> AgentResult<()> {
             keystore_path,
             unattended_console,
             allow_trusted_unattended_console,
+            enable_lan,
+            disable_relay,
+            lan_port,
         }) => {
             init(
                 &cli.config,
@@ -49,6 +56,9 @@ pub async fn run(cli: Cli) -> AgentResult<()> {
                     keystore_path,
                     unattended_console,
                     allow_trusted_unattended_console,
+                    enable_lan,
+                    disable_relay,
+                    lan_port,
                 },
             )
             .await
@@ -59,6 +69,11 @@ pub async fn run(cli: Cli) -> AgentResult<()> {
         Some(Command::PublicKey) => public_key(&cli.config).await,
         Some(Command::SetDeviceId { device_id }) => set_device_id(&cli.config, device_id),
         Some(Command::DeviceId) => device_id(&cli.config),
+        Some(Command::ConfigureConsoleTransports {
+            lan,
+            relay,
+            lan_port,
+        }) => configure_console_transports(&cli.config, lan, relay, lan_port),
         Some(Command::TrustClient {
             public_key,
             name,
@@ -81,11 +96,6 @@ pub async fn run(cli: Cli) -> AgentResult<()> {
             keystore_path,
             auto_accept,
         }) => lan(port, pin, device_name, keystore_path, auto_accept).await,
-        Some(Command::LanHeadless {
-            port,
-            device_name,
-            keystore_path,
-        }) => lan_headless(port, device_name, keystore_path).await,
         Some(Command::ConsoleWorker { socket }) => console_worker(&socket).await,
         Some(Command::ConsoleBroker {
             socket,
@@ -124,14 +134,7 @@ async fn console_broker(
         tracing::info!("console broker waiting for an authenticated graphical worker");
         let capturer = listener.into_pool();
         capturer.wait_until_ready().await?;
-        run_host_with_capturer(config_path, true, true, move || {
-            (
-                Box::new(capturer.clone()),
-                Some(Box::new(capturer.clone()) as Box<dyn ConsoleInputSink>),
-                Some(Box::new(capturer.clone()) as Box<dyn ConsoleStateProvider>),
-            )
-        })
-        .await
+        run_physical_console_broker(config_path, capturer).await
     }
     #[cfg(not(target_os = "linux"))]
     {
@@ -149,6 +152,9 @@ struct InitOptions {
     keystore_path: std::path::PathBuf,
     unattended_console: bool,
     allow_trusted_unattended_console: bool,
+    enable_lan: bool,
+    disable_relay: bool,
+    lan_port: u16,
 }
 
 async fn init(config_path: &std::path::Path, options: InitOptions) -> AgentResult<()> {
@@ -165,6 +171,16 @@ async fn init(config_path: &std::path::Path, options: InitOptions) -> AgentResul
             allow_trusted_clients: options.allow_trusted_unattended_console,
             ..UnattendedConsoleConfig::default()
         },
+        console_transports: ConsoleTransportConfig {
+            lan: LanConsoleTransportConfig {
+                enabled: options.enable_lan,
+                port: options.lan_port,
+                ..LanConsoleTransportConfig::default()
+            },
+            relay: RelayConsoleTransportConfig {
+                enabled: !options.disable_relay,
+            },
+        },
     };
     cfg.validate()?;
     cfg.save(config_path)?;
@@ -176,8 +192,16 @@ async fn init(config_path: &std::path::Path, options: InitOptions) -> AgentResul
     println!("Agent initialized.");
     println!("  config:     {}", config_path.display());
     println!("  device:     {}", cfg.device_name);
-    println!("  relay ws:   {}", cfg.relay_url);
-    println!("  relay http: {}", cfg.relay_http_url);
+    if cfg.console_transports.relay.enabled {
+        println!("  relay ws:   {}", cfg.relay_url);
+        println!("  relay http: {}", cfg.relay_http_url);
+    }
+    if cfg.console_transports.lan.enabled {
+        println!(
+            "  LAN:        {}:{}",
+            cfg.console_transports.lan.bind_address, cfg.console_transports.lan.port
+        );
+    }
     println!(
         "  signing pk: {}",
         base64::Engine::encode(&base64::engine::general_purpose::STANDARD, signing.public)
@@ -238,6 +262,25 @@ fn device_id(config_path: &std::path::Path) -> AgentResult<()> {
         .ok_or_else(|| AgentError::Config("device_id is not registered yet".to_string()))?;
     println!("{device_id}");
     Ok(())
+}
+
+fn configure_console_transports(
+    config_path: &std::path::Path,
+    lan: bool,
+    relay: bool,
+    lan_port: u16,
+) -> AgentResult<()> {
+    let mut cfg = AgentConfig::load(config_path)?;
+    if !lan && !relay {
+        return Err(AgentError::Config(
+            "select at least one console transport".to_string(),
+        ));
+    }
+    cfg.console_transports.lan.enabled = lan;
+    cfg.console_transports.lan.port = lan_port;
+    cfg.console_transports.relay.enabled = relay;
+    cfg.validate()?;
+    cfg.save(config_path)
 }
 
 fn trust_client(
@@ -394,6 +437,148 @@ where
     }
 }
 
+/// Start the single physical-console broker source through every explicitly
+/// configured transport. Capture, input, state and trust stay shared; LAN and
+/// relay differ only in how an authenticated session reaches this function.
+#[cfg(target_os = "linux")]
+async fn run_physical_console_broker(
+    config_path: &std::path::Path,
+    source: crate::console::broker::ConsoleWorkerPool,
+) -> AgentResult<()> {
+    let cfg = AgentConfig::load(config_path)?;
+    if !cfg.unattended_console.enabled || !cfg.unattended_console.allow_trusted_clients {
+        return Err(AgentError::Config(
+            "physical console requires local unattended_console.enabled and unattended_console.allow_trusted_clients".to_string(),
+        ));
+    }
+    let store = FileKeyStore::new(cfg.keystore_path.clone())?;
+    let signing = store.ensure_signing_key().await?;
+    let signing_key = ed25519_signing_key(&signing)?;
+    let _encryption = store.ensure_encryption_key().await?;
+    let trusted_path = cfg.keystore_path.join("trusted_clients.json");
+    let trusted = TrustedClients::load_or_empty(&trusted_path)?;
+    let policy = physical_console_policy(&cfg);
+
+    tracing::info!(
+        lan = cfg.console_transports.lan.enabled,
+        relay = cfg.console_transports.relay.enabled,
+        "physical-console broker started"
+    );
+    let mut transports = tokio::task::JoinSet::new();
+    if cfg.console_transports.lan.enabled {
+        transports.spawn(run_lan_physical_console(
+            signing_key.clone(),
+            cfg.device_name.clone(),
+            cfg.console_transports.lan.clone(),
+            trusted.clone(),
+            cfg.unattended_console.clone(),
+            source.clone(),
+        ));
+    }
+    if cfg.console_transports.relay.enabled {
+        let device_id = cfg.device_id.ok_or_else(|| {
+            AgentError::Config(
+                "device_id missing — register the relay transport before enabling it".to_string(),
+            )
+        })?;
+        transports.spawn(run_relay_physical_console(
+            cfg.clone(),
+            device_id,
+            signing_key,
+            trusted,
+            policy,
+            source,
+        ));
+    }
+    // Both transport supervisors are intentionally long-running and retry
+    // independently. One unavailable route must not make the other route or
+    // its trust policy disappear.
+    match transports.join_next().await {
+        Some(Ok(result)) => result,
+        Some(Err(error)) => Err(AgentError::Config(format!(
+            "physical-console transport crashed: {error}"
+        ))),
+        None => Err(AgentError::Config(
+            "no physical-console transport enabled".to_string(),
+        )),
+    }
+}
+
+#[cfg(target_os = "linux")]
+async fn run_lan_physical_console(
+    signing_key: SigningKey,
+    device_name: String,
+    transport: LanConsoleTransportConfig,
+    trusted: TrustedClients,
+    limits: UnattendedConsoleConfig,
+    source: crate::console::broker::ConsoleWorkerPool,
+) -> AgentResult<()> {
+    loop {
+        if let Err(error) = lan::serve_physical_console(
+            signing_key.clone(),
+            device_name.clone(),
+            transport.clone(),
+            trusted.clone(),
+            limits.clone(),
+            source.clone(),
+        )
+        .await
+        {
+            tracing::warn!(error = %error, "physical-console LAN listener failed; retrying");
+        }
+        tokio::time::sleep(Duration::from_secs(5)).await;
+    }
+}
+
+#[cfg(target_os = "linux")]
+fn physical_console_policy(cfg: &AgentConfig) -> ConsentPolicy {
+    ConsentPolicy::UnattendedConsole {
+        min_capture_interval: Duration::from_secs(cfg.unattended_console.min_capture_interval_secs),
+        capture_timeout: Duration::from_secs(cfg.unattended_console.capture_timeout_secs),
+        max_capture_bytes: cfg.unattended_console.max_capture_bytes,
+    }
+}
+
+#[cfg(target_os = "linux")]
+async fn run_relay_physical_console(
+    cfg: AgentConfig,
+    device_id: uuid::Uuid,
+    signing_key: SigningKey,
+    trusted: TrustedClients,
+    policy: ConsentPolicy,
+    source: crate::console::broker::ConsoleWorkerPool,
+) -> AgentResult<()> {
+    let mut failed_attempts = 0_u32;
+    loop {
+        match RelayClient::connect_device(
+            &cfg.relay_url,
+            device_id,
+            &signing_key,
+            Duration::from_secs(cfg.heartbeat_secs),
+        )
+        .await
+        {
+            Ok(client) => {
+                failed_attempts = 0;
+                tracing::info!("physical-console relay connected, waiting for trusted sessions");
+                let mut host = ScreenshotHost::new(signing_key.clone(), trusted.clone(), policy)
+                    .with_capturer(Box::new(source.clone()))
+                    .with_console_input_sink(Box::new(source.clone()))
+                    .with_console_state_provider(Box::new(source.clone()));
+                if let Err(error) = client.run_host(&mut host).await {
+                    tracing::warn!(error = %error, "physical-console relay session ended; reconnecting");
+                }
+            },
+            Err(error) => {
+                tracing::warn!(error = %error, "physical-console relay connection failed; retrying")
+            },
+        }
+        let delay = reconnect_delay(failed_attempts);
+        failed_attempts = failed_attempts.saturating_add(1);
+        tokio::time::sleep(delay).await;
+    }
+}
+
 /// Bounded exponential reconnect delay: 1, 2, 4, 8, 16, then 30 seconds.
 /// Keeping this deterministic makes the recovery behavior testable and avoids
 /// a tight reconnect loop when a relay is intentionally offline.
@@ -430,33 +615,6 @@ async fn lan(
         },
     };
     lan::serve(signing_key, device_name, port, auth).await
-}
-
-async fn lan_headless(
-    port: u16,
-    device_name: String,
-    keystore_path: std::path::PathBuf,
-) -> AgentResult<()> {
-    if device_name.trim().is_empty() || device_name.len() > 100 {
-        return Err(AgentError::Config(
-            "headless LAN device name must be between 1 and 100 characters".to_string(),
-        ));
-    }
-    let store = FileKeyStore::new(keystore_path.clone())?;
-    let signing = store.ensure_signing_key().await?;
-    let signing_key = ed25519_signing_key(&signing)?;
-    let trusted = TrustedClients::load_or_empty(&keystore_path.join("trusted_clients.json"))?;
-    if trusted.is_empty() {
-        return Err(AgentError::Config(
-            "headless LAN mode requires at least one locally pre-trusted client".to_string(),
-        ));
-    }
-    let limits = UnattendedConsoleConfig {
-        enabled: true,
-        allow_trusted_clients: true,
-        ..UnattendedConsoleConfig::default()
-    };
-    lan::serve_headless_screenshot_only(signing_key, device_name, port, trusted, limits).await
 }
 
 fn ed25519_signing_key(stored: &KsSigningKey) -> AgentResult<SigningKey> {

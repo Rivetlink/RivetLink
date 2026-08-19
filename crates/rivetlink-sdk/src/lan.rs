@@ -25,6 +25,7 @@ use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
 use tokio::net::TcpStream;
 
 use rivetlink_crypto::sealed::SealedChannel;
+use rivetlink_protocol::{ConsoleInputPacket, HostConsoleState};
 
 use crate::direct;
 use crate::error::{SdkError, SdkResult};
@@ -46,7 +47,10 @@ pub const SERVICE_TYPE: &str = "_rivetlink._tcp.local.";
 /// `StartStream` so a host can learn (and remember, trust-on-connect) the key of
 /// a client that connected by PIN. The fields are `#[serde(default)]`, so a v3
 /// client talking to a v2 host is fine — the host just ignores them.
-pub const PROTOCOL_VERSION: u16 = 3;
+/// v4 adds the physical-console request/response. It is deliberately a
+/// one-shot operation: every capture/input transaction follows the same
+/// authenticated direct handshake and sealed transport as the rest of LAN.
+pub const PROTOCOL_VERSION: u16 = 4;
 
 /// Domain-separated context a client signs (with its Ed25519 identity) to prove
 /// it controls the key it announces on `StartStream`. Bump the suffix if the
@@ -90,6 +94,7 @@ pub const DEFAULT_LAN_PORT: u16 = 47823;
 const TXT_NAME: &str = "name";
 const TXT_PUBKEY: &str = "pk";
 const TXT_VERSION: &str = "v";
+const TXT_MODE: &str = "mode";
 
 /// Upper bound on a single sealed application frame (a screenshot PNG, base64).
 const MAX_SEALED_FRAME: usize = 32 * 1024 * 1024;
@@ -108,6 +113,10 @@ pub struct LanDevice {
     pub public_key: Option<String>,
     /// Protocol version the host advertised, if any.
     pub protocol_version: Option<u16>,
+    /// Whether this advertisement is the boot-time physical GDM/GNOME console.
+    /// A missing value means a regular LAN host for backwards compatibility.
+    #[serde(default)]
+    pub physical_console: bool,
 }
 
 impl LanDevice {
@@ -203,6 +212,7 @@ struct HostAccumulator {
     port: u16,
     public_key: Option<String>,
     protocol_version: Option<u16>,
+    physical_console: bool,
     addresses: std::collections::BTreeSet<IpAddr>,
 }
 
@@ -224,6 +234,9 @@ impl HostAccumulator {
             protocol_version: info
                 .get_property_val_str(TXT_VERSION)
                 .and_then(|v| v.parse().ok()),
+            physical_console: info
+                .get_property_val_str(TXT_MODE)
+                .is_some_and(|mode| mode == "physical-console"),
             addresses,
         })
     }
@@ -241,6 +254,7 @@ impl HostAccumulator {
         if other.protocol_version.is_some() {
             self.protocol_version = other.protocol_version;
         }
+        self.physical_console |= other.physical_console;
         self.addresses.extend(other.addresses);
     }
 
@@ -269,6 +283,7 @@ impl HostAccumulator {
             port: self.port,
             public_key: self.public_key,
             protocol_version: self.protocol_version,
+            physical_console: self.physical_console,
         })
     }
 }
@@ -315,13 +330,29 @@ impl Advertiser {
     /// `version` the protocol version. Local addresses are filled in
     /// automatically.
     pub fn start(instance: &str, port: u16, public_key: &str, version: u16) -> SdkResult<Self> {
+        Self::start_with_mode(instance, port, public_key, version, None)
+    }
+
+    /// Like [`Self::start`], with an optional narrowly defined host mode for
+    /// clients that need to choose the right local UI. The mode is discovery
+    /// metadata only; trust still comes exclusively from the direct handshake.
+    pub fn start_with_mode(
+        instance: &str,
+        port: u16,
+        public_key: &str,
+        version: u16,
+        mode: Option<&str>,
+    ) -> SdkResult<Self> {
         let daemon = ServiceDaemon::new().map_err(|e| SdkError::Discovery(e.to_string()))?;
         let hostname = format!("{}.local.", sanitize_hostname(instance));
-        let props: [(&str, String); 3] = [
+        let mut props: Vec<(&str, String)> = vec![
             (TXT_NAME, instance.to_string()),
             (TXT_PUBKEY, public_key.to_string()),
             (TXT_VERSION, version.to_string()),
         ];
+        if let Some(mode) = mode {
+            props.push((TXT_MODE, mode.to_string()));
+        }
         let info = ServiceInfo::new(SERVICE_TYPE, instance, &hostname, "", port, &props[..])
             .map_err(|e| SdkError::Discovery(e.to_string()))?
             .enable_addr_auto();
@@ -409,6 +440,13 @@ pub enum LanRequest {
     /// or the literal `"CommandMod"` for the platform command modifier (⌘ on
     /// macOS, Ctrl elsewhere), which the host maps onto *its own* command key.
     Key { code: String, down: bool },
+    /// Capture the real boot-time GDM/GNOME console, optionally first applying
+    /// one normalized input event. This operation is accepted only by the
+    /// physical-console broker after the direct trusted-device handshake.
+    ConsoleCapture {
+        #[serde(default)]
+        inputs: Vec<ConsoleInputPacket>,
+    },
 }
 
 /// A mouse button, for [`LanRequest::PointerButton`].
@@ -460,6 +498,14 @@ pub enum LanResponse {
     Frame(FrameDelta),
     /// The displays the host can share (reply to [`LanRequest::ListDisplays`]).
     Displays { displays: Vec<DisplayInfo> },
+    /// A physical-console capture plus non-sensitive lifecycle state. The
+    /// state lets a client distinguish GDM, desktop and lock transitions
+    /// without exposing session identifiers or account details.
+    ConsoleCapture {
+        png_b64: String,
+        state: Option<HostConsoleState>,
+        generation: Option<u64>,
+    },
     /// The host could not satisfy the request.
     Error { message: String },
 }
@@ -607,6 +653,49 @@ pub async fn screenshot_key_pinned(
     screenshot_key(addr, identity, parse_pinned_host(pinned_host_b64)?).await
 }
 
+/// One encrypted direct-LAN transaction with a physical-console broker.
+/// `input` contains only a normalized event; it is never interpreted as a
+/// password by RivetLink and is never persisted or logged.
+pub async fn console_capture_key_pinned(
+    addr: SocketAddr,
+    identity: &Identity,
+    pinned_host_b64: Option<&str>,
+    inputs: Vec<ConsoleInputPacket>,
+) -> SdkResult<ConsoleCapture> {
+    let (mut stream, channel) = connect_key_pinned(addr, identity, pinned_host_b64).await?;
+    send_request(
+        &mut stream,
+        &channel,
+        &LanRequest::ConsoleCapture { inputs },
+    )
+    .await?;
+    match recv_response(&mut stream, &channel).await? {
+        LanResponse::ConsoleCapture {
+            png_b64,
+            state,
+            generation,
+        } => Ok(ConsoleCapture {
+            png: B64
+                .decode(png_b64.trim())
+                .map_err(|e| SdkError::Base64(e.to_string()))?,
+            state,
+            generation,
+        }),
+        LanResponse::Error { message } => Err(SdkError::Relay(message)),
+        _ => Err(SdkError::Crypto(
+            "expected physical-console capture response".to_string(),
+        )),
+    }
+}
+
+/// Result from [`console_capture_key_pinned`].
+#[derive(Debug, Clone)]
+pub struct ConsoleCapture {
+    pub png: Vec<u8>,
+    pub state: Option<HostConsoleState>,
+    pub generation: Option<u64>,
+}
+
 /// Parse a pinned host identity from base64. `None` means trust-on-first-use;
 /// a `Some(_)` is an explicit pin, so empty/malformed is an error (never a
 /// silent TOFU downgrade — that would let a MITM strip the pin).
@@ -640,7 +729,9 @@ async fn fetch_screenshot(stream: &mut TcpStream, channel: &SealedChannel) -> Sd
         LanResponse::Screenshot { png_b64 } => B64
             .decode(png_b64.trim())
             .map_err(|e| SdkError::Base64(e.to_string())),
-        LanResponse::Frame(_) | LanResponse::Displays { .. } => Err(SdkError::Crypto(
+        LanResponse::Frame(_)
+        | LanResponse::Displays { .. }
+        | LanResponse::ConsoleCapture { .. } => Err(SdkError::Crypto(
             "expected screenshot, got another response".to_string(),
         )),
         LanResponse::Error { message } => Err(SdkError::Relay(message)),
@@ -762,7 +853,7 @@ where
             // revokes "share all screens" — surface it so the viewer can show or
             // hide its screen picker live.
             LanResponse::Displays { displays } => on_displays(displays),
-            LanResponse::Screenshot { .. } => {},
+            LanResponse::Screenshot { .. } | LanResponse::ConsoleCapture { .. } => {},
         }
     }
 }
@@ -898,6 +989,7 @@ mod tests {
             port: 7000,
             public_key: None,
             protocol_version: Some(1),
+            physical_console: false,
         };
         assert_eq!(dev.socket_addr().unwrap().to_string(), "192.168.1.5:7000");
     }

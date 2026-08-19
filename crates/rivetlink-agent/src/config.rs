@@ -10,10 +10,12 @@ use crate::error::{AgentError, AgentResult};
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct AgentConfig {
     /// Relay server WebSocket URL (e.g. `wss://relay.example.com/ws`).
+    #[serde(default)]
     pub relay_url: String,
 
     /// Relay server HTTP base URL (e.g. `https://relay.example.com`).
     /// Used for one-shot REST calls like device registration.
+    #[serde(default)]
     pub relay_http_url: String,
 
     /// Display name reported to the relay server when registering.
@@ -43,6 +45,74 @@ pub struct AgentConfig {
     /// retired virtual-monitor implementation.
     #[serde(default, alias = "headless")]
     pub unattended_console: UnattendedConsoleConfig,
+
+    /// Explicit transports exposed by the boot-time physical-console broker.
+    /// Older configurations omitted this field and therefore retain relay-only
+    /// behaviour through the default below; an upgrade never opens a LAN port.
+    #[serde(default)]
+    pub console_transports: ConsoleTransportConfig,
+}
+
+/// Transport selection for the unattended physical-console broker.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ConsoleTransportConfig {
+    #[serde(default)]
+    pub lan: LanConsoleTransportConfig,
+    #[serde(default = "default_relay_transport")]
+    pub relay: RelayConsoleTransportConfig,
+}
+
+impl Default for ConsoleTransportConfig {
+    fn default() -> Self {
+        Self {
+            lan: LanConsoleTransportConfig::default(),
+            // Preserve the meaning of an existing config that predates this
+            // field: it was relay-backed, never LAN-exposed.
+            relay: default_relay_transport(),
+        }
+    }
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct LanConsoleTransportConfig {
+    #[serde(default)]
+    pub enabled: bool,
+    #[serde(default = "default_lan_bind_address")]
+    pub bind_address: String,
+    #[serde(default = "default_lan_port")]
+    pub port: u16,
+}
+
+impl Default for LanConsoleTransportConfig {
+    fn default() -> Self {
+        Self {
+            enabled: false,
+            bind_address: default_lan_bind_address(),
+            port: default_lan_port(),
+        }
+    }
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct RelayConsoleTransportConfig {
+    #[serde(default = "default_true")]
+    pub enabled: bool,
+}
+
+fn default_relay_transport() -> RelayConsoleTransportConfig {
+    RelayConsoleTransportConfig { enabled: true }
+}
+
+fn default_true() -> bool {
+    true
+}
+
+fn default_lan_bind_address() -> String {
+    "0.0.0.0".to_string()
+}
+
+fn default_lan_port() -> u16 {
+    rivetlink_sdk::lan::DEFAULT_LAN_PORT
 }
 
 /// Limits and consent opt-in for an unattended physical-console host.
@@ -124,16 +194,37 @@ impl AgentConfig {
 
     /// Reject obviously broken values before they reach networking code.
     pub fn validate(&self) -> AgentResult<()> {
-        if !self.relay_url.starts_with("ws://") && !self.relay_url.starts_with("wss://") {
+        if !self.console_transports.lan.enabled && !self.console_transports.relay.enabled {
+            return Err(AgentError::Config(
+                "at least one console transport (lan or relay) must be enabled".to_string(),
+            ));
+        }
+        if self.console_transports.relay.enabled
+            && !self.relay_url.starts_with("ws://")
+            && !self.relay_url.starts_with("wss://")
+        {
             return Err(AgentError::Config(
                 "relay_url must start with ws:// or wss://".to_string(),
             ));
         }
-        if !self.relay_http_url.starts_with("http://")
+        if self.console_transports.relay.enabled
+            && !self.relay_http_url.starts_with("http://")
             && !self.relay_http_url.starts_with("https://")
         {
             return Err(AgentError::Config(
                 "relay_http_url must start with http:// or https://".to_string(),
+            ));
+        }
+        if self.console_transports.lan.enabled
+            && self
+                .console_transports
+                .lan
+                .bind_address
+                .parse::<std::net::IpAddr>()
+                .is_err()
+        {
+            return Err(AgentError::Config(
+                "console_transports.lan.bind_address must be an IP address".to_string(),
             ));
         }
         if self.device_name.is_empty() {
@@ -175,6 +266,7 @@ mod tests {
             heartbeat_secs: 10,
             reconnect_cap_secs: 60,
             unattended_console: UnattendedConsoleConfig::default(),
+            console_transports: ConsoleTransportConfig::default(),
         }
     }
 
@@ -246,5 +338,48 @@ mod tests {
         .unwrap();
         assert!(cfg.unattended_console.enabled);
         assert!(cfg.unattended_console.allow_trusted_clients);
+    }
+
+    #[test]
+    fn lan_only_configuration_needs_no_relay_credentials() {
+        let mut cfg = sample();
+        cfg.relay_url.clear();
+        cfg.relay_http_url.clear();
+        cfg.console_transports.lan.enabled = true;
+        cfg.console_transports.relay.enabled = false;
+        assert!(cfg.validate().is_ok());
+    }
+
+    #[test]
+    fn relay_configuration_still_requires_relay_endpoints() {
+        let mut cfg = sample();
+        cfg.relay_url.clear();
+        assert!(cfg.validate().is_err());
+    }
+
+    #[test]
+    fn both_transports_are_a_valid_explicit_configuration() {
+        let mut cfg = sample();
+        cfg.console_transports.lan.enabled = true;
+        cfg.console_transports.relay.enabled = true;
+        assert!(cfg.validate().is_ok());
+    }
+
+    #[test]
+    fn no_transport_is_rejected() {
+        let mut cfg = sample();
+        cfg.console_transports.lan.enabled = false;
+        cfg.console_transports.relay.enabled = false;
+        assert!(cfg.validate().is_err());
+    }
+
+    #[test]
+    fn old_configs_preserve_relay_only_transport() {
+        let cfg: AgentConfig = serde_json::from_str(
+            r#"{"relay_url":"wss://relay.test/ws","relay_http_url":"https://relay.test","device_name":"host","keystore_path":"/tmp/keys"}"#,
+        )
+        .unwrap();
+        assert!(cfg.console_transports.relay.enabled);
+        assert!(!cfg.console_transports.lan.enabled);
     }
 }
