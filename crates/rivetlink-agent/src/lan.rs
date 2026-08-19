@@ -128,6 +128,11 @@ where
         .bind_address
         .parse()
         .map_err(|_| AgentError::Config("invalid LAN bind address".to_string()))?;
+    tracing::info!(
+        address = %transport.bind_address,
+        port = transport.port,
+        "physical-console LAN listener binding"
+    );
     let listener = TcpListener::bind((bind_ip, transport.port)).await?;
     let local_port = listener.local_addr()?.port();
     let public_key = B64.encode(signing_key.verifying_key().as_bytes());
@@ -143,7 +148,8 @@ where
         address = %transport.bind_address,
         port = local_port,
         trusted_clients = trusted.len(),
-        "physical-console LAN listener started"
+        service = "_rivetlink._tcp.local.",
+        "physical-console LAN listener started and advertised"
     );
 
     let trusted = Arc::new(trusted);
