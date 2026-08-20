@@ -52,6 +52,11 @@ pub const SERVICE_TYPE: &str = "_rivetlink._tcp.local.";
 /// authenticated direct handshake and sealed transport as the rest of LAN.
 pub const PROTOCOL_VERSION: u16 = 4;
 
+/// A direct-LAN peer must answer a signed key exchange promptly. Without a
+/// bound, a half-open or incompatible peer could leave a physical-console UI
+/// showing a perpetual connecting state.
+const DIRECT_HANDSHAKE_TIMEOUT: Duration = Duration::from_secs(10);
+
 /// Domain-separated context a client signs (with its Ed25519 identity) to prove
 /// it controls the key it announces on `StartStream`. Bump the suffix if the
 /// signed payload ever changes.
@@ -613,7 +618,12 @@ pub async fn connect_key_pinned(
     let pinned = parse_pinned_host(pinned_host_b64)?;
     tracing::info!(%addr, pinned = pinned.is_some(), "LAN connect: key mode");
     let mut stream = connect_nodelay(addr).await?;
-    let channel = direct::client_connect_key(&mut stream, identity, pinned).await?;
+    let channel = tokio::time::timeout(
+        DIRECT_HANDSHAKE_TIMEOUT,
+        direct::client_connect_key(&mut stream, identity, pinned),
+    )
+    .await
+    .map_err(|_| SdkError::Crypto("direct-LAN handshake timed out".to_string()))??;
     tracing::info!(%addr, "LAN connect: channel up (key)");
     Ok((stream, channel))
 }
@@ -681,7 +691,7 @@ pub async fn console_capture_key_pinned(
             state,
             generation,
         }),
-        LanResponse::Error { message } => Err(SdkError::Relay(message)),
+        LanResponse::Error { message } => Err(SdkError::Lan(message)),
         _ => Err(SdkError::Crypto(
             "expected physical-console capture response".to_string(),
         )),
@@ -734,7 +744,7 @@ async fn fetch_screenshot(stream: &mut TcpStream, channel: &SealedChannel) -> Sd
         | LanResponse::ConsoleCapture { .. } => Err(SdkError::Crypto(
             "expected screenshot, got another response".to_string(),
         )),
-        LanResponse::Error { message } => Err(SdkError::Relay(message)),
+        LanResponse::Error { message } => Err(SdkError::Lan(message)),
     }
 }
 
@@ -747,7 +757,7 @@ pub async fn list_displays(
     send_request(stream, channel, &LanRequest::ListDisplays).await?;
     match recv_response(stream, channel).await? {
         LanResponse::Displays { displays } => Ok(displays),
-        LanResponse::Error { message } => Err(SdkError::Relay(message)),
+        LanResponse::Error { message } => Err(SdkError::Lan(message)),
         _ => Ok(Vec::new()),
     }
 }
@@ -847,7 +857,7 @@ where
             },
             LanResponse::Error { message } => {
                 tracing::warn!(%message, "LAN stream: host sent error");
-                return Err(SdkError::Relay(message));
+                return Err(SdkError::Lan(message));
             },
             // The host pushes a fresh display list mid-stream when it grants or
             // revokes "share all screens" — surface it so the viewer can show or

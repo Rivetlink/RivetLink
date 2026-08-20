@@ -13,7 +13,9 @@ and the selected network transports, but has no session D-Bus address and
 cannot capture or inject input itself.
 
 `rivetlink-console-worker.service` runs only inside the existing graphical GDM
-or GNOME systemd user session. It gets the session's Mutter ScreenCast and
+or GNOME systemd user session. Ubuntu may name its greeter account
+`gdm-greeter` rather than `gdm`; the installer detects and allow-lists each
+installed GDM account. It gets the session's Mutter ScreenCast and
 RemoteDesktop D-Bus access, but has no relay credential and exposes only a
 length-bounded Unix socket protocol for a PNG capture and normalized pointer,
 scroll or key event. The socket is `0660`, belongs to the private

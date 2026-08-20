@@ -164,6 +164,7 @@ where
                 let limits = limits.clone();
                 let source = source.clone();
                 sessions.spawn(async move {
+                    tracing::info!(%peer, "physical-console LAN connection accepted");
                     if let Err(error) = serve_physical_console_client(stream, signing_key, trusted, limits, source).await {
                         // This intentionally contains no request/input material.
                         tracing::info!(%peer, error = %error, "physical-console LAN session closed");

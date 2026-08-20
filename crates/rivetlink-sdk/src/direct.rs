@@ -47,6 +47,11 @@ enum Wire {
     },
     /// Sealed confirmation token.
     Confirm { sealed: String },
+    /// A host rejected a syntactically valid key-authenticated client before a
+    /// sealed channel could be established. This contains no credentials or
+    /// key material; it lets the owner distinguish an authorization failure
+    /// from a broken network connection.
+    Reject { reason: String },
 }
 
 async fn write_msg<W: AsyncWrite + Unpin>(w: &mut W, msg: &Wire) -> SdkResult<()> {
@@ -228,9 +233,16 @@ where
     )
     .await?;
 
-    let Wire::Kex { eph, id, sig } = read_msg(stream).await? else {
-        tracing::warn!("handshake[key/client]: expected kex, got other message");
-        return Err(SdkError::Crypto("expected key exchange".to_string()));
+    let (eph, id, sig) = match read_msg(stream).await? {
+        Wire::Kex { eph, id, sig } => (eph, id, sig),
+        Wire::Reject { reason } => {
+            tracing::warn!("handshake[key/client]: host rejected client");
+            return Err(SdkError::Crypto(format!("host rejected client: {reason}")));
+        },
+        _ => {
+            tracing::warn!("handshake[key/client]: expected kex, got other message");
+            return Err(SdkError::Crypto("expected key exchange".to_string()));
+        },
     };
     let host_id = parse_identity(&id)?;
     tracing::debug!(host = %short(&id), "handshake[key/client]: got host kex");
@@ -296,6 +308,17 @@ where
             client = %short(id),
             "handshake[key/host]: client not trusted (not in allow-list, no PIN) — rejecting"
         );
+        // The client has already proven possession of its private key. Return
+        // a deliberately generic rejection so a legitimate owner gets an
+        // actionable error instead of an opaque EOF, without disclosing any
+        // trust-store contents to the network.
+        let _ = write_msg(
+            stream,
+            &Wire::Reject {
+                reason: "client is not authorized for this host".to_string(),
+            },
+        )
+        .await;
         return Err(SdkError::Crypto("client not trusted".to_string()));
     }
     tracing::debug!(client = %short(id), "handshake[key/host]: client trusted, replying kex");
@@ -345,6 +368,12 @@ where
             tracing::warn!("handshake[auto/host]: unexpected confirmation as first message");
             Err(SdkError::Crypto(
                 "unexpected confirmation as first message".to_string(),
+            ))
+        },
+        Wire::Reject { .. } => {
+            tracing::warn!("handshake[auto/host]: unexpected rejection as first message");
+            Err(SdkError::Crypto(
+                "unexpected rejection as first message".to_string(),
             ))
         },
     }
@@ -412,10 +441,9 @@ mod tests {
 
         let (mut c, mut h) = pipe();
         let host = tokio::spawn(async move { host_accept_key(&mut h, &host_id, |_| false).await });
-        // Host rejects, so the client's read of the host's Kex fails (EOF).
         let client = client_connect_key(&mut c, &client_id, None).await;
         assert!(host.await.unwrap().is_err());
-        assert!(client.is_err());
+        assert!(client.unwrap_err().to_string().contains("not authorized"));
     }
 
     #[tokio::test]

@@ -23,6 +23,9 @@ pub enum SdkError {
     #[error("relay error: {0}")]
     Relay(String),
 
+    #[error("local network error: {0}")]
+    Lan(String),
+
     #[error("websocket error: {0}")]
     WebSocket(String),
 
