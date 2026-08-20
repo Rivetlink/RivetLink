@@ -131,9 +131,16 @@ async fn console_broker(
         let allowed_worker_uids = allowed_worker_uids.into_iter().collect();
         let listener =
             crate::console::broker::ConsoleBrokerListener::bind(socket, allowed_worker_uids)?;
-        tracing::info!("console broker waiting for an authenticated graphical worker");
         let capturer = listener.into_pool();
-        capturer.wait_until_ready().await?;
+        // Start the transport listeners before GDM/ GNOME has attached its
+        // worker.  Besides making the machine discoverable at the real login
+        // screen, this reserves the physical-console LAN port for the
+        // boot-time broker instead of letting a later user-session host claim
+        // it. Capture and input safely return a "no active graphical console
+        // worker" error until the graphical worker connects.
+        tracing::info!(
+            "console broker started; transports are available while waiting for an authenticated graphical worker"
+        );
         run_physical_console_broker(config_path, capturer).await
     }
     #[cfg(not(target_os = "linux"))]
