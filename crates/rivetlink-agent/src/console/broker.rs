@@ -50,6 +50,7 @@ impl ConsoleBrokerListener {
             .map_err(|error| AgentError::Config(format!("bind console broker: {error}")))?;
         std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o660))
             .map_err(|error| AgentError::Config(format!("secure console socket: {error}")))?;
+        grant_worker_socket_access(path, &allowed_worker_uids)?;
         Ok(Self {
             listener,
             allowed_worker_uids,
@@ -102,6 +103,53 @@ impl ConsoleBrokerListener {
             receiver: Arc::new(Mutex::new(rx)),
             generation,
         }
+    }
+}
+
+/// Grant only the explicitly allow-listed graphical-worker UIDs traversal of
+/// the broker runtime directory and read/write access to its socket.
+///
+/// GDM launches its greeter from a long-lived user manager.  Supplementary
+/// groups added during installation are not reliably picked up by that manager
+/// on every Ubuntu/GDM combination, even after the broker restarts.  A POSIX
+/// ACL on the broker-owned directory/socket is both narrower and independent
+/// of that inherited group list.  The broker still verifies `SO_PEERCRED`
+/// against the same UID allow-list before accepting any worker protocol data.
+fn grant_worker_socket_access(path: &Path, allowed_worker_uids: &BTreeSet<u32>) -> AgentResult<()> {
+    let parent = path.parent().ok_or_else(|| {
+        AgentError::Config("console broker socket has no parent directory".to_string())
+    })?;
+    for uid in allowed_worker_uids {
+        set_acl(
+            parent,
+            &format!("u:{uid}:x"),
+            "grant console directory traversal",
+        )?;
+        set_acl(path, &format!("u:{uid}:rw"), "grant console socket access")?;
+    }
+    tracing::debug!(
+        workers = allowed_worker_uids.len(),
+        "granted per-worker console socket ACLs"
+    );
+    Ok(())
+}
+
+/// The installer guarantees `setfacl` is present (`acl` package).  This is a
+/// fixed binary with fixed targets and numeric UID ACL specs; no caller input
+/// is interpreted by a shell.
+fn set_acl(path: &Path, spec: &str, action: &str) -> AgentResult<()> {
+    let status = std::process::Command::new("/usr/bin/setfacl")
+        .args(["-m", spec])
+        .arg(path)
+        .stdin(std::process::Stdio::null())
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null())
+        .status()
+        .map_err(|error| AgentError::Config(format!("{action}: start setfacl: {error}")))?;
+    if status.success() {
+        Ok(())
+    } else {
+        Err(AgentError::Config(format!("{action}: setfacl failed")))
     }
 }
 
