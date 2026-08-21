@@ -125,6 +125,9 @@ pub fn capture_png(timeout: Duration) -> AgentResult<Vec<u8>> {
         .stdout
         .take()
         .ok_or_else(|| AgentError::Config("Mutter capture stdout missing".to_string()))?;
+    // Keep GStreamer diagnostics separate from the raw-frame pipe. This is
+    // bounded local journal data only; it cannot contain screen pixels.
+    let stderr = child.stderr.take().map(collect_gstreamer_stderr);
     let frame_bytes = width
         .checked_mul(height)
         .and_then(|v| v.checked_mul(4))
@@ -135,10 +138,16 @@ pub fn capture_png(timeout: Duration) -> AgentResult<Vec<u8>> {
     let read_result = stdout.read_exact(&mut bgrx);
     let _ = child.kill();
     let _ = child.wait();
+    let gstreamer_error = stderr
+        .and_then(|reader| reader.join().ok())
+        .unwrap_or_default();
     read_result.map_err(|e| {
+        let diagnostic = (!gstreamer_error.is_empty())
+            .then(|| format!("; GStreamer: {gstreamer_error}"))
+            .unwrap_or_default();
         AgentError::Config(format!(
-            "Mutter capture did not produce a frame within {} seconds: {e}",
-            timeout.as_secs().max(1)
+            "Mutter capture did not produce a frame within {} seconds: {e}{diagnostic}",
+            timeout.as_secs().max(1),
         ))
     })?;
     encode_bgrx_png(width, height, &bgrx)
@@ -373,9 +382,11 @@ fn spawn_gst(node: u32, out_w: usize, out_h: usize) -> AgentResult<Child> {
     Ok(child)
 }
 
-/// Spawn GStreamer through a bounded Ubuntu `timeout` wrapper and stop after
-/// its first PipeWire frame. This keeps one-shot capture bounded even when a
-/// compositor or PipeWire daemon stops responding.
+/// Spawn GStreamer through a bounded Ubuntu `timeout` wrapper for a one-shot
+/// capture. It deliberately uses the same PipeWire pipeline as [`spawn_gst`].
+/// The former `num-buffers=1` variant can close stdout before the first frame
+/// is negotiated on some Ubuntu PipeWire/GStreamer combinations. The caller
+/// reads one frame then terminates this process itself.
 fn spawn_one_frame_gst(
     node: u32,
     out_w: usize,
@@ -391,7 +402,10 @@ fn spawn_one_frame_gst(
         "-q",
         "pipewiresrc",
         &format!("path={node}"),
-        "num-buffers=1",
+        "do-timestamp=true",
+        "!",
+        "videoscale",
+        "add-borders=true",
         "!",
         "videoconvert",
         "!",
@@ -447,6 +461,24 @@ fn drain_gstreamer_stderr(child: &mut Child) {
             }
         });
     }
+}
+
+/// Read at most a small diagnostic prefix from a one-shot GStreamer process.
+/// Raw frames travel solely on stdout, so retaining stderr cannot expose
+/// desktop pixels. The bound prevents a broken plugin from consuming unbounded
+/// worker memory before the timeout terminates its process.
+fn collect_gstreamer_stderr(
+    mut stderr: impl Read + Send + 'static,
+) -> std::thread::JoinHandle<String> {
+    const MAX_DIAGNOSTIC_BYTES: u64 = 4 * 1024;
+    std::thread::spawn(move || {
+        let mut bytes = Vec::new();
+        let _ = stderr
+            .by_ref()
+            .take(MAX_DIAGNOSTIC_BYTES)
+            .read_to_end(&mut bytes);
+        String::from_utf8_lossy(&bytes).trim().to_string()
+    })
 }
 
 /// Encode tightly packed BGRx data from PipeWire as a PNG without writing a
@@ -577,6 +609,7 @@ fn dbus_err(e: impl std::fmt::Display) -> AgentError {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::io::Cursor;
 
     #[test]
     fn fit_preserves_aspect_within_bounds() {
@@ -594,5 +627,13 @@ mod tests {
         // Dimensions are always even.
         let (w, h) = fit_output(3441, 1441);
         assert_eq!((w % 2, h % 2), (0, 0));
+    }
+
+    #[test]
+    fn one_shot_gstreamer_diagnostics_are_bounded_and_text_only() {
+        let diagnostic = collect_gstreamer_stderr(Cursor::new(b"missing pipewiresrc\n".to_vec()))
+            .join()
+            .expect("diagnostic reader");
+        assert_eq!(diagnostic, "missing pipewiresrc");
     }
 }
