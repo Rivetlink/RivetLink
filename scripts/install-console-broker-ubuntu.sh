@@ -56,7 +56,11 @@ sudo usermod -a -G rivetlink-console "$OWNER_USER"
 sudo install -d -o rivetlink -g rivetlink-console -m 0710 /var/lib/rivetlink /var/lib/rivetlink/keys
 sudo install -d -o root -g rivetlink-console -m 0710 /etc/rivetlink
 sudo install -d -o root -g root -m 0755 /usr/local/lib/rivetlink /etc/systemd/user
-sudo install -o root -g root -m 0755 "$AGENT_SOURCE" /usr/local/lib/rivetlink/rivet-agent
+# Keep an already-running broker on its old executable until a complete new
+# agent is present. `mv` within this directory is atomic, so broker and worker
+# never observe a partly copied binary during a recovery/update installation.
+sudo install -o root -g root -m 0755 "$AGENT_SOURCE" /usr/local/lib/rivetlink/rivet-agent.next
+sudo mv -f /usr/local/lib/rivetlink/rivet-agent.next /usr/local/lib/rivetlink/rivet-agent
 sudo apt-get update
 sudo apt-get install -y pipewire gstreamer1.0-tools gstreamer1.0-pipewire
 
@@ -121,7 +125,6 @@ ExecStart=/usr/local/lib/rivetlink/rivet-agent console-worker --socket /run/rive
 Restart=on-failure
 RestartSec=3
 NoNewPrivileges=yes
-PrivateTmp=yes
 LockPersonality=yes
 RestrictSUIDSGID=yes
 Environment=RUST_LOG=info

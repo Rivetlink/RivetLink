@@ -16,6 +16,12 @@ systemctl --global disable rivetlink-console-worker.service 2>/dev/null || true
 rm -f /etc/systemd/system/rivetlink-console-broker.service
 rm -f /etc/systemd/user/rivetlink-console-worker.service
 rm -f /usr/local/lib/rivetlink/rivet-agent
+rm -f /usr/local/lib/rivetlink/rivet-agent.next
+# Old releases extracted the desktop AppImage here and made services execute
+# AppRun. It is retired; remove it only during explicit uninstall, never during
+# an in-place upgrade where an already-running legacy worker may still exist.
+rm -rf --one-file-system /usr/local/lib/rivetlink/appimage
+rm -rf --one-file-system /usr/local/lib/rivetlink/appimage.extracting
 rmdir /usr/local/lib/rivetlink 2>/dev/null || true
 systemctl daemon-reload
 

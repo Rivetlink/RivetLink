@@ -22,6 +22,15 @@ scroll or key event. The socket is `0660`, belongs to the private
 `rivetlink-console` group, and broker-side peer credentials must match the GDM
 or configured owner UID.
 
+The interactive desktop AppImage is never used as either service executable.
+During setup its separately bundled native `rivet-agent` is installed as a
+root-owned executable at `/usr/local/lib/rivetlink/rivet-agent` using an
+atomic replacement; both the broker and worker execute that same file directly.
+This keeps the broker/worker pair on one version while leaving the GUI AppImage
+for normal desktop use. In particular, the worker does not enter AppImage's
+unprivileged user-namespace runtime, so normal operation needs no AppArmor
+exception, relaxed user-namespace policy, or weaker Unix-socket permissions.
+
 The broker accepts a physical-console session only if the exact local trusted
 entry has all required owner permissions:
 
@@ -96,14 +105,28 @@ rivetlink-console-worker.service       global session unit for GDM/GNOME
 /usr/local/lib/rivetlink/rivet-agent   installed agent binary
 ```
 
+On upgrade the authorized installer replaces `rivet-agent` before it rewrites
+and restarts the broker unit. The global worker unit is reloaded and restarted
+in the current GNOME session; future GDM/GNOME sessions load the same native
+binary automatically. The former extracted-AppImage service runtime is not a
+service path any more and is removed by the explicit uninstall operation.
+
 Check operation:
 
 ```bash
 systemctl status rivetlink-console-broker
 journalctl -u rivetlink-console-broker -b
 journalctl _SYSTEMD_USER_UNIT=rivetlink-console-worker.service -b
+systemctl cat rivetlink-console-broker.service
+systemctl --user cat rivetlink-console-worker.service
+sudo journalctl -k -b | grep -Ei 'apparmor.*DENIED.*rivetlink|unprivileged_userns'
 sudo ufw allow in on enp1s0 to any port 47823 proto tcp  # only if UFW is enabled; use your LAN NIC
 ```
+
+Both `ExecStart` values must name `/usr/local/lib/rivetlink/rivet-agent`, not
+`AppRun`. With Ubuntu's restricted unprivileged-user-namespace profile, the
+kernel log must contain no AppArmor `DENIED` connection to
+`/run/rivetlink/console.sock` after the worker starts.
 
 After first installation, reboot once so GDM and the desktop receive the
 `rivetlink-console` group. A normal subsequent reboot requires no local
@@ -145,6 +168,10 @@ alter GDM, GNOME, PAM, display configuration or unrelated accounts.
 9. Enable both Local network and Via relay. On the LAN verify the Local network
    route; from outside the LAN verify the relay route to the same GDM, then
    repeat login, lock/unlock and logout on each route.
+10. On an Ubuntu installation with restricted unprivileged user namespaces,
+    restart both units. Verify the worker stays active, the broker reports an
+    active graphical worker, and the kernel journal contains no AppArmor denial
+    for `/run/rivetlink/console.sock`.
 
 The owner, not CI, must run this real HDMI-dummy/GDM checklist. Automated tests
 cover the configuration, authenticated direct handshake and state machine but
