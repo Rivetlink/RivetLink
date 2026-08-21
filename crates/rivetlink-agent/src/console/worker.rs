@@ -71,9 +71,15 @@ pub enum WorkerErrorCode {
 /// creates one and never changes ownership or mode itself.
 pub async fn run(socket_path: &Path) -> AgentResult<()> {
     require_graphical_session()?;
-    let stream = UnixStream::connect(socket_path)
-        .await
-        .map_err(|error| AgentError::Config(format!("connect console broker: {error}")))?;
+    let stream = UnixStream::connect(socket_path).await.map_err(|error| {
+        // This is a local Unix-socket access failure, not an invalid RivetLink
+        // configuration.  Keeping its OS error kind lets the journal and UI
+        // distinguish a permission boundary problem from a missing display.
+        AgentError::Io(std::io::Error::new(
+            error.kind(),
+            format!("connect console broker: {error}"),
+        ))
+    })?;
     serve(stream).await
 }
 

@@ -164,16 +164,31 @@ where
                 let limits = limits.clone();
                 let source = source.clone();
                 sessions.spawn(async move {
-                    tracing::info!(%peer, "physical-console LAN connection accepted");
+                    // The desktop app performs a lightweight TCP health probe for
+                    // saved LAN devices.  It intentionally opens and closes the
+                    // socket without starting the authenticated protocol, so keep
+                    // that routine traffic out of the normal service journal.
+                    tracing::debug!(%peer, "physical-console LAN TCP connection accepted");
                     if let Err(error) = serve_physical_console_client(stream, signing_key, trusted, limits, source).await {
                         // This intentionally contains no request/input material.
-                        tracing::info!(%peer, error = %error, "physical-console LAN session closed");
+                        if is_lan_health_probe_disconnect(&error) {
+                            tracing::debug!(%peer, "physical-console LAN health probe closed");
+                        } else {
+                            tracing::info!(%peer, error = %error, "physical-console LAN session closed");
+                        }
                     }
                 });
             },
             Some(_) = sessions.join_next(), if !sessions.is_empty() => {},
         }
     }
+}
+
+/// A saved-device health probe reaches the TCP listener but deliberately does
+/// not send a direct-LAN handshake.  SDK framing reports that as an early EOF.
+/// It occurs before authentication and cannot carry capture or input data.
+fn is_lan_health_probe_disconnect(error: &AgentError) -> bool {
+    matches!(error, AgentError::Lan(message) if message.contains("early eof"))
 }
 
 // One sequential authenticated transaction loop; splitting it would obscure
@@ -994,6 +1009,19 @@ mod tests {
         assert!(!share_all_now(&Some(rx)));
         let (_tx2, rx2) = watch::channel(true);
         assert!(share_all_now(&Some(rx2)));
+    }
+
+    #[test]
+    fn only_an_early_eof_is_treated_as_a_lan_health_probe() {
+        assert!(is_lan_health_probe_disconnect(&AgentError::Lan(
+            "direct-LAN error: io error: early eof".to_string()
+        )));
+        assert!(!is_lan_health_probe_disconnect(&AgentError::Lan(
+            "untrusted controller".to_string()
+        )));
+        assert!(!is_lan_health_probe_disconnect(&AgentError::Relay(
+            "no active graphical console worker".to_string()
+        )));
     }
 
     #[tokio::test]
