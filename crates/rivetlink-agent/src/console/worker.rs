@@ -136,8 +136,9 @@ fn require_graphical_session() -> AgentResult<()> {
 
 async fn capture(timeout_ms: u64) -> WorkerResponse {
     let timeout_ms = timeout_ms.clamp(1, MAX_CAPTURE_TIMEOUT_MS);
+    let gdm_login = matches!(graphical_session_state(), HostConsoleState::GdmLogin);
     match tokio::task::spawn_blocking(move || {
-        crate::capture::mutter::capture_png(Duration::from_millis(timeout_ms))
+        crate::capture::mutter::capture_console_png(Duration::from_millis(timeout_ms), gdm_login)
     })
     .await
     {

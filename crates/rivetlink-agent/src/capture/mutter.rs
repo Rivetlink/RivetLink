@@ -16,7 +16,10 @@
 //! GNOME-only (Mutter). Other compositors fall back to nothing here for now.
 
 use std::collections::BTreeMap;
+use std::fs;
 use std::io::{BufRead, BufReader, Read};
+use std::os::unix::fs::PermissionsExt;
+use std::path::PathBuf;
 use std::process::{Child, Command, Stdio};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
@@ -151,6 +154,84 @@ pub fn capture_png(timeout: Duration) -> AgentResult<Vec<u8>> {
         ))
     })?;
     encode_bgrx_png(width, height, &bgrx)
+}
+
+/// Capture the GDM greeter safely when its Mutter ScreenCast policy explicitly
+/// inhibits new cast sessions. GDM does this before login, even for its own
+/// graphical worker. GNOME Shell exposes a separate one-shot screenshot API
+/// for the session it owns; unlike the portal it shows no chooser and never
+/// targets another seat. This fallback is deliberately limited to GDM — a
+/// locked/ordinary desktop must continue to obey the normal ScreenCast policy.
+pub fn capture_console_png(timeout: Duration, gdm_login: bool) -> AgentResult<Vec<u8>> {
+    match capture_png(timeout) {
+        Err(error) if gdm_login && session_creation_inhibited(&error) => {
+            tracing::info!("GDM inhibits ScreenCast; using GNOME Shell one-shot screenshot");
+            shell_screenshot_png()
+        },
+        result => result,
+    }
+}
+
+fn session_creation_inhibited(error: &AgentError) -> bool {
+    error
+        .to_string()
+        .to_ascii_lowercase()
+        .contains("session creation inhibited")
+}
+
+/// Ask the GNOME Shell owned by this session for one whole-screen PNG. The
+/// output lives in a newly-created 0700 child of the worker's runtime dir and
+/// is read only if Shell confirms that exact path, so no D-Bus reply can trick
+/// the worker into reading an unrelated local file.
+fn shell_screenshot_png() -> AgentResult<Vec<u8>> {
+    const SHELL_SCREENSHOT_DEST: &str = "org.gnome.Shell.Screenshot";
+    const SHELL_SCREENSHOT_PATH: &str = "/org/gnome/Shell/Screenshot";
+    const SHELL_SCREENSHOT_IFACE: &str = "org.gnome.Shell.Screenshot";
+
+    let runtime = std::env::var_os("XDG_RUNTIME_DIR")
+        .map(PathBuf::from)
+        .ok_or_else(|| AgentError::Config("GDM screenshot requires XDG_RUNTIME_DIR".to_string()))?;
+    let directory = runtime.join(format!("rivetlink-console-{}", uuid::Uuid::now_v7()));
+    fs::create_dir(&directory)
+        .map_err(|error| AgentError::Config(format!("create GDM screenshot directory: {error}")))?;
+    let cleanup = || {
+        let _ = fs::remove_dir_all(&directory);
+    };
+    if let Err(error) = fs::set_permissions(&directory, fs::Permissions::from_mode(0o700)) {
+        cleanup();
+        return Err(AgentError::Config(format!(
+            "secure GDM screenshot directory: {error}"
+        )));
+    }
+    let requested = directory.join("screen.png");
+    let result = (|| {
+        let conn = Connection::session().map_err(dbus_err)?;
+        let shell = Proxy::new(
+            &conn,
+            SHELL_SCREENSHOT_DEST,
+            SHELL_SCREENSHOT_PATH,
+            SHELL_SCREENSHOT_IFACE,
+        )
+        .map_err(dbus_err)?;
+        let path = requested.to_string_lossy().to_string();
+        let (success, used): (bool, String) = shell
+            .call("Screenshot", &(true, false, path))
+            .map_err(dbus_err)?;
+        if !success {
+            return Err(AgentError::Config(
+                "GNOME Shell declined the GDM screenshot".to_string(),
+            ));
+        }
+        let used = PathBuf::from(used);
+        if used != requested {
+            return Err(AgentError::Config(
+                "GNOME Shell returned an unexpected screenshot path".to_string(),
+            ));
+        }
+        fs::read(&used).map_err(|error| AgentError::Config(format!("read GDM screenshot: {error}")))
+    })();
+    cleanup();
+    result
 }
 
 /// Capture `display` (a monitor index, `None` = first/primary) and push delta
@@ -635,5 +716,15 @@ mod tests {
             .join()
             .expect("diagnostic reader");
         assert_eq!(diagnostic, "missing pipewiresrc");
+    }
+
+    #[test]
+    fn recognizes_only_mutters_explicit_inhibit_error() {
+        assert!(session_creation_inhibited(&AgentError::Lan(
+            "Mutter ScreenCast D-Bus error: Session creation inhibited".to_string(),
+        )));
+        assert!(!session_creation_inhibited(&AgentError::Lan(
+            "Mutter ScreenCast D-Bus error: Access denied".to_string(),
+        )));
     }
 }
