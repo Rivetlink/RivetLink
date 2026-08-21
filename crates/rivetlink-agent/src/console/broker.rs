@@ -10,6 +10,7 @@ use std::os::unix::fs::PermissionsExt;
 use std::path::Path;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
+use std::sync::RwLock;
 use std::time::Duration;
 use tokio::net::unix::{OwnedReadHalf, OwnedWriteHalf};
 use tokio::net::{UnixListener, UnixStream};
@@ -34,7 +35,12 @@ const MAX_WORKER_RESPONSE: usize = 12 * 1024 * 1024;
 #[derive(Debug)]
 pub struct ConsoleBrokerListener {
     listener: UnixListener,
+    /// Stable, installer-provided desktop/legacy-GDM UIDs.
     allowed_worker_uids: BTreeSet<u32>,
+    /// The current GDM greeter may be a systemd DynamicUser.  These UIDs are
+    /// discovered from logind and replaced as its session changes, rather than
+    /// turning an old dynamic UID into a permanent local privilege.
+    active_gdm_greeter_uids: Arc<RwLock<BTreeSet<u32>>>,
 }
 
 impl ConsoleBrokerListener {
@@ -51,9 +57,13 @@ impl ConsoleBrokerListener {
         std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o660))
             .map_err(|error| AgentError::Config(format!("secure console socket: {error}")))?;
         grant_worker_socket_access(path, &allowed_worker_uids)?;
+        let active_gdm_greeter_uids = Arc::new(RwLock::new(BTreeSet::new()));
+        #[cfg(target_os = "linux")]
+        spawn_gdm_greeter_refresh(path.to_path_buf(), Arc::clone(&active_gdm_greeter_uids));
         Ok(Self {
             listener,
             allowed_worker_uids,
+            active_gdm_greeter_uids,
         })
     }
 
@@ -67,7 +77,11 @@ impl ConsoleBrokerListener {
                     AgentError::Config(format!("read console peer credentials: {error}"))
                 })?
                 .uid();
-            if !self.allowed_worker_uids.contains(&uid) {
+            let dynamic_allowed = self
+                .active_gdm_greeter_uids
+                .read()
+                .is_ok_and(|uids| uids.contains(&uid));
+            if !self.allowed_worker_uids.contains(&uid) && !dynamic_allowed {
                 tracing::warn!(uid, "console worker rejected by local UID policy");
                 drop(stream);
                 continue;
@@ -151,6 +165,71 @@ fn set_acl(path: &Path, spec: &str, action: &str) -> AgentResult<()> {
     } else {
         Err(AgentError::Config(format!("{action}: setfacl failed")))
     }
+}
+
+/// GDM on current Ubuntu releases can run its greeter with a transient
+/// systemd DynamicUser UID (for example `gdm-greeter` / 60578).  Static
+/// installer-time UID lookups cannot safely predict that UID after a reboot.
+/// Refresh from logind instead, grant it an ACL, and keep the authorization
+/// set equal to *currently active* greeter sessions.
+#[cfg(target_os = "linux")]
+fn spawn_gdm_greeter_refresh(path: std::path::PathBuf, active: Arc<RwLock<BTreeSet<u32>>>) {
+    tokio::spawn(async move {
+        loop {
+            let discovered = active_gdm_greeter_uids();
+            if let Ok(mut permitted) = active.write() {
+                let new_uids = discovered
+                    .difference(&permitted)
+                    .copied()
+                    .collect::<BTreeSet<_>>();
+                if !new_uids.is_empty() {
+                    match grant_worker_socket_access(&path, &new_uids) {
+                        Ok(()) => {
+                            tracing::info!(uids = ?new_uids, "authorized active GDM greeter worker")
+                        },
+                        Err(error) => {
+                            tracing::warn!(error = %error, "could not grant active GDM greeter socket ACL");
+                            // Do not add a UID that lacks the filesystem ACL.
+                            continue;
+                        },
+                    }
+                }
+                *permitted = discovered;
+            } else {
+                tracing::warn!("GDM greeter UID policy lock poisoned");
+            }
+            tokio::time::sleep(Duration::from_secs(2)).await;
+        }
+    });
+}
+
+#[cfg(target_os = "linux")]
+fn active_gdm_greeter_uids() -> BTreeSet<u32> {
+    let output = std::process::Command::new("/usr/bin/loginctl")
+        .args(["list-sessions", "--no-legend", "--no-pager"])
+        .stdin(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null())
+        .output();
+    let Ok(output) = output else {
+        return BTreeSet::new();
+    };
+    if !output.status.success() {
+        return BTreeSet::new();
+    }
+    String::from_utf8_lossy(&output.stdout)
+        .lines()
+        .filter_map(parse_gdm_greeter_session_uid)
+        .collect()
+}
+
+/// `loginctl list-sessions --no-legend` begins each row with session ID, UID,
+/// and user.  Only the exact GDM greeter account is accepted; a LAN client or
+/// arbitrary local process cannot nominate an UID through this path.
+fn parse_gdm_greeter_session_uid(line: &str) -> Option<u32> {
+    let mut fields = line.split_whitespace();
+    let _session_id = fields.next()?;
+    let uid = fields.next()?.parse().ok()?;
+    (fields.next()? == "gdm-greeter").then_some(uid)
 }
 
 /// Switchable source that follows the current seat0 worker. It owns neither a
@@ -347,5 +426,17 @@ mod tests {
         let error = worker_error(WorkerErrorCode::CaptureUnavailable);
         assert!(!error.to_string().contains("password"));
         assert!(!error.to_string().contains("key"));
+    }
+
+    #[test]
+    fn accepts_only_the_active_gdm_greeter_logind_row() {
+        assert_eq!(
+            parse_gdm_greeter_session_uid("c1 60578 gdm-greeter seat0 1970 greeter tty1 no -"),
+            Some(60_578)
+        );
+        assert_eq!(
+            parse_gdm_greeter_session_uid("3 1000 gus user - 4583 user - no -"),
+            None
+        );
     }
 }
