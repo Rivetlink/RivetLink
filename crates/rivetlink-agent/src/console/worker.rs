@@ -22,6 +22,12 @@ use crate::input::{InputAction, InputHandle};
 const MAX_IPC_FRAME: usize = 64 * 1024;
 /// Capture is deliberately bounded even if a compromised broker requests more.
 const MAX_CAPTURE_TIMEOUT_MS: u64 = 15_000;
+/// GDM's user manager can start before the boot-time broker has created its
+/// socket. Wait quietly for that narrow normal-boot race instead of emitting a
+/// restart-loop error every few seconds. Permission failures still surface
+/// immediately and remain diagnosable.
+const BROKER_SOCKET_WAIT: Duration = Duration::from_secs(12);
+const BROKER_SOCKET_RETRY: Duration = Duration::from_millis(250);
 
 /// Input accepted from the broker after its independent trusted-client check.
 /// This excludes clipboard, files, shell commands, and arbitrary keycode data.
@@ -77,7 +83,7 @@ pub enum WorkerErrorCode {
 /// creates one and never changes ownership or mode itself.
 pub async fn run(socket_path: &Path) -> AgentResult<()> {
     require_graphical_session()?;
-    let stream = UnixStream::connect(socket_path).await.map_err(|error| {
+    let stream = connect_to_broker(socket_path).await.map_err(|error| {
         // This is a local Unix-socket access failure, not an invalid RivetLink
         // configuration.  Keeping its OS error kind lets the journal and UI
         // distinguish a permission boundary problem from a missing display.
@@ -87,6 +93,26 @@ pub async fn run(socket_path: &Path) -> AgentResult<()> {
         ))
     })?;
     serve(stream).await
+}
+
+async fn connect_to_broker(socket_path: &Path) -> std::io::Result<UnixStream> {
+    let deadline = tokio::time::Instant::now() + BROKER_SOCKET_WAIT;
+    loop {
+        match UnixStream::connect(socket_path).await {
+            Ok(stream) => return Ok(stream),
+            Err(error)
+                if should_retry_broker_connect(error.kind())
+                    && tokio::time::Instant::now() < deadline =>
+            {
+                tokio::time::sleep(BROKER_SOCKET_RETRY).await;
+            },
+            Err(error) => return Err(error),
+        }
+    }
+}
+
+fn should_retry_broker_connect(kind: std::io::ErrorKind) -> bool {
+    kind == std::io::ErrorKind::NotFound
 }
 
 /// Serve one broker connection. A broker must open a fresh worker connection
@@ -286,6 +312,14 @@ mod tests {
         assert!(matches!(
             graphical_session_state(),
             HostConsoleState::GdmLogin | HostConsoleState::DesktopReady
+        ));
+    }
+
+    #[test]
+    fn only_a_missing_broker_socket_is_a_normal_boot_race() {
+        assert!(should_retry_broker_connect(std::io::ErrorKind::NotFound));
+        assert!(!should_retry_broker_connect(
+            std::io::ErrorKind::PermissionDenied
         ));
     }
 

@@ -136,9 +136,10 @@ seat0 session. Choose direct authenticated **Local network**, **Via relay**, or
 both: LAN needs no server/account/internet; relay registration uses the current
 signed-in app session and never copies a token to a script or service. It does
 not enable auto-login, RDP/VNC, shell or file access. Stock GNOME/Mutter does
-not expose capture or input for the *existing physical GDM login display*;
-RivetLink reports that state safely and captures the real seat after normal
-desktop login. See [the physical-console guide](docs/ubuntu-physical-console-broker.md).
+not expose capture or input for the *existing physical GDM login display*.
+GNOME Remote Login uses a separate RDP-owned display and does not expose a
+public raw-frame/input API for RivetLink's protocol. See
+[the remote-login integration boundary](docs/ubuntu-gnome-remote-login.md).
 
 ## Development
 

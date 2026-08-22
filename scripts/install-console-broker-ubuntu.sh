@@ -95,8 +95,6 @@ RuntimeDirectoryMode=0710
 ExecStart=/usr/local/lib/rivetlink/rivet-agent --config /var/lib/rivetlink/agent.json console-broker --socket /run/rivetlink/console.sock --allowed-worker-uid $GDM_UID --allowed-worker-uid $OWNER_UID
 Restart=on-failure
 RestartSec=5
-StartLimitIntervalSec=60
-StartLimitBurst=5
 NoNewPrivileges=yes
 PrivateTmp=yes
 ProtectSystem=strict
@@ -150,8 +148,7 @@ Status: systemctl status rivetlink-console-broker
 Logs:   journalctl -u rivetlink-console-broker -b
 Worker: journalctl _SYSTEMD_USER_UNIT=rivetlink-console-worker.service -b
 
-Important: this first broker wiring provides authenticated GDM/GNOME capture
-and an authorization-gated input IPC path. Use a RivetLink build whose desktop
-client supports the ConsoleControl session capability before expecting the UI
-to send input through the relay.
+Important: this broker captures and controls the authenticated GNOME desktop.
+Stock GNOME intentionally does not permit RivetLink to capture or control the
+physical GDM login display through its public APIs.
 DONE
