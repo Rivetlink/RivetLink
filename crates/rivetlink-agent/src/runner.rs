@@ -577,7 +577,7 @@ async fn run_relay_physical_console(
                 }
             },
             Err(error) => {
-                tracing::warn!(error = %error, "physical-console relay connection failed; retrying")
+                tracing::warn!(error = %error, "physical-console relay connection failed; retrying");
             },
         }
         let delay = reconnect_delay(failed_attempts);

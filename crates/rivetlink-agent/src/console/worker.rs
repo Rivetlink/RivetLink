@@ -62,7 +62,12 @@ pub enum WorkerResponse {
 pub enum WorkerErrorCode {
     NoGraphicalSession,
     InvalidRequest,
-    CaptureUnavailable,
+    GdmCaptureUnavailable,
+    ScreenCastUnavailable,
+    PipeWireUnavailable,
+    CaptureAuthorizationDenied,
+    CompositorFailure,
+    FrameEncodingFailed,
 }
 
 /// Run the worker against the broker's already-created Unix socket.
@@ -88,20 +93,17 @@ pub async fn run(socket_path: &Path) -> AgentResult<()> {
 /// rather than accidentally reusing a stale D-Bus session.
 pub async fn serve(stream: UnixStream) -> AgentResult<()> {
     let (mut reader, mut writer) = stream.into_split();
-    write_packet(
-        &mut writer,
-        &WorkerResponse::Ready {
-            state: graphical_session_state(),
-        },
-    )
-    .await?;
+    // A worker belongs to exactly one graphical D-Bus session.  On GDM →
+    // GNOME the broker accepts a fresh worker rather than reusing this state.
+    let state = graphical_session_state();
+    write_packet(&mut writer, &WorkerResponse::Ready { state }).await?;
     let mut input: Option<InputHandle> = None;
 
     loop {
         let request: WorkerRequest = read_packet(&mut reader).await?;
         let response = match request {
             WorkerRequest::Ping => WorkerResponse::Pong,
-            WorkerRequest::Capture { timeout_ms } => capture(timeout_ms).await,
+            WorkerRequest::Capture { timeout_ms } => capture(timeout_ms, state).await,
             WorkerRequest::Input { event } => apply_input(&mut input, event),
             WorkerRequest::Stop => return Ok(()),
         };
@@ -112,6 +114,7 @@ pub async fn serve(stream: UnixStream) -> AgentResult<()> {
 /// Classify only the session that owns this worker. `greeter` is emitted by
 /// GDM's actual systemd user session; a normal GNOME user session is desktop.
 /// This does not infer a password field or inspect any screen content.
+#[allow(clippy::disallowed_methods)] // systemd supplies these session-scoped facts
 fn graphical_session_state() -> HostConsoleState {
     if std::env::var("XDG_SESSION_CLASS").is_ok_and(|class| class == "greeter")
         || std::env::var("USER").is_ok_and(|user| user == "gdm")
@@ -134,10 +137,10 @@ fn require_graphical_session() -> AgentResult<()> {
     }
 }
 
-async fn capture(timeout_ms: u64) -> WorkerResponse {
+async fn capture(timeout_ms: u64, state: HostConsoleState) -> WorkerResponse {
     let timeout_ms = timeout_ms.clamp(1, MAX_CAPTURE_TIMEOUT_MS);
     match tokio::task::spawn_blocking(move || {
-        crate::capture::mutter::capture_console_png(Duration::from_millis(timeout_ms))
+        crate::capture::mutter::capture_console_png(Duration::from_millis(timeout_ms), state)
     })
     .await
     {
@@ -147,15 +150,36 @@ async fn capture(timeout_ms: u64) -> WorkerResponse {
         Ok(Err(error)) => {
             tracing::warn!(error = %error, "console capture failed");
             WorkerResponse::Error {
-                code: WorkerErrorCode::CaptureUnavailable,
+                code: capture_error_code(state, &error),
             }
         },
         Err(error) => {
             tracing::warn!(error = %error, "console capture task failed");
             WorkerResponse::Error {
-                code: WorkerErrorCode::CaptureUnavailable,
+                code: WorkerErrorCode::CompositorFailure,
             }
         },
+    }
+}
+
+/// Convert local compositor diagnostics into a stable, non-sensitive broker
+/// result.  Raw D-Bus/GStreamer text stays in the local journal only; it is
+/// never sent over a physical-console connection.
+fn capture_error_code(state: HostConsoleState, error: &AgentError) -> WorkerErrorCode {
+    let text = error.to_string().to_ascii_lowercase();
+    if text.contains("access denied") || text.contains("not authorized") {
+        WorkerErrorCode::CaptureAuthorizationDenied
+    } else if text.contains("pipewire") || text.contains("gst-launch") || text.contains("gstreamer")
+    {
+        WorkerErrorCode::PipeWireUnavailable
+    } else if text.contains("encode") || text.contains("png") {
+        WorkerErrorCode::FrameEncodingFailed
+    } else if state == HostConsoleState::GdmLogin || state == HostConsoleState::SessionLocked {
+        WorkerErrorCode::GdmCaptureUnavailable
+    } else if text.contains("screencast") || text.contains("session creation inhibited") {
+        WorkerErrorCode::ScreenCastUnavailable
+    } else {
+        WorkerErrorCode::CompositorFailure
     }
 }
 
@@ -248,6 +272,25 @@ mod tests {
             graphical_session_state(),
             HostConsoleState::GdmLogin | HostConsoleState::DesktopReady
         ));
+    }
+
+    #[test]
+    fn capture_errors_are_classified_without_disclosing_compositor_text() {
+        let gdm = capture_error_code(
+            HostConsoleState::GdmLogin,
+            &AgentError::Lan("Mutter RemoteDesktop D-Bus error: unavailable".to_string()),
+        );
+        assert_eq!(gdm, WorkerErrorCode::GdmCaptureUnavailable);
+        let pipewire = capture_error_code(
+            HostConsoleState::DesktopReady,
+            &AgentError::Config("gst-launch-1.0 failed to start".to_string()),
+        );
+        assert_eq!(pipewire, WorkerErrorCode::PipeWireUnavailable);
+        let denied = capture_error_code(
+            HostConsoleState::DesktopReady,
+            &AgentError::Lan("Mutter ScreenCast D-Bus error: Access denied".to_string()),
+        );
+        assert_eq!(denied, WorkerErrorCode::CaptureAuthorizationDenied);
     }
 
     #[tokio::test]

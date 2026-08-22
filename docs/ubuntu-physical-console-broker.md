@@ -18,12 +18,13 @@ or GNOME systemd user session. Ubuntu may name its greeter account
 installed GDM account. It gets the session's Mutter ScreenCast and
 RemoteDesktop D-Bus access, but has no relay credential and exposes only a
 length-bounded Unix socket protocol for a PNG capture and normalized pointer,
-scroll or key event. Some Ubuntu GDM builds intentionally inhibit a new
-Mutter ScreenCast before login and GNOME does the same on a locked desktop;
-the dedicated, trusted physical-console worker then falls back to GNOME Shell's
-one-shot screenshot interface for that same seat. It does not relax
-Mutter/AppArmor policy, open a portal chooser, or expose this fallback to
-ordinary screen sharing. The socket is `0660`, belongs to the private
+scroll or key event. GDM intentionally inhibits a standalone ScreenCast before
+login (and GNOME can do the same on a locked desktop), so the worker uses a
+Mutter `RemoteDesktop`-bound ScreenCast for those states. That supplies a
+PipeWire frame stream from the actual seat0 display; RivetLink reads pixels in
+memory and encodes the response in memory. It never asks GNOME Shell to save a
+screenshot, creates no image file, does not relax Mutter/AppArmor policy, and
+does not open a portal chooser. The socket is `0660`, belongs to the private
 `rivetlink-console` group, and broker-side peer credentials must match the GDM
 or configured owner UID.
 
@@ -110,11 +111,20 @@ rivetlink-console-worker.service       global session unit for GDM/GNOME
 /usr/local/lib/rivetlink/rivet-agent   installed agent binary
 ```
 
-On upgrade the authorized installer replaces `rivet-agent` before it rewrites
-and restarts the broker unit. The global worker unit is reloaded and restarted
-in the current GNOME session; future GDM/GNOME sessions load the same native
-binary automatically. The former extracted-AppImage service runtime is not a
-service path any more and is removed by the explicit uninstall operation.
+Every RivetLink Application update also carries its matching native service
+agent. On the next launch, the desktop app compares that bundled agent with
+`/usr/local/lib/rivetlink/rivet-agent`. If they differ, it asks only for the
+normal PolicyKit authorization and invokes a narrow agent-update helper. That
+helper atomically replaces the agent, restarts the broker only when it was
+already active, and the app restarts the current session worker. It does not
+ask for a controller key again and does not alter the identity, trusted clients,
+LAN/relay settings, or service-unit contents. A disabled physical console stays
+disabled while its agent is updated, ready for the next explicit enable.
+
+The comparison is exact file content, rather than the agent's display version,
+so a stale service executable cannot silently remain behind a successful
+desktop update. The former extracted-AppImage service runtime is not a service
+path any more and is removed by the explicit uninstall operation.
 
 Check operation:
 
@@ -132,6 +142,14 @@ Both `ExecStart` values must name `/usr/local/lib/rivetlink/rivet-agent`, not
 `AppRun`. With Ubuntu's restricted unprivileged-user-namespace profile, the
 kernel log must contain no AppArmor `DENIED` connection to
 `/run/rivetlink/console.sock` after the worker starts.
+
+To check that the installed native agent is the one from the current RivetLink
+Application build, open **Settings → Ubuntu physical console**: its service
+agent badge must read **Native** and the broker badge **Running**. From a
+terminal, the broker and worker command lines must both contain
+`/usr/local/lib/rivetlink/rivet-agent`; do not use the agent's `--version`
+output as the compatibility check because the installer compares the exact
+bundled binary instead.
 
 After first installation, reboot once so GDM and the desktop receive the
 `rivetlink-console` group. A normal subsequent reboot requires no local
@@ -161,7 +179,8 @@ alter GDM, GNOME, PAM, display configuration or unrelated accounts.
    LAN, then wait for GDM and discover the host in RivetLink's Local network
    tab. It must appear without a relay account or server.
 4. Open its **Physical console · Local network** view and verify it is the real GDM screen shown by the
-   HDMI dummy.
+   HDMI dummy. Confirm the broker reports `state=GdmLogin` and that the journal
+   contains neither `Saving to disk is disabled` nor a screenshot-file fallback.
 5. Focus the image in the RivetLink Application, click the user/password field
    and type normally. RivetLink sends physical key events, not a password
    credential.
@@ -177,6 +196,9 @@ alter GDM, GNOME, PAM, display configuration or unrelated accounts.
     restart both units. Verify the worker stays active, the broker reports an
     active graphical worker, and the kernel journal contains no AppArmor denial
     for `/run/rivetlink/console.sock`.
+11. Before and after this test, verify that no RivetLink screenshot images were
+    created under `/run/user/*`, `/tmp`, or `/var/tmp`; GDM frame data must stay
+    in the active worker and encrypted RivetLink session only.
 
 The owner, not CI, must run this real HDMI-dummy/GDM checklist. Automated tests
 cover the configuration, authenticated direct handshake and state machine but

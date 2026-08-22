@@ -185,7 +185,7 @@ fn spawn_gdm_greeter_refresh(path: std::path::PathBuf, active: Arc<RwLock<BTreeS
                 if !new_uids.is_empty() {
                     match grant_worker_socket_access(&path, &new_uids) {
                         Ok(()) => {
-                            tracing::info!(uids = ?new_uids, "authorized active GDM greeter worker")
+                            tracing::info!(uids = ?new_uids, "authorized active GDM greeter worker");
                         },
                         Err(error) => {
                             tracing::warn!(error = %error, "could not grant active GDM greeter socket ACL");
@@ -402,9 +402,14 @@ fn worker_error(code: WorkerErrorCode) -> AgentError {
     let description = match code {
         WorkerErrorCode::NoGraphicalSession => "the graphical console session is unavailable",
         WorkerErrorCode::InvalidRequest => "the console worker rejected the request",
-        WorkerErrorCode::CaptureUnavailable => {
-            "the console worker could not capture the active display"
+        WorkerErrorCode::GdmCaptureUnavailable => "the GDM console capture backend is unavailable",
+        WorkerErrorCode::ScreenCastUnavailable => "the Mutter ScreenCast service is unavailable",
+        WorkerErrorCode::PipeWireUnavailable => "the PipeWire capture service is unavailable",
+        WorkerErrorCode::CaptureAuthorizationDenied => "the compositor denied console capture",
+        WorkerErrorCode::CompositorFailure => {
+            "the console compositor could not capture the active display"
         },
+        WorkerErrorCode::FrameEncodingFailed => "the console frame could not be encoded",
     };
     AgentError::Relay(description.to_string())
 }
@@ -423,7 +428,7 @@ mod tests {
 
     #[test]
     fn worker_error_is_non_sensitive() {
-        let error = worker_error(WorkerErrorCode::CaptureUnavailable);
+        let error = worker_error(WorkerErrorCode::GdmCaptureUnavailable);
         assert!(!error.to_string().contains("password"));
         assert!(!error.to_string().contains("key"));
     }
