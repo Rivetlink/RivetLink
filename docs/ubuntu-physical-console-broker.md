@@ -19,10 +19,11 @@ installed GDM account. It gets the session's Mutter ScreenCast and
 RemoteDesktop D-Bus access, but has no relay credential and exposes only a
 length-bounded Unix socket protocol for a PNG capture and normalized pointer,
 scroll or key event. Some Ubuntu GDM builds intentionally inhibit a new
-Mutter ScreenCast before login; only in that GDM worker state RivetLink falls
-back to GNOME Shell's one-shot screenshot interface for the same seat. It does
-not relax Mutter/AppArmor policy, open a portal chooser, or apply that fallback
-to a locked or ordinary desktop session. The socket is `0660`, belongs to the private
+Mutter ScreenCast before login and GNOME does the same on a locked desktop;
+the dedicated, trusted physical-console worker then falls back to GNOME Shell's
+one-shot screenshot interface for that same seat. It does not relax
+Mutter/AppArmor policy, open a portal chooser, or expose this fallback to
+ordinary screen sharing. The socket is `0660`, belongs to the private
 `rivetlink-console` group, and broker-side peer credentials must match the GDM
 or configured owner UID.
 

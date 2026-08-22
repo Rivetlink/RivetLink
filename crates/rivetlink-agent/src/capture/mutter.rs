@@ -156,16 +156,20 @@ pub fn capture_png(timeout: Duration) -> AgentResult<Vec<u8>> {
     encode_bgrx_png(width, height, &bgrx)
 }
 
-/// Capture the GDM greeter safely when its Mutter ScreenCast policy explicitly
-/// inhibits new cast sessions. GDM does this before login, even for its own
-/// graphical worker. GNOME Shell exposes a separate one-shot screenshot API
-/// for the session it owns; unlike the portal it shows no chooser and never
-/// targets another seat. This fallback is deliberately limited to GDM — a
-/// locked/ordinary desktop must continue to obey the normal ScreenCast policy.
-pub fn capture_console_png(timeout: Duration, gdm_login: bool) -> AgentResult<Vec<u8>> {
+/// Capture a physical console safely when Mutter's ScreenCast policy explicitly
+/// inhibits new cast sessions. GNOME does this before login *and while the
+/// desktop is locked*. Both are intended physical-console states: the owner
+/// must be able to see and unlock the real HDMI-backed seat after explicitly
+/// authorizing a trusted controller. GNOME Shell exposes a separate one-shot
+/// screenshot API for the session it owns; unlike the portal it shows no
+/// chooser and never targets another seat. This fallback exists only in the
+/// dedicated physical-console worker, never in ordinary screen sharing.
+pub fn capture_console_png(timeout: Duration) -> AgentResult<Vec<u8>> {
     match capture_png(timeout) {
-        Err(error) if gdm_login && session_creation_inhibited(&error) => {
-            tracing::info!("GDM inhibits ScreenCast; using GNOME Shell one-shot screenshot");
+        Err(error) if session_creation_inhibited(&error) => {
+            tracing::info!(
+                "physical console ScreenCast inhibited; using GNOME Shell one-shot screenshot"
+            );
             shell_screenshot_png()
         },
         result => result,
@@ -190,17 +194,20 @@ fn shell_screenshot_png() -> AgentResult<Vec<u8>> {
 
     let runtime = std::env::var_os("XDG_RUNTIME_DIR")
         .map(PathBuf::from)
-        .ok_or_else(|| AgentError::Config("GDM screenshot requires XDG_RUNTIME_DIR".to_string()))?;
+        .ok_or_else(|| {
+            AgentError::Config("console screenshot requires XDG_RUNTIME_DIR".to_string())
+        })?;
     let directory = runtime.join(format!("rivetlink-console-{}", uuid::Uuid::now_v7()));
-    fs::create_dir(&directory)
-        .map_err(|error| AgentError::Config(format!("create GDM screenshot directory: {error}")))?;
+    fs::create_dir(&directory).map_err(|error| {
+        AgentError::Config(format!("create console screenshot directory: {error}"))
+    })?;
     let cleanup = || {
         let _ = fs::remove_dir_all(&directory);
     };
     if let Err(error) = fs::set_permissions(&directory, fs::Permissions::from_mode(0o700)) {
         cleanup();
         return Err(AgentError::Config(format!(
-            "secure GDM screenshot directory: {error}"
+            "secure console screenshot directory: {error}"
         )));
     }
     let requested = directory.join("screen.png");
@@ -219,7 +226,7 @@ fn shell_screenshot_png() -> AgentResult<Vec<u8>> {
             .map_err(dbus_err)?;
         if !success {
             return Err(AgentError::Config(
-                "GNOME Shell declined the GDM screenshot".to_string(),
+                "GNOME Shell declined the console screenshot".to_string(),
             ));
         }
         let used = PathBuf::from(used);
@@ -228,7 +235,8 @@ fn shell_screenshot_png() -> AgentResult<Vec<u8>> {
                 "GNOME Shell returned an unexpected screenshot path".to_string(),
             ));
         }
-        fs::read(&used).map_err(|error| AgentError::Config(format!("read GDM screenshot: {error}")))
+        fs::read(&used)
+            .map_err(|error| AgentError::Config(format!("read console screenshot: {error}")))
     })();
     cleanup();
     result
