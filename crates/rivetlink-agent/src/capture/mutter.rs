@@ -24,7 +24,7 @@ use std::time::Duration;
 
 use tokio::sync::mpsc::Sender;
 use zbus::blocking::{Connection, Proxy};
-use zbus::zvariant::{OwnedObjectPath, OwnedValue, Str, Value};
+use zbus::zvariant::{OwnedObjectPath, OwnedValue, Value};
 
 use rivetlink_protocol::HostConsoleState;
 use rivetlink_sdk::lan::{DisplayInfo, FrameDelta};
@@ -44,9 +44,6 @@ const FALLBACK_H: usize = 720;
 
 const SC_DEST: &str = "org.gnome.Mutter.ScreenCast";
 const SC_PATH: &str = "/org/gnome/Mutter/ScreenCast";
-const RD_DEST: &str = "org.gnome.Mutter.RemoteDesktop";
-const RD_PATH: &str = "/org/gnome/Mutter/RemoteDesktop";
-const RD_SESSION_IFACE: &str = "org.gnome.Mutter.RemoteDesktop.Session";
 
 /// One monitor Mutter can cast, with its current-mode pixel resolution (0×0 when
 /// unknown — capture then falls back to a fixed size).
@@ -119,16 +116,6 @@ pub fn capture_png(timeout: Duration) -> AgentResult<Vec<u8>> {
     capture_primary_png(timeout, MutterSession::record_monitor)
 }
 
-/// Capture the real GDM or locked desktop through an in-memory PipeWire stream
-/// bound to a Mutter RemoteDesktop session.  Mutter documents this binding for
-/// remote-desktop-driven screen casts, and GNOME Remote Desktop uses the same
-/// API shape for its GDM remote-login mode.  No PNG/JPEG is ever written to a
-/// filesystem: GStreamer emits raw pixels to stdout and the worker encodes them
-/// entirely in process memory.
-fn capture_remote_desktop_png(timeout: Duration) -> AgentResult<Vec<u8>> {
-    capture_primary_png(timeout, MutterSession::record_monitor_remote_desktop)
-}
-
 /// The only backends permitted for a physical console session.  In particular,
 /// this intentionally has no screenshot-file backend: a greeter frame can
 /// contain account information and must not be persisted as a convenience
@@ -136,16 +123,21 @@ fn capture_remote_desktop_png(timeout: Duration) -> AgentResult<Vec<u8>> {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum ConsoleCaptureBackend {
     DirectScreenCast,
-    RemoteDesktopScreenCast,
 }
 
 fn console_capture_backend(state: HostConsoleState) -> AgentResult<ConsoleCaptureBackend> {
     match state {
-        // GDM (and a locked session if a worker reports it in a later release)
-        // needs the ScreenCast session to be owned by RemoteDesktop.
-        HostConsoleState::GdmLogin | HostConsoleState::SessionLocked => {
-            Ok(ConsoleCaptureBackend::RemoteDesktopScreenCast)
-        },
+        // Mutter deliberately inhibits *all* RemoteDesktop/ScreenCast sessions
+        // for the existing local GDM (and locked) display.  GNOME's supported
+        // Remote Login feature does not relax this: its system dispatcher asks
+        // GDM to create a distinct headless RemoteDisplay and hands an RDP
+        // connection to that display.  It cannot be used to read or control
+        // the physical seat0 display.  Do not turn this into a privileged
+        // workaround; there is no supported capture/input API for this state.
+        HostConsoleState::GdmLogin | HostConsoleState::SessionLocked => Err(AgentError::Config(
+            "the existing GDM or locked physical display cannot be captured through a supported Mutter API"
+                .to_string(),
+        )),
         HostConsoleState::DesktopReady => Ok(ConsoleCaptureBackend::DirectScreenCast),
         HostConsoleState::Booting
         | HostConsoleState::SessionStarting
@@ -205,32 +197,15 @@ fn capture_primary_png(
 }
 
 /// Capture the physical console using the backend appropriate to the graphical
-/// session that owns this worker.  GDM intentionally rejects standalone
-/// ScreenCast sessions and disables disk screenshots.  Its compatible path is
-/// an in-memory ScreenCast tied to a RemoteDesktop session.  A normal unlocked
-/// desktop retains the existing standalone ScreenCast path, with the same
-/// in-memory fallback when Mutter explicitly inhibits it (for example while
-/// that desktop is locked).
+/// session that owns this worker.  An unlocked desktop uses Mutter's normal
+/// ScreenCast API.  The existing GDM and locked displays are explicitly
+/// rejected before any capture or input session is requested: stock Mutter
+/// intentionally inhibits those APIs and GNOME Remote Login creates a separate
+/// headless display rather than granting access to physical seat0.
 pub fn capture_console_png(timeout: Duration, state: HostConsoleState) -> AgentResult<Vec<u8>> {
     match console_capture_backend(state)? {
-        ConsoleCaptureBackend::RemoteDesktopScreenCast => capture_remote_desktop_png(timeout),
-        ConsoleCaptureBackend::DirectScreenCast => match capture_png(timeout) {
-            Err(error) if session_creation_inhibited(&error) => {
-                tracing::info!(
-                    "physical console ScreenCast inhibited; retrying through RemoteDesktop-bound PipeWire"
-                );
-                capture_remote_desktop_png(timeout)
-            },
-            result => result,
-        },
+        ConsoleCaptureBackend::DirectScreenCast => capture_png(timeout),
     }
-}
-
-fn session_creation_inhibited(error: &AgentError) -> bool {
-    error
-        .to_string()
-        .to_ascii_lowercase()
-        .contains("session creation inhibited")
 }
 
 /// Capture `display` (a monitor index, `None` = first/primary) and push delta
@@ -342,13 +317,11 @@ pub fn stream(
 
 // ---- Mutter ScreenCast session ---------------------------------------------
 
-/// A live Mutter ScreenCast session.  The GDM-compatible variant is tied to a
-/// RemoteDesktop session, which is also torn down on drop.  Both variants
-/// expose their pixels solely through the PipeWire node id.
+/// A live Mutter ScreenCast session. Its pixels are exposed solely through the
+/// PipeWire node id.
 struct MutterSession {
     conn: Connection,
     session_path: OwnedObjectPath,
-    remote_desktop_path: Option<OwnedObjectPath>,
     node_id: u32,
 }
 
@@ -399,88 +372,6 @@ impl MutterSession {
         Ok(Self {
             conn,
             session_path,
-            remote_desktop_path: None,
-            node_id,
-        })
-    }
-
-    /// Create an in-memory monitor capture whose ScreenCast session is driven
-    /// by a RemoteDesktop session.  This is the Mutter API arrangement used by
-    /// GNOME Remote Desktop for remote-login sessions, and unlike GNOME Shell's
-    /// screenshot D-Bus API it never needs a filename.
-    fn record_monitor_remote_desktop(connector: &str) -> AgentResult<Self> {
-        let conn = Connection::session().map_err(dbus_err)?;
-
-        let remote_desktop =
-            Proxy::new(&conn, RD_DEST, RD_PATH, RD_DEST).map_err(remote_desktop_dbus_err)?;
-        let remote_desktop_path: OwnedObjectPath = remote_desktop
-            .call("CreateSession", &())
-            .map_err(remote_desktop_dbus_err)?;
-        let remote_desktop_session = Proxy::new(
-            &conn,
-            RD_DEST,
-            remote_desktop_path.clone(),
-            RD_SESSION_IFACE,
-        )
-        .map_err(remote_desktop_dbus_err)?;
-        let remote_desktop_session_id: String = remote_desktop_session
-            .get_property("SessionId")
-            .map_err(remote_desktop_dbus_err)?;
-
-        let screencast = Proxy::new(&conn, SC_DEST, SC_PATH, SC_DEST).map_err(dbus_err)?;
-        let mut session_props: BTreeMap<&str, Value> = BTreeMap::new();
-        session_props.insert(
-            "remote-desktop-session-id",
-            Value::Str(Str::from(remote_desktop_session_id)),
-        );
-        // Match GNOME Remote Desktop's remote-login session: animations are
-        // not useful to a remote physical-console viewer and can delay the
-        // first stable frame during a GDM ↔ GNOME handover.
-        session_props.insert("disable-animations", Value::Bool(true));
-        let session_path: OwnedObjectPath = screencast
-            .call("CreateSession", &(session_props,))
-            .map_err(dbus_err)?;
-        let session = Proxy::new(
-            &conn,
-            SC_DEST,
-            session_path.clone(),
-            "org.gnome.Mutter.ScreenCast.Session",
-        )
-        .map_err(dbus_err)?;
-
-        // Remote-desktop-driven ScreenCast sessions are started by this parent
-        // session.  Start it before recording the monitor, following GNOME
-        // Remote Desktop's established ordering.
-        remote_desktop_session
-            .call::<_, _, ()>("Start", &())
-            .map_err(remote_desktop_dbus_err)?;
-
-        let mut stream_props: BTreeMap<&str, Value> = BTreeMap::new();
-        stream_props.insert("cursor-mode", Value::U32(1));
-        let stream_path: OwnedObjectPath = session
-            .call("RecordMonitor", &(connector, stream_props))
-            .map_err(dbus_err)?;
-        let stream = Proxy::new(
-            &conn,
-            SC_DEST,
-            stream_path,
-            "org.gnome.Mutter.ScreenCast.Stream",
-        )
-        .map_err(dbus_err)?;
-        let mut signal = stream
-            .receive_signal("PipeWireStreamAdded")
-            .map_err(dbus_err)?;
-        stream.call::<_, _, ()>("Start", &()).map_err(dbus_err)?;
-
-        let msg = signal
-            .next()
-            .ok_or_else(|| AgentError::Lan("Mutter sent no PipeWireStreamAdded".to_string()))?;
-        let node_id: u32 = msg.body().deserialize().map_err(dbus_err)?;
-
-        Ok(Self {
-            conn,
-            session_path,
-            remote_desktop_path: Some(remote_desktop_path),
             node_id,
         })
     }
@@ -495,11 +386,6 @@ impl Drop for MutterSession {
             "org.gnome.Mutter.ScreenCast.Session",
         ) {
             let _ = session.call::<_, _, ()>("Stop", &());
-        }
-        if let Some(path) = &self.remote_desktop_path {
-            if let Ok(session) = Proxy::new(&self.conn, RD_DEST, path.clone(), RD_SESSION_IFACE) {
-                let _ = session.call::<_, _, ()>("Stop", &());
-            }
         }
     }
 }
@@ -776,10 +662,6 @@ fn dbus_err(e: impl std::fmt::Display) -> AgentError {
     AgentError::Lan(format!("Mutter ScreenCast D-Bus error: {e}"))
 }
 
-fn remote_desktop_dbus_err(e: impl std::fmt::Display) -> AgentError {
-    AgentError::Lan(format!("Mutter RemoteDesktop D-Bus error: {e}"))
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -812,29 +694,15 @@ mod tests {
     }
 
     #[test]
-    fn recognizes_only_mutters_explicit_inhibit_error() {
-        assert!(session_creation_inhibited(&AgentError::Lan(
-            "Mutter ScreenCast D-Bus error: Session creation inhibited".to_string(),
-        )));
-        assert!(!session_creation_inhibited(&AgentError::Lan(
-            "Mutter ScreenCast D-Bus error: Access denied".to_string(),
-        )));
-    }
-
-    #[test]
-    fn gdm_and_locked_console_use_in_memory_remote_desktop_capture() {
-        assert_eq!(
-            console_capture_backend(HostConsoleState::GdmLogin).unwrap(),
-            ConsoleCaptureBackend::RemoteDesktopScreenCast
-        );
-        assert_eq!(
-            console_capture_backend(HostConsoleState::SessionLocked).unwrap(),
-            ConsoleCaptureBackend::RemoteDesktopScreenCast
-        );
+    fn only_an_unlocked_desktop_can_use_the_physical_console_backend() {
         assert_eq!(
             console_capture_backend(HostConsoleState::DesktopReady).unwrap(),
             ConsoleCaptureBackend::DirectScreenCast
         );
+        for state in [HostConsoleState::GdmLogin, HostConsoleState::SessionLocked] {
+            let error = console_capture_backend(state).unwrap_err();
+            assert!(error.to_string().contains("supported Mutter API"));
+        }
     }
 
     #[test]

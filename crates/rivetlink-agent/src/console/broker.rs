@@ -402,7 +402,12 @@ fn worker_error(code: WorkerErrorCode) -> AgentError {
     let description = match code {
         WorkerErrorCode::NoGraphicalSession => "the graphical console session is unavailable",
         WorkerErrorCode::InvalidRequest => "the console worker rejected the request",
-        WorkerErrorCode::GdmCaptureUnavailable => "the GDM console capture backend is unavailable",
+        WorkerErrorCode::GdmCaptureUnavailable => {
+            "the existing GDM physical display cannot be captured through a supported GNOME API"
+        },
+        WorkerErrorCode::GdmInputUnavailable => {
+            "the existing GDM physical display cannot accept remote input through a supported GNOME API"
+        },
         WorkerErrorCode::ScreenCastUnavailable => "the Mutter ScreenCast service is unavailable",
         WorkerErrorCode::PipeWireUnavailable => "the PipeWire capture service is unavailable",
         WorkerErrorCode::CaptureAuthorizationDenied => "the compositor denied console capture",
@@ -428,9 +433,14 @@ mod tests {
 
     #[test]
     fn worker_error_is_non_sensitive() {
-        let error = worker_error(WorkerErrorCode::GdmCaptureUnavailable);
-        assert!(!error.to_string().contains("password"));
-        assert!(!error.to_string().contains("key"));
+        for code in [
+            WorkerErrorCode::GdmCaptureUnavailable,
+            WorkerErrorCode::GdmInputUnavailable,
+        ] {
+            let error = worker_error(code);
+            assert!(!error.to_string().contains("password"));
+            assert!(!error.to_string().contains("key"));
+        }
     }
 
     #[test]

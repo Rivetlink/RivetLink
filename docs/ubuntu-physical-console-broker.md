@@ -1,9 +1,26 @@
 # Ubuntu physical-console broker (GDM + HDMI dummy)
 
-This is RivetLink's unattended Ubuntu design for a permanently connected HDMI
-dummy/EDID emulator. It captures the actual seat0 monitor owned first by GDM
-and then by the normal GNOME desktop; it does **not** start a separate virtual
-GNOME monitor and does not enable automatic Ubuntu login.
+This is RivetLink's Ubuntu design for a permanently connected HDMI dummy/EDID
+emulator. It captures and controls the actual seat0 monitor after the normal
+GNOME desktop is logged in; it does **not** start a separate virtual GNOME
+monitor or enable automatic Ubuntu login.
+
+> **Important platform boundary:** stock GNOME/Mutter deliberately does not
+> permit a third-party process to capture or inject input into the existing
+> physical GDM/locked display. RivetLink detects that state before it requests
+> a Mutter session and returns a stable non-sensitive error. This is intentional
+> and is not fixed by changing Unix-socket ACLs, AppArmor, or service users.
+
+GNOME's supported pre-login feature is **Remote Login**, but it is materially
+different from a physical-console viewer: its privileged system dispatcher asks
+GDM to create a separate **headless RemoteDisplay**, then hands an **RDP**
+connection from that display to a headless user session after login. It neither
+captures nor controls the real HDMI-backed `seat0` greeter. RivetLink does not
+enable, expose, or impersonate that RDP service because doing so would violate
+the physical-seat and no-RDP requirements of this deployment. See GNOME's
+[Remote Desktop source README](https://github.com/GNOME/gnome-remote-desktop/blob/main/README.md),
+its [remote-login design discussion](https://discourse.gnome.org/t/persistent-remote-desktop-access-api/19415/2),
+and Mutter's [RemoteAccessController API](https://gnome.pages.gitlab.gnome.org/mutter/meta/class.RemoteAccessController.html).
 
 ## Security boundary
 
@@ -15,18 +32,15 @@ cannot capture or inject input itself.
 `rivetlink-console-worker.service` runs only inside the existing graphical GDM
 or GNOME systemd user session. Ubuntu may name its greeter account
 `gdm-greeter` rather than `gdm`; the installer detects and allow-lists each
-installed GDM account. It gets the session's Mutter ScreenCast and
-RemoteDesktop D-Bus access, but has no relay credential and exposes only a
-length-bounded Unix socket protocol for a PNG capture and normalized pointer,
-scroll or key event. GDM intentionally inhibits a standalone ScreenCast before
-login (and GNOME can do the same on a locked desktop), so the worker uses a
-Mutter `RemoteDesktop`-bound ScreenCast for those states. That supplies a
-PipeWire frame stream from the actual seat0 display; RivetLink reads pixels in
-memory and encodes the response in memory. It never asks GNOME Shell to save a
-screenshot, creates no image file, does not relax Mutter/AppArmor policy, and
-does not open a portal chooser. The socket is `0660`, belongs to the private
-`rivetlink-console` group, and broker-side peer credentials must match the GDM
-or configured owner UID.
+installed GDM account. The GDM worker is limited to reporting the authenticated
+`GdmLogin` state and performs **no** capture or input attempt. The normal GNOME
+worker gets the session's Mutter ScreenCast access, but has no relay credential
+and exposes only a length-bounded Unix socket protocol for in-memory PNG
+capture and normalized pointer, scroll or key events. It never asks GNOME Shell
+to save a screenshot, creates no image file, does not relax Mutter/AppArmor
+policy, and does not open a portal chooser. The socket is `0660`, belongs to
+the private `rivetlink-console` group, and broker-side peer credentials must
+match the GDM or configured owner UID.
 
 The interactive desktop AppImage is never used as either service executable.
 During setup its separately bundled native `rivet-agent` is installed as a
@@ -56,12 +70,13 @@ RivetLink does not store, inspect or log the Ubuntu password.
 
 ## Transports
 
-The physical-console broker has one GDM/GNOME capture and input source with
+The physical-console broker has one GDM/GNOME state source and a GNOME capture
+and input source with
 two independent routes to it:
 
 ```text
 trusted client ── encrypted direct LAN ──┐
-                                         ├─ physical-console broker ─ seat0 worker ─ GDM/GNOME
+                                         ├─ physical-console broker ─ seat0 worker ─ GNOME desktop
 trusted client ── E2E relay ciphertext ──┘
 ```
 
@@ -178,32 +193,35 @@ alter GDM, GNOME, PAM, display configuration or unrelated accounts.
 3. Configure **Local network** only, disable internet while retaining Ethernet
    LAN, then wait for GDM and discover the host in RivetLink's Local network
    tab. It must appear without a relay account or server.
-4. Open its **Physical console · Local network** view and verify it is the real GDM screen shown by the
-   HDMI dummy. Confirm the broker reports `state=GdmLogin` and that the journal
-   contains neither `Saving to disk is disabled` nor a screenshot-file fallback.
-5. Focus the image in the RivetLink Application, click the user/password field
-   and type normally. RivetLink sends physical key events, not a password
-   credential.
-6. Verify GDM signs in, then capture/input move to the normal GNOME desktop.
-7. Lock, unlock and log out; verify the worker reconnects to the appropriate
-   graphical session each time.
-8. Reboot from GNOME. Verify the LAN client cannot remain falsely connected,
-   then discovers/reaches GDM again after the broker and GDM worker return.
-9. Enable both Local network and Via relay. On the LAN verify the Local network
-   route; from outside the LAN verify the relay route to the same GDM, then
-   repeat login, lock/unlock and logout on each route.
-10. On an Ubuntu installation with restricted unprivileged user namespaces,
+4. Open its **Physical console · Local network** view. At `state=GdmLogin`,
+   verify RivetLink shows the supported-GNOME-API error rather than spinning,
+   saving an image, or attempting to create a RemoteDesktop session.
+5. Log in normally at the physical console, then connect in RivetLink and
+   verify capture and normalized mouse/keyboard input on the real GNOME
+   desktop.
+6. Lock and log out. Verify the active worker changes state and that RivetLink
+   safely reports GDM/locked capture as unavailable instead of bypassing it.
+7. Reboot from GNOME. Verify the LAN client cannot remain falsely connected,
+   then discovers the node again after the broker and GDM worker return.
+8. Enable both Local network and Via relay. On the LAN verify the Local network
+   route; from outside the LAN verify relay capture/input for the logged-in
+   GNOME desktop.
+9. On an Ubuntu installation with restricted unprivileged user namespaces,
     restart both units. Verify the worker stays active, the broker reports an
     active graphical worker, and the kernel journal contains no AppArmor denial
     for `/run/rivetlink/console.sock`.
-11. Before and after this test, verify that no RivetLink screenshot images were
+10. Before and after this test, verify that no RivetLink screenshot images were
     created under `/run/user/*`, `/tmp`, or `/var/tmp`; GDM frame data must stay
-    in the active worker and encrypted RivetLink session only.
+    out of RivetLink entirely, and GNOME frame data must remain in the active
+    worker and encrypted RivetLink session only.
 
 The owner, not CI, must run this real HDMI-dummy/GDM checklist. Automated tests
 cover the configuration, authenticated direct handshake and state machine but
 cannot emulate Mutter owning a physical seat in CI.
 
-Do not use the old `rivetlink-headless-gnome.service` virtual-monitor setup for
-this deployment; it captures a separate desktop and cannot show the real GDM
-console.
+If physical pre-login access is required, use a dedicated hardware IP-KVM with
+HDMI capture and USB HID emulation. It is outside the host OS boundary and can
+show/control the physical display without weakening GDM or pretending that a
+headless GNOME Remote Login display is seat0. Do not use the old
+`rivetlink-headless-gnome.service` virtual-monitor setup for this deployment;
+it captures a separate desktop and cannot show the real GDM console.

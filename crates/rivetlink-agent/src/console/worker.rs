@@ -63,6 +63,7 @@ pub enum WorkerErrorCode {
     NoGraphicalSession,
     InvalidRequest,
     GdmCaptureUnavailable,
+    GdmInputUnavailable,
     ScreenCastUnavailable,
     PipeWireUnavailable,
     CaptureAuthorizationDenied,
@@ -104,7 +105,7 @@ pub async fn serve(stream: UnixStream) -> AgentResult<()> {
         let response = match request {
             WorkerRequest::Ping => WorkerResponse::Pong,
             WorkerRequest::Capture { timeout_ms } => capture(timeout_ms, state).await,
-            WorkerRequest::Input { event } => apply_input(&mut input, event),
+            WorkerRequest::Input { event } => apply_input(state, &mut input, event),
             WorkerRequest::Stop => return Ok(()),
         };
         write_packet(&mut writer, &response).await?;
@@ -183,7 +184,21 @@ fn capture_error_code(state: HostConsoleState, error: &AgentError) -> WorkerErro
     }
 }
 
-fn apply_input(handle: &mut Option<InputHandle>, event: ConsoleInput) -> WorkerResponse {
+fn apply_input(
+    state: HostConsoleState,
+    handle: &mut Option<InputHandle>,
+    event: ConsoleInput,
+) -> WorkerResponse {
+    // Treat the existing physical GDM display as an explicit security boundary.
+    // Stock Mutter inhibits RemoteDesktop there, and GNOME Remote Login's
+    // supported system dispatcher controls a distinct headless RemoteDisplay,
+    // not seat0.  Never probe it or let an otherwise trusted broker turn an
+    // input request into an attempt to circumvent that policy.
+    if state == HostConsoleState::GdmLogin || state == HostConsoleState::SessionLocked {
+        return WorkerResponse::Error {
+            code: WorkerErrorCode::GdmInputUnavailable,
+        };
+    }
     let action = match event {
         ConsoleInput::PointerMove { x, y } => InputAction::Move { x, y },
         ConsoleInput::PointerButton { button, down } => InputAction::Button { button, down },
@@ -291,6 +306,26 @@ mod tests {
             &AgentError::Lan("Mutter ScreenCast D-Bus error: Access denied".to_string()),
         );
         assert_eq!(denied, WorkerErrorCode::CaptureAuthorizationDenied);
+    }
+
+    #[test]
+    fn gdm_and_locked_sessions_reject_input_before_creating_a_mutter_handle() {
+        for state in [HostConsoleState::GdmLogin, HostConsoleState::SessionLocked] {
+            let response = apply_input(
+                state,
+                &mut None,
+                ConsoleInput::Key {
+                    code: "Enter".to_string(),
+                    down: true,
+                },
+            );
+            assert!(matches!(
+                response,
+                WorkerResponse::Error {
+                    code: WorkerErrorCode::GdmInputUnavailable
+                }
+            ));
+        }
     }
 
     #[tokio::test]
