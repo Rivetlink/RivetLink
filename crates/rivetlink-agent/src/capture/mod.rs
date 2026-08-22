@@ -21,6 +21,12 @@ pub mod portal;
 #[cfg(target_os = "linux")]
 pub mod mutter;
 
+// Native local X11 capture for an authenticated GDM/desktop session that is
+// actually running under Xorg.  It deliberately uses the session cookie and
+// has no disk-backed screenshot path.
+#[cfg(target_os = "linux")]
+pub mod x11;
+
 // Native single-screen live capture via `scap`: ScreenCast portal + PipeWire on
 // Linux, ScreenCaptureKit on macOS. Windows stays client-only for now (scap's
 // Windows capture backend doesn't build), matching the app's host support.

@@ -1,4 +1,4 @@
-//! Narrow per-session worker for the real GNOME/Mutter console.
+//! Narrow per-session worker for the real login-manager/GNOME console.
 //!
 //! A system broker can run before login without display privileges. This worker
 //! is instead started by the *actual* GDM or GNOME systemd user session and
@@ -9,7 +9,7 @@ use base64::Engine;
 use rivetlink_protocol::HostConsoleState;
 use rivetlink_sdk::lan::PtrButton;
 use serde::{Deserialize, Serialize};
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::time::Duration;
 use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
 use tokio::net::UnixStream;
@@ -77,6 +77,28 @@ pub enum WorkerErrorCode {
     FrameEncodingFailed,
 }
 
+/// The compositor/socket family owned by this graphical worker. This is kept
+/// local to the worker: the broker exposes only the stable host state, never a
+/// display address or Xauthority path to a remote RivetLink client.
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum GraphicalBackend {
+    Wayland,
+    X11 { display: String },
+    Unknown,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct GraphicalSession {
+    state: HostConsoleState,
+    backend: GraphicalBackend,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum CaptureBackend {
+    X11,
+    Mutter,
+}
+
 /// Run the worker against the broker's already-created Unix socket.
 ///
 /// The systemd unit must arrange the socket permissions; this process never
@@ -122,52 +144,144 @@ pub async fn serve(stream: UnixStream) -> AgentResult<()> {
     let (mut reader, mut writer) = stream.into_split();
     // A worker belongs to exactly one graphical D-Bus session.  On GDM →
     // GNOME the broker accepts a fresh worker rather than reusing this state.
-    let state = graphical_session_state();
-    write_packet(&mut writer, &WorkerResponse::Ready { state }).await?;
+    let session = graphical_session();
+    write_packet(
+        &mut writer,
+        &WorkerResponse::Ready {
+            state: session.state,
+        },
+    )
+    .await?;
     let mut input: Option<InputHandle> = None;
 
     loop {
         let request: WorkerRequest = read_packet(&mut reader).await?;
         let response = match request {
             WorkerRequest::Ping => WorkerResponse::Pong,
-            WorkerRequest::Capture { timeout_ms } => capture(timeout_ms, state).await,
-            WorkerRequest::Input { event } => apply_input(state, &mut input, event),
+            WorkerRequest::Capture { timeout_ms } => capture(timeout_ms, &session).await,
+            WorkerRequest::Input { event } => apply_input(&session, &mut input, event),
             WorkerRequest::Stop => return Ok(()),
         };
         write_packet(&mut writer, &response).await?;
     }
 }
 
-/// Classify only the session that owns this worker. `greeter` is emitted by
-/// GDM's actual systemd user session; a normal GNOME user session is desktop.
-/// This does not infer a password field or inspect any screen content.
+/// Classify only the session that owns this worker. Both GDM and LightDM set
+/// `XDG_SESSION_CLASS=greeter`; a normal GNOME user session is desktop. This
+/// does not infer a password field or inspect any screen content.
 #[allow(clippy::disallowed_methods)] // systemd supplies these session-scoped facts
+#[cfg(test)]
 fn graphical_session_state() -> HostConsoleState {
-    if std::env::var("XDG_SESSION_CLASS").is_ok_and(|class| class == "greeter")
+    graphical_session().state
+}
+
+#[allow(clippy::disallowed_methods)] // systemd supplies session-scoped facts
+fn graphical_session() -> GraphicalSession {
+    let state = if std::env::var("XDG_SESSION_CLASS").is_ok_and(|class| class == "greeter")
         || std::env::var("USER").is_ok_and(|user| user == "gdm")
     {
+        // `GdmLogin` is the protocol's established, manager-neutral pre-login
+        // state name. The actual manager/backend stays local to this worker.
         HostConsoleState::GdmLogin
     } else {
         HostConsoleState::DesktopReady
+    };
+    let backend = match std::env::var("XDG_SESSION_TYPE").as_deref() {
+        Ok("wayland") => GraphicalBackend::Wayland,
+        Ok("x11") => x11_backend_from_environment().unwrap_or(GraphicalBackend::Unknown),
+        _ => GraphicalBackend::Unknown,
+    };
+    GraphicalSession { state, backend }
+}
+
+/// Select only an X11 display owned by this graphical worker. Reject network
+/// display syntax so configuring GDM Xorg never turns RivetLink into an X11
+/// TCP client/server, and require a regular session Xauthority file rather
+/// than broadening access with `xhost`.
+#[allow(clippy::disallowed_methods)] // systemd supplies session-scoped values
+fn x11_backend_from_environment() -> Option<GraphicalBackend> {
+    let display = std::env::var("DISPLAY").ok()?;
+    if !is_local_x11_display(&display) {
+        return None;
+    }
+    let authority = PathBuf::from(std::env::var_os("XAUTHORITY")?);
+    if !authority.is_absolute() || !authority.is_file() {
+        return None;
+    }
+    Some(GraphicalBackend::X11 { display })
+}
+
+fn is_local_x11_display(display: &str) -> bool {
+    let Some(number) = display.strip_prefix(':') else {
+        return false;
+    };
+    let (screen, suffix) = number.split_once('.').unwrap_or((number, ""));
+    !screen.is_empty()
+        && screen.bytes().all(|byte| byte.is_ascii_digit())
+        && (suffix.is_empty() || suffix.bytes().all(|byte| byte.is_ascii_digit()))
+}
+
+fn session_capture_png(session: &GraphicalSession, timeout: Duration) -> AgentResult<Vec<u8>> {
+    match capture_backend(session)? {
+        CaptureBackend::X11 => match &session.backend {
+            GraphicalBackend::X11 { display } => crate::capture::x11::capture_png(display),
+            _ => unreachable!("X11 capture routing requires an X11 session"),
+        },
+        CaptureBackend::Mutter => {
+            crate::capture::mutter::capture_console_png(timeout, session.state)
+        },
+    }
+}
+
+fn capture_backend(session: &GraphicalSession) -> AgentResult<CaptureBackend> {
+    match (&session.state, &session.backend) {
+        (HostConsoleState::GdmLogin, GraphicalBackend::X11 { .. })
+        | (HostConsoleState::DesktopReady, GraphicalBackend::X11 { .. }) => Ok(CaptureBackend::X11),
+        (HostConsoleState::DesktopReady, GraphicalBackend::Wayland) => Ok(CaptureBackend::Mutter),
+        (HostConsoleState::GdmLogin, GraphicalBackend::Wayland) => Err(AgentError::Config(
+            "the protected Wayland login display cannot be captured; RivetLink requires the optional local LightDM X11 login mode for pre-login capture"
+                .to_string(),
+        )),
+        (HostConsoleState::GdmLogin, GraphicalBackend::Unknown) => Err(AgentError::Config(
+            "login display server is not a supported local Xorg session".to_string(),
+        )),
+        (HostConsoleState::SessionLocked, _) => Err(AgentError::Config(
+            "the locked physical display cannot be captured through a supported backend"
+                .to_string(),
+        )),
+        _ => Err(AgentError::Config(
+            "graphical console capture is unavailable while the session is transitioning"
+                .to_string(),
+        )),
     }
 }
 
 fn require_graphical_session() -> AgentResult<()> {
+    // LightDM's X11 greeter is not backed by a systemd user manager. It has a
+    // valid, cookie-authenticated Xauthority session but no per-user D-Bus
+    // session. X11 capture/input need neither; requiring D-Bus here would
+    // incorrectly force a root worker or a global access relaxation.
+    if matches!(graphical_session().backend, GraphicalBackend::X11 { .. }) {
+        return Ok(());
+    }
     let has_runtime = std::env::var_os("XDG_RUNTIME_DIR").is_some();
     let has_session_bus = std::env::var_os("DBUS_SESSION_BUS_ADDRESS").is_some();
     if has_runtime && has_session_bus {
         Ok(())
     } else {
         Err(AgentError::Config(
-            "console worker requires the active GDM or GNOME graphical session".to_string(),
+            "console worker requires an active login-manager or GNOME graphical session"
+                .to_string(),
         ))
     }
 }
 
-async fn capture(timeout_ms: u64, state: HostConsoleState) -> WorkerResponse {
+async fn capture(timeout_ms: u64, session: &GraphicalSession) -> WorkerResponse {
     let timeout_ms = timeout_ms.clamp(1, MAX_CAPTURE_TIMEOUT_MS);
+    let session = session.clone();
+    let capture_session = session.clone();
     match tokio::task::spawn_blocking(move || {
-        crate::capture::mutter::capture_console_png(Duration::from_millis(timeout_ms), state)
+        session_capture_png(&capture_session, Duration::from_millis(timeout_ms))
     })
     .await
     {
@@ -177,7 +291,7 @@ async fn capture(timeout_ms: u64, state: HostConsoleState) -> WorkerResponse {
         Ok(Err(error)) => {
             tracing::warn!(error = %error, "console capture failed");
             WorkerResponse::Error {
-                code: capture_error_code(state, &error),
+                code: capture_error_code(session.state, &error),
             }
         },
         Err(error) => {
@@ -211,16 +325,18 @@ fn capture_error_code(state: HostConsoleState, error: &AgentError) -> WorkerErro
 }
 
 fn apply_input(
-    state: HostConsoleState,
+    session: &GraphicalSession,
     handle: &mut Option<InputHandle>,
     event: ConsoleInput,
 ) -> WorkerResponse {
-    // Treat the existing physical GDM display as an explicit security boundary.
-    // Stock Mutter inhibits RemoteDesktop there, and GNOME Remote Login's
-    // supported system dispatcher controls a distinct headless RemoteDisplay,
-    // not seat0.  Never probe it or let an otherwise trusted broker turn an
-    // input request into an attempt to circumvent that policy.
-    if state == HostConsoleState::GdmLogin || state == HostConsoleState::SessionLocked {
+    if session.state == HostConsoleState::SessionLocked {
+        return WorkerResponse::Error {
+            code: WorkerErrorCode::GdmInputUnavailable,
+        };
+    }
+    if session.state == HostConsoleState::GdmLogin && !uses_x11_input(session) {
+        // Do not probe a protected Wayland greeter. The only pre-login route
+        // is RivetLink's explicitly configured local LightDM X11 session.
         return WorkerResponse::Error {
             code: WorkerErrorCode::GdmInputUnavailable,
         };
@@ -238,12 +354,18 @@ fn apply_input(
             };
         },
     };
-    // The handle owns a Mutter RemoteDesktop session in this very same D-Bus
-    // session; it cannot target another seat or act as root.
-    handle
-        .get_or_insert_with(|| InputHandle::spawn(None))
-        .send(action);
+    let handle = handle.get_or_insert_with(|| match &session.backend {
+        GraphicalBackend::X11 { display } => InputHandle::spawn_x11(display.clone()),
+        // The handle owns a Mutter RemoteDesktop session in this same D-Bus
+        // session; it cannot target another seat or act as root.
+        GraphicalBackend::Wayland | GraphicalBackend::Unknown => InputHandle::spawn(None),
+    });
+    handle.send(action);
     WorkerResponse::InputAccepted
+}
+
+fn uses_x11_input(session: &GraphicalSession) -> bool {
+    matches!(session.backend, GraphicalBackend::X11 { .. })
 }
 
 fn is_valid_key_code(code: &str) -> bool {
@@ -316,6 +438,51 @@ mod tests {
     }
 
     #[test]
+    fn x11_display_addresses_are_local_unix_sockets_only() {
+        assert!(is_local_x11_display(":0"));
+        assert!(is_local_x11_display(":12.0"));
+        assert!(!is_local_x11_display("localhost:0"));
+        assert!(!is_local_x11_display("tcp/localhost:0"));
+        assert!(!is_local_x11_display(":one"));
+    }
+
+    #[test]
+    fn capture_backend_follows_the_actual_display_server() {
+        let gdm_x11 = GraphicalSession {
+            state: HostConsoleState::GdmLogin,
+            backend: GraphicalBackend::X11 {
+                display: ":0".to_string(),
+            },
+        };
+        assert_eq!(capture_backend(&gdm_x11).unwrap(), CaptureBackend::X11);
+        assert!(uses_x11_input(&gdm_x11));
+
+        let gdm_wayland = GraphicalSession {
+            state: HostConsoleState::GdmLogin,
+            backend: GraphicalBackend::Wayland,
+        };
+        assert!(capture_backend(&gdm_wayland).is_err());
+        assert!(!uses_x11_input(&gdm_wayland));
+
+        let desktop_wayland = GraphicalSession {
+            state: HostConsoleState::DesktopReady,
+            backend: GraphicalBackend::Wayland,
+        };
+        assert_eq!(
+            capture_backend(&desktop_wayland).unwrap(),
+            CaptureBackend::Mutter
+        );
+
+        let desktop_x11 = GraphicalSession {
+            state: HostConsoleState::DesktopReady,
+            backend: GraphicalBackend::X11 {
+                display: ":1".to_string(),
+            },
+        };
+        assert_eq!(capture_backend(&desktop_x11).unwrap(), CaptureBackend::X11);
+    }
+
+    #[test]
     fn only_a_missing_broker_socket_is_a_normal_boot_race() {
         assert!(should_retry_broker_connect(std::io::ErrorKind::NotFound));
         assert!(!should_retry_broker_connect(
@@ -343,10 +510,21 @@ mod tests {
     }
 
     #[test]
-    fn gdm_and_locked_sessions_reject_input_before_creating_a_mutter_handle() {
-        for state in [HostConsoleState::GdmLogin, HostConsoleState::SessionLocked] {
+    fn protected_sessions_reject_input_before_creating_a_mutter_handle() {
+        for session in [
+            GraphicalSession {
+                state: HostConsoleState::GdmLogin,
+                backend: GraphicalBackend::Wayland,
+            },
+            GraphicalSession {
+                state: HostConsoleState::SessionLocked,
+                backend: GraphicalBackend::X11 {
+                    display: ":0".to_string(),
+                },
+            },
+        ] {
             let response = apply_input(
-                state,
+                &session,
                 &mut None,
                 ConsoleInput::Key {
                     code: "Enter".to_string(),

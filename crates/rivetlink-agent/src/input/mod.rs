@@ -8,7 +8,10 @@
 //! remote control is unavailable.
 
 #[cfg(target_os = "linux")]
-mod mutter;
+pub(crate) mod mutter;
+
+#[cfg(target_os = "linux")]
+pub(crate) mod x11;
 
 #[cfg(target_os = "linux")]
 pub use mutter::{injected_click_age_ms, InputAction, InputHandle};

@@ -97,6 +97,9 @@ pub async fn run(cli: Cli) -> AgentResult<()> {
             auto_accept,
         }) => lan(port, pin, device_name, keystore_path, auto_accept).await,
         Some(Command::ConsoleWorker { socket }) => console_worker(&socket).await,
+        Some(Command::ConsoleLightdmGreeterStart) => lightdm_greeter_start(),
+        Some(Command::ConsoleLightdmGreeterWatch { display }) => lightdm_greeter_watch(&display),
+        Some(Command::ConsoleLightdmGreeterStop) => lightdm_greeter_stop(),
         Some(Command::ConsoleBroker {
             socket,
             allowed_worker_uids,
@@ -104,6 +107,46 @@ pub async fn run(cli: Cli) -> AgentResult<()> {
         None => Err(AgentError::Config(
             "no subcommand given — use `rivet-agent --help`".to_string(),
         )),
+    }
+}
+
+fn lightdm_greeter_start() -> AgentResult<()> {
+    #[cfg(target_os = "linux")]
+    {
+        crate::console::lightdm::start()
+    }
+    #[cfg(not(target_os = "linux"))]
+    {
+        Err(AgentError::Config(
+            "LightDM console integration is supported on Linux only".to_string(),
+        ))
+    }
+}
+
+fn lightdm_greeter_watch(display: &str) -> AgentResult<()> {
+    #[cfg(target_os = "linux")]
+    {
+        crate::console::lightdm::watch(display)
+    }
+    #[cfg(not(target_os = "linux"))]
+    {
+        let _ = display;
+        Err(AgentError::Config(
+            "LightDM console integration is supported on Linux only".to_string(),
+        ))
+    }
+}
+
+fn lightdm_greeter_stop() -> AgentResult<()> {
+    #[cfg(target_os = "linux")]
+    {
+        crate::console::lightdm::stop()
+    }
+    #[cfg(not(target_os = "linux"))]
+    {
+        Err(AgentError::Config(
+            "LightDM console integration is supported on Linux only".to_string(),
+        ))
     }
 }
 

@@ -61,3 +61,7 @@ url = "2"
 # zbus: talk to GNOME Mutter's ScreenCast D-Bus API to start a dialog-free
 # screen cast and get a PipeWire node id. Shares tokio with the rest of the app.
 zbus = { version = "4", default-features = false, features = ["tokio"] }
+# Native, local-only X11 capture/input for an already-authorized GDM Xorg
+# worker.  This talks only to the Unix socket selected by DISPLAY and uses the
+# session's MIT-MAGIC-COOKIE; it never opens or listens on an X11 TCP socket.
+x11rb = { version = "0.13", features = ["xtest"] }

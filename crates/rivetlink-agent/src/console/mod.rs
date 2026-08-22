@@ -14,6 +14,13 @@ pub mod state;
 #[cfg(target_os = "linux")]
 pub mod broker;
 
+// The LightDM integration is a deliberately tiny root-only launcher. It
+// discovers LightDM's own greeter process, then drops to that greeter account
+// before starting the ordinary X11 worker. It never captures or injects input
+// while privileged.
+#[cfg(target_os = "linux")]
+pub mod lightdm;
+
 #[cfg(target_os = "linux")]
 pub mod worker;
 

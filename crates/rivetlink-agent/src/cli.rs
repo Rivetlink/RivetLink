@@ -182,6 +182,24 @@ pub enum Command {
         socket: PathBuf,
     },
 
+    /// Start the narrowly scoped LightDM greeter-worker launcher. This command
+    /// is called only by a root-owned LightDM setup hook installed by RivetLink.
+    #[command(hide = true)]
+    ConsoleLightdmGreeterStart,
+
+    /// Internal detached half of the LightDM launcher. It accepts only a
+    /// locally validated X11 display from its parent command.
+    #[command(hide = true)]
+    ConsoleLightdmGreeterWatch {
+        #[arg(long)]
+        display: String,
+    },
+
+    /// Stop the fixed LightDM worker recorded in RivetLink's protected runtime
+    /// directory. This has no arbitrary PID or command parameter.
+    #[command(hide = true)]
+    ConsoleLightdmGreeterStop,
+
     /// Run the non-root relay broker for one authenticated GDM/GNOME worker.
     /// This is intentionally separate from `console-worker`: the broker owns
     /// network identity but never accesses Mutter directly.

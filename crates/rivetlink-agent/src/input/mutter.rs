@@ -106,6 +106,16 @@ impl InputHandle {
         Self { tx }
     }
 
+    /// Spawn a local X11/XTEST injector for a session-owned Unix display.
+    /// `display` has already been checked by the worker to exclude TCP X11
+    /// addresses; x11rb obtains the normal MIT-MAGIC-COOKIE from the worker's
+    /// own XAUTHORITY environment.
+    pub fn spawn_x11(display: String) -> Self {
+        let (tx, rx) = mpsc::channel::<InputAction>();
+        thread::spawn(move || crate::input::x11::run(&display, &rx));
+        Self { tx }
+    }
+
     /// Queue an action. Dropped silently if the injector thread is gone.
     pub fn send(&self, action: InputAction) {
         let _ = self.tx.send(action);
@@ -261,16 +271,24 @@ fn button_code(b: PtrButton) -> i32 {
 /// Map a browser `KeyboardEvent.code` (or the `"CommandMod"` token) to an evdev
 /// keycode for `NotifyKeyboardKeycode`. `None` for codes we don't replay.
 fn key_code(code: &str) -> Option<u32> {
+    browser_evdev_key_code(code)
+}
+
+/// Map a browser physical key identifier to the Linux evdev code shared by
+/// Mutter RemoteDesktop and Xorg's standard evdev/XKB map. This preserves the
+/// configured keyboard layout in the local graphical session and never maps
+/// browser text into password characters itself.
+pub(crate) fn browser_evdev_key_code(code: &str) -> Option<u32> {
     if code == "CommandMod" {
         return Some(29); // KEY_LEFTCTRL — Linux's command modifier (copy/paste)
     }
-    code_to_key(code).map(|k| u32::from(k.code()))
+    code_to_key(code).map(|key| u32::from(key.code()))
 }
 
 /// Map a browser `KeyboardEvent.code` (physical position, layout-independent)
 /// to an evdev key. `None` for codes we don't replay.
 #[allow(clippy::too_many_lines)] // a flat lookup table — one arm per key
-fn code_to_key(code: &str) -> Option<evdev::Key> {
+pub(crate) fn code_to_key(code: &str) -> Option<evdev::Key> {
     use evdev::Key;
     let key = match code {
         // Letters
