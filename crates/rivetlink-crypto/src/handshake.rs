@@ -1,10 +1,10 @@
 //! Authenticated ephemeral key exchange for establishing a [`SealedChannel`].
 //!
 //! Both peers generate an ephemeral x25519 keypair and sign the public key
-//! with their long-term Ed25519 identity. The signature binds the ephemeral
-//! key to a known identity, so a relay that merely forwards bytes cannot
-//! substitute its own ephemeral key (MITM) without also forging an identity
-//! signature.
+//! with their long-term Ed25519 identity. The caller supplies a canonical
+//! handshake binding: it must include the protocol, version, role, identities,
+//! and any preceding handshake messages. This prevents a valid ephemeral-key
+//! signature from being transplanted into another connection or role.
 //!
 //! Flow:
 //! 1. each side calls [`start`] → gets its ephemeral public key + signature to send
@@ -16,7 +16,7 @@
 use ed25519_dalek::{Signature, Signer, SigningKey, Verifier, VerifyingKey};
 use x25519_dalek::PublicKey as X25519Public;
 
-use crate::sealed::SealedChannel;
+use crate::sealed::{ChannelRole, SealedChannel};
 use crate::session_keys::SessionKeyPair;
 use crate::{CryptoError, CryptoResult};
 
@@ -35,12 +35,16 @@ impl std::fmt::Debug for LocalKeyExchange {
     }
 }
 
-/// Begin a key exchange: generate an ephemeral keypair and sign its public
-/// key with the long-term identity.
-pub fn start(identity: &SigningKey) -> LocalKeyExchange {
+const SIGNATURE_DOMAIN: &[u8] = b"rivetlink-authenticated-kex-v2";
+
+/// Begin a key exchange: generate an ephemeral keypair and sign it with the
+/// long-term identity plus a caller-provided canonical handshake binding.
+pub fn start(identity: &SigningKey, binding: &[u8]) -> LocalKeyExchange {
     let keypair = SessionKeyPair::generate();
     let ephemeral_public = *keypair.public_key().as_bytes();
-    let signature = identity.sign(&ephemeral_public).to_bytes();
+    let signature = identity
+        .sign(&signature_message(binding, &ephemeral_public))
+        .to_bytes();
     LocalKeyExchange {
         keypair,
         ephemeral_public,
@@ -59,26 +63,41 @@ impl LocalKeyExchange {
         &self.signature
     }
 
-    /// Consume this exchange and derive the shared [`SealedChannel`] using the
-    /// peer's ephemeral public key.
-    pub fn into_channel(self, peer_ephemeral: &[u8; 32]) -> SealedChannel {
+    /// Consume this exchange and derive a directional [`SealedChannel`] using
+    /// the peer's ephemeral public key and the final canonical transcript.
+    pub fn into_channel(
+        self,
+        peer_ephemeral: &[u8; 32],
+        transcript: &[u8],
+        role: ChannelRole,
+    ) -> CryptoResult<SealedChannel> {
         let peer_public = X25519Public::from(*peer_ephemeral);
         let shared = self.keypair.derive_shared_secret(&peer_public);
-        SealedChannel::from_shared_secret(shared.as_bytes())
+        SealedChannel::from_handshake_secret(shared.as_bytes(), transcript, role)
     }
 }
 
-/// Verify the peer's signature over their ephemeral key against their trusted
-/// identity public key.
+/// Verify the peer's signature over its ephemeral key and canonical binding
+/// against its trusted identity public key.
 pub fn verify_peer(
     peer_identity: &VerifyingKey,
     peer_ephemeral: &[u8; 32],
     peer_signature: &[u8; 64],
+    binding: &[u8],
 ) -> CryptoResult<()> {
     let sig = Signature::from_bytes(peer_signature);
     peer_identity
-        .verify(peer_ephemeral, &sig)
+        .verify(&signature_message(binding, peer_ephemeral), &sig)
         .map_err(|_| CryptoError::InvalidSignature)
+}
+
+fn signature_message(binding: &[u8], ephemeral: &[u8; 32]) -> Vec<u8> {
+    let mut message = Vec::with_capacity(SIGNATURE_DOMAIN.len() + 8 + binding.len() + 32);
+    message.extend_from_slice(SIGNATURE_DOMAIN);
+    message.extend_from_slice(&(binding.len() as u64).to_be_bytes());
+    message.extend_from_slice(binding);
+    message.extend_from_slice(ephemeral);
+    message
 }
 
 #[cfg(test)]
@@ -98,28 +117,37 @@ mod tests {
         let client_id = identity();
         let host_id = identity();
 
-        let client = start(&client_id);
-        let host = start(&host_id);
+        let client_binding = b"test/client";
+        let host_binding = b"test/host";
+        let transcript = b"test/transcript";
+        let client = start(&client_id, client_binding);
+        let host = start(&host_id, host_binding);
 
         // Each verifies the other's signed ephemeral key.
         verify_peer(
             &host_id.verifying_key(),
             host.ephemeral_public(),
             host.signature(),
+            host_binding,
         )
         .expect("client verifies host");
         verify_peer(
             &client_id.verifying_key(),
             client.ephemeral_public(),
             client.signature(),
+            client_binding,
         )
         .expect("host verifies client");
 
         let client_eph = *client.ephemeral_public();
         let host_eph = *host.ephemeral_public();
 
-        let client_ch = client.into_channel(&host_eph);
-        let host_ch = host.into_channel(&client_eph);
+        let client_ch = client
+            .into_channel(&host_eph, transcript, ChannelRole::Initiator)
+            .unwrap();
+        let host_ch = host
+            .into_channel(&client_eph, transcript, ChannelRole::Responder)
+            .unwrap();
 
         let sealed = client_ch.seal(b"frame bytes").unwrap();
         assert_eq!(host_ch.open(&sealed).unwrap(), b"frame bytes");
@@ -128,14 +156,15 @@ mod tests {
     #[test]
     fn rejects_forged_ephemeral_key() {
         let real_id = identity();
-        let real = start(&real_id);
+        let binding = b"test";
+        let real = start(&real_id, binding);
 
         // Relay swaps the ephemeral key but cannot re-sign with the identity.
         let mut forged = *real.ephemeral_public();
         forged[0] ^= 0xff;
 
         assert!(matches!(
-            verify_peer(&real_id.verifying_key(), &forged, real.signature()),
+            verify_peer(&real_id.verifying_key(), &forged, real.signature(), binding),
             Err(CryptoError::InvalidSignature)
         ));
     }
@@ -144,13 +173,15 @@ mod tests {
     fn rejects_wrong_identity() {
         let real_id = identity();
         let attacker_id = identity();
-        let exchange = start(&real_id);
+        let binding = b"test";
+        let exchange = start(&real_id, binding);
 
         assert!(matches!(
             verify_peer(
                 &attacker_id.verifying_key(),
                 exchange.ephemeral_public(),
                 exchange.signature(),
+                binding,
             ),
             Err(CryptoError::InvalidSignature)
         ));

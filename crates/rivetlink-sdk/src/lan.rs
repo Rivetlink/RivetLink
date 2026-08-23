@@ -773,7 +773,7 @@ pub async fn list_displays(
 // Each parameter is a distinct stream option (transport, codec rate, screen,
 // identity, control channel, sink); bundling them into a struct would add
 // ceremony without clarity.
-#[allow(clippy::too_many_arguments)]
+#[allow(clippy::too_many_arguments, clippy::cognitive_complexity)]
 pub async fn stream_frames<F, D>(
     stream: TcpStream,
     channel: SealedChannel,
@@ -791,10 +791,9 @@ where
     D: FnMut(Vec<DisplayInfo>),
 {
     // Own the read/write halves so the write side can live in its own task. The
-    // sealed channel is stateless (random per-message nonce), so sealing (writes)
-    // and opening (reads) need no shared mutable state — an Arc to share the key
-    // is enough. Reading frames is the hot path and stays in this task; the rare
-    // display-switch writes go to a small writer task.
+    // sealed channel has independent directional sequence state. The reader only
+    // opens host→client packets and the writer only seals client→host packets, so
+    // an Arc safely shares one authenticated session without races.
     // `display` is a reserved token in tracing's field shorthand, so log a copy.
     let scr = display;
     tracing::info!(fps, screen = ?scr, "LAN stream: requesting StartStream");
@@ -915,8 +914,18 @@ mod tests {
     async fn sealed_request_response_roundtrip() {
         let (mut c, mut h) = tokio::io::duplex(64 * 1024);
         let shared = [9u8; 32];
-        let ch_c = SealedChannel::from_shared_secret(&shared);
-        let ch_h = SealedChannel::from_shared_secret(&shared);
+        let ch_c = SealedChannel::from_handshake_secret(
+            &shared,
+            b"rivetlink-lan-test",
+            rivetlink_crypto::sealed::ChannelRole::Initiator,
+        )
+        .unwrap();
+        let ch_h = SealedChannel::from_handshake_secret(
+            &shared,
+            b"rivetlink-lan-test",
+            rivetlink_crypto::sealed::ChannelRole::Responder,
+        )
+        .unwrap();
 
         let host = tokio::spawn(async move {
             let req = recv_request(&mut h, &ch_h).await.unwrap();

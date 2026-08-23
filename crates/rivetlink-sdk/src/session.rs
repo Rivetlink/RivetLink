@@ -15,8 +15,10 @@ use ed25519_dalek::VerifyingKey;
 use futures_util::{SinkExt, StreamExt};
 use rivetlink_core::{DeviceId, SessionId};
 use rivetlink_crypto::handshake::{self, LocalKeyExchange};
-use rivetlink_crypto::sealed::SealedChannel;
-use rivetlink_protocol::{ConsoleInputPacket, HostConsoleState, SessionCapability, SignalPacket};
+use rivetlink_crypto::sealed::{ChannelRole, SealedChannel};
+use rivetlink_protocol::{
+    ConsoleInputPacket, HostConsoleState, SessionCapability, SignalPacket, RELAY_PROTOCOL_VERSION,
+};
 use std::path::PathBuf;
 use tokio_tungstenite::tungstenite::Message;
 use uuid::Uuid;
@@ -54,8 +56,13 @@ pub struct CaptureOutcome {
 /// Run a single screenshot session end to end. Returns the path written.
 // The protocol handshake is intentionally kept in one ordered routine; splitting
 // it would obscure which checks must happen before decrypting screenshot data.
-#[allow(clippy::too_many_lines)]
+#[allow(clippy::too_many_lines, clippy::cognitive_complexity)]
 pub async fn capture_screenshot(req: CaptureParams<'_>) -> SdkResult<CaptureOutcome> {
+    if !req.relay_ws_url.starts_with("wss://") {
+        return Err(SdkError::Config(
+            "relay_ws_url must use wss://; plaintext relay WebSockets are unsafe".to_string(),
+        ));
+    }
     let host_identity = parse_identity(req.host_public_key_b64)?;
     let (mut ws, _resp) = tokio_tungstenite::connect_async(req.relay_ws_url)
         .await
@@ -76,6 +83,7 @@ pub async fn capture_screenshot(req: CaptureParams<'_>) -> SdkResult<CaptureOutc
     let session_request = SignalPacket::SessionRequest {
         device_id: DeviceId(req.device_id),
         client_public_key: req.identity.public_key_b64(),
+        protocol_version: RELAY_PROTOCOL_VERSION,
         requested_capability: req.requested_capability,
         session_id: None,
     };
@@ -102,7 +110,10 @@ pub async fn capture_screenshot(req: CaptureParams<'_>) -> SdkResult<CaptureOutc
             } => {
                 tracing::info!(session = %sid, ?role, "host accepted session");
                 session_id = Some(sid);
-                let kex = handshake::start(req.identity.signing_key());
+                let kex = handshake::start(
+                    req.identity.signing_key(),
+                    &relay_kex_binding(sid, b"client", &req.identity.public_key_b64()),
+                );
                 send_packet(&mut ws, &key_exchange_packet(sid, req.identity, &kex)).await?;
                 local_kex = Some(kex);
             },
@@ -115,6 +126,11 @@ pub async fn capture_screenshot(req: CaptureParams<'_>) -> SdkResult<CaptureOutc
                 identity_public_key,
                 signature,
             } => {
+                if session_id != Some(sid) {
+                    return Err(SdkError::Crypto(
+                        "host key exchange does not match the active session".to_string(),
+                    ));
+                }
                 // Pin host identity: the asserted identity must equal the key
                 // we fetched over the authenticated REST channel.
                 if identity_public_key.trim() != req.host_public_key_b64.trim() {
@@ -124,13 +140,35 @@ pub async fn capture_screenshot(req: CaptureParams<'_>) -> SdkResult<CaptureOutc
                 }
                 let peer_eph = decode_32(&ephemeral_public_key)?;
                 let peer_sig = decode_64(&signature)?;
-                handshake::verify_peer(&host_identity, &peer_eph, &peer_sig)
-                    .map_err(|e| SdkError::Crypto(format!("host key exchange invalid: {e}")))?;
+                handshake::verify_peer(
+                    &host_identity,
+                    &peer_eph,
+                    &peer_sig,
+                    &relay_kex_binding(sid, b"host", &identity_public_key),
+                )
+                .map_err(|e| SdkError::Crypto(format!("host key exchange invalid: {e}")))?;
 
                 let kex = local_kex.take().ok_or_else(|| {
                     SdkError::Crypto("host key exchange arrived before accept".to_string())
                 })?;
-                channel = Some(kex.into_channel(&peer_eph));
+                let client_packet = key_exchange_packet(sid, req.identity, &kex);
+                let host_packet = SignalPacket::SessionKeyExchange {
+                    session_id: sid,
+                    ephemeral_public_key: ephemeral_public_key.clone(),
+                    identity_public_key: identity_public_key.clone(),
+                    signature: signature.clone(),
+                };
+                let transcript = relay_transcript(
+                    sid,
+                    &req.identity.public_key_b64(),
+                    &host_identity_b64(&host_identity),
+                    &client_packet,
+                    &host_packet,
+                )?;
+                channel = Some(
+                    kex.into_channel(&peer_eph, &transcript, ChannelRole::Initiator)
+                        .map_err(|e| SdkError::Crypto(e.to_string()))?,
+                );
                 session_id = Some(sid);
 
                 if let Some(event) = &req.console_input {
@@ -256,6 +294,36 @@ fn key_exchange_packet(
         identity_public_key: identity.public_key_b64(),
         signature: std.encode(kex.signature()),
     }
+}
+
+fn relay_kex_binding(session_id: SessionId, role: &[u8], identity_b64: &str) -> Vec<u8> {
+    let mut binding = Vec::with_capacity(128);
+    binding.extend_from_slice(b"rivetlink-relay-v2");
+    binding.extend_from_slice(session_id.to_string().as_bytes());
+    binding.extend_from_slice(role);
+    binding.extend_from_slice(identity_b64.trim().as_bytes());
+    binding
+}
+
+fn host_identity_b64(identity: &VerifyingKey) -> String {
+    base64::engine::general_purpose::STANDARD.encode(identity.as_bytes())
+}
+
+fn relay_transcript(
+    session_id: SessionId,
+    client_identity: &str,
+    host_identity: &str,
+    client_kex: &SignalPacket,
+    host_kex: &SignalPacket,
+) -> SdkResult<Vec<u8>> {
+    let mut transcript = Vec::new();
+    transcript.extend_from_slice(b"rivetlink-relay-v2");
+    transcript.extend_from_slice(session_id.to_string().as_bytes());
+    transcript.extend_from_slice(client_identity.trim().as_bytes());
+    transcript.extend_from_slice(host_identity.trim().as_bytes());
+    transcript.extend_from_slice(&serde_json::to_vec(client_kex)?);
+    transcript.extend_from_slice(&serde_json::to_vec(host_kex)?);
+    Ok(transcript)
 }
 
 fn parse_identity(b64: &str) -> SdkResult<VerifyingKey> {

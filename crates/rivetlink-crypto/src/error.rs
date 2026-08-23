@@ -33,6 +33,25 @@ pub enum CryptoError {
     #[error("decryption failed: {0}")]
     Decryption(String),
 
+    /// The authenticated transport sequence was replayed, skipped, or
+    /// reordered. Ordered RivetLink transports deliberately reject this rather
+    /// than accepting a potentially stale privileged input event.
+    #[error("replayed or out-of-order packet (expected sequence {expected}, received {received})")]
+    ReplayOrOutOfOrder { expected: u64, received: u64 },
+
+    /// A directional AEAD sequence reached its hard limit. A fresh handshake
+    /// is required rather than ever risking nonce reuse.
+    #[error("sealed-channel nonce sequence exhausted")]
+    NonceExhausted,
+
+    /// The encrypted wire envelope belongs to an unsupported protocol version.
+    #[error("unsupported sealed-channel wire version")]
+    UnsupportedWireVersion,
+
+    /// HKDF output derivation unexpectedly failed.
+    #[error("session key derivation failed")]
+    KeyDerivation,
+
     /// Post-quantum key encapsulation (ML-KEM) failed.
     #[error("post-quantum key encapsulation failed")]
     PqEncapsulation,

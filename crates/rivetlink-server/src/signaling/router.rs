@@ -55,6 +55,7 @@ fn route_packet(
         SignalPacket::SessionRequest {
             device_id,
             client_public_key,
+            protocol_version,
             requested_capability,
             ..
         } => {
@@ -89,6 +90,7 @@ fn route_packet(
             let enriched = SignalPacket::SessionRequest {
                 device_id: *device_id,
                 client_public_key: client_public_key.clone(),
+                protocol_version: *protocol_version,
                 requested_capability: *requested_capability,
                 session_id: Some(rivetlink_core::SessionId(session_id)),
             };
@@ -270,6 +272,7 @@ mod tests {
         let packet = SignalPacket::SessionRequest {
             device_id: DeviceId(device_user_id),
             client_public_key: "test_key".to_string(),
+            protocol_version: rivetlink_protocol::RELAY_PROTOCOL_VERSION,
             requested_capability: rivetlink_protocol::SessionCapability::Screenshot,
             session_id: None,
         };
@@ -317,6 +320,7 @@ mod tests {
         let request = SignalPacket::SessionRequest {
             device_id: DeviceId(device_id),
             client_public_key: "controller-key".to_string(),
+            protocol_version: rivetlink_protocol::RELAY_PROTOCOL_VERSION,
             requested_capability: rivetlink_protocol::SessionCapability::ConsoleControl,
             session_id: None,
         };
@@ -374,6 +378,7 @@ mod tests {
         let packet = SignalPacket::SessionRequest {
             device_id: DeviceId(device_user_id),
             client_public_key: "attacker_key".to_string(),
+            protocol_version: rivetlink_protocol::RELAY_PROTOCOL_VERSION,
             requested_capability: rivetlink_protocol::SessionCapability::Screenshot,
             session_id: None,
         };

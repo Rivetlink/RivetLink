@@ -18,6 +18,8 @@ use uuid::Uuid;
 use crate::error::{AgentError, AgentResult};
 
 type WsStream = WebSocketStream<MaybeTlsStream<TcpStream>>;
+const DEVICE_AUTH_PROTOCOL_VERSION: u16 = 2;
+const DEVICE_AUTH_DOMAIN: &[u8] = b"rivetlink-relay-device-auth-v2";
 
 /// AUTH message sent as the first frame after connecting (user mode).
 #[derive(Debug, Serialize)]
@@ -46,7 +48,10 @@ enum AuthAck {
 #[serde(tag = "type")]
 enum OutgoingDeviceHello {
     #[serde(rename = "DEVICE_HELLO")]
-    Hello { device_id: Uuid },
+    Hello {
+        device_id: Uuid,
+        protocol_version: u16,
+    },
 }
 
 /// Server-sent challenge.
@@ -54,7 +59,10 @@ enum OutgoingDeviceHello {
 #[serde(tag = "type")]
 enum DeviceChallenge {
     #[serde(rename = "DEVICE_CHALLENGE")]
-    Challenge { nonce: String },
+    Challenge {
+        nonce: String,
+        protocol_version: u16,
+    },
 }
 
 /// Client-sent challenge response.
@@ -80,6 +88,7 @@ impl RelayClient {
         token: &str,
         heartbeat_interval: Duration,
     ) -> AgentResult<Self> {
+        ensure_secure_relay_url(url)?;
         let (mut stream, _resp) = tokio_tungstenite::connect_async(url)
             .await
             .map_err(|e| AgentError::Relay(format!("connect failed: {e}")))?;
@@ -129,11 +138,15 @@ impl RelayClient {
         signing_key: &SigningKey,
         heartbeat_interval: Duration,
     ) -> AgentResult<Self> {
+        ensure_secure_relay_url(url)?;
         let (mut stream, _resp) = tokio_tungstenite::connect_async(url)
             .await
             .map_err(|e| AgentError::Relay(format!("connect failed: {e}")))?;
 
-        let hello = serde_json::to_string(&OutgoingDeviceHello::Hello { device_id })?;
+        let hello = serde_json::to_string(&OutgoingDeviceHello::Hello {
+            device_id,
+            protocol_version: DEVICE_AUTH_PROTOCOL_VERSION,
+        })?;
         stream
             .send(Message::Text(hello))
             .await
@@ -156,12 +169,22 @@ impl RelayClient {
 
         let challenge: DeviceChallenge =
             serde_json::from_str(&challenge_text).map_err(AgentError::Serde)?;
-        let DeviceChallenge::Challenge { nonce } = challenge;
+        let DeviceChallenge::Challenge {
+            nonce,
+            protocol_version,
+        } = challenge;
+        if protocol_version != DEVICE_AUTH_PROTOCOL_VERSION {
+            return Err(AgentError::Relay(
+                "relay rejected the secure device-auth protocol version".to_string(),
+            ));
+        }
         let nonce_bytes = base64::engine::general_purpose::STANDARD
             .decode(&nonce)
             .map_err(|e| AgentError::Base64(e.to_string()))?;
-
-        let signature = signing_key.sign(&nonce_bytes);
+        let nonce: [u8; 32] = nonce_bytes
+            .try_into()
+            .map_err(|_| AgentError::Relay("invalid relay device challenge".to_string()))?;
+        let signature = signing_key.sign(&device_challenge_binding(device_id, &nonce));
         let sig_b64 = base64::engine::general_purpose::STANDARD.encode(signature.to_bytes());
 
         let auth = serde_json::to_string(&OutgoingDeviceAuth::Auth {
@@ -292,6 +315,26 @@ impl RelayClient {
             }
         }
     }
+}
+
+fn ensure_secure_relay_url(url: &str) -> AgentResult<()> {
+    if url.starts_with("wss://") {
+        Ok(())
+    } else {
+        Err(AgentError::Config(
+            "relay_url must use wss://; plaintext relay WebSockets are unsafe".to_string(),
+        ))
+    }
+}
+
+fn device_challenge_binding(device_id: Uuid, nonce: &[u8; 32]) -> Vec<u8> {
+    let mut binding =
+        Vec::with_capacity(DEVICE_AUTH_DOMAIN.len() + 2 + device_id.as_bytes().len() + nonce.len());
+    binding.extend_from_slice(DEVICE_AUTH_DOMAIN);
+    binding.extend_from_slice(&DEVICE_AUTH_PROTOCOL_VERSION.to_be_bytes());
+    binding.extend_from_slice(device_id.as_bytes());
+    binding.extend_from_slice(nonce);
+    binding
 }
 
 /// Handles inbound signaling packets for a host, producing outbound frames.

@@ -10,8 +10,8 @@
 //! use std::path::PathBuf;
 //!
 //! let mut client = RivetClient::new(ClientConfig {
-//!     relay_ws_url: "ws://127.0.0.1:8080/ws".into(),
-//!     relay_http_url: "http://127.0.0.1:8080".into(),
+//!     relay_ws_url: "wss://relay.example/ws".into(),
+//!     relay_http_url: "https://relay.example".into(),
 //!     identity_path: PathBuf::from("client_identity.json"),
 //! })?;
 //!
@@ -230,8 +230,8 @@ mod tests {
             uuid::Uuid::now_v7()
         ));
         let client = RivetClient::new(ClientConfig {
-            relay_ws_url: "ws://127.0.0.1:8080/ws".into(),
-            relay_http_url: "http://127.0.0.1:8080".into(),
+            relay_ws_url: "wss://relay.example/ws".into(),
+            relay_http_url: "https://relay.example".into(),
             identity_path: identity_path.clone(),
         })
         .unwrap();

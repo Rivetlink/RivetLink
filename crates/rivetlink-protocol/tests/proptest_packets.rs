@@ -7,7 +7,10 @@
 
 use proptest::prelude::*;
 use rivetlink_core::{DeviceId, SessionId, SessionRole};
-use rivetlink_protocol::packets::{ButtonState, InputPacket, MouseButton, SignalPacket};
+use rivetlink_protocol::{
+    packets::{ButtonState, InputPacket, MouseButton, SignalPacket},
+    SessionCapability, RELAY_PROTOCOL_VERSION,
+};
 
 // ─── Strategies ──────────────────────────────────────────
 
@@ -69,6 +72,7 @@ fn any_signal_packet() -> impl Strategy<Value = SignalPacket> {
             SignalPacket::SessionRequest {
                 device_id,
                 client_public_key,
+                protocol_version: RELAY_PROTOCOL_VERSION,
                 requested_capability: SessionCapability::Screenshot,
                 session_id: None,
             }

@@ -33,7 +33,7 @@
 use spake2::{Ed25519Group, Identity, Password, Spake2};
 
 use crate::error::{CryptoError, CryptoResult};
-use crate::sealed::SealedChannel;
+use crate::sealed::{ChannelRole, SealedChannel};
 
 /// Domain-separation identity, so a SPAKE2 transcript from this protocol can't
 /// be replayed into another that happens to use the same password.
@@ -82,12 +82,18 @@ pub fn start(password: &[u8]) -> Started {
 }
 
 impl PakeHandshake {
-    /// Complete the exchange with the peer's message, deriving a sealed channel.
+    /// Complete the exchange with the peer's message, deriving a directional
+    /// sealed channel bound to the caller's canonical transcript.
     ///
     /// Returns [`CryptoError::PakeFailed`] only if the peer's message is
     /// malformed. A *wrong* password does not fail here — it yields a channel
     /// whose first [`SealedChannel::open`] will fail (see the module docs).
-    pub fn finish(self, peer_message: &[u8]) -> CryptoResult<SealedChannel> {
+    pub fn finish(
+        self,
+        peer_message: &[u8],
+        transcript: &[u8],
+        role: ChannelRole,
+    ) -> CryptoResult<SealedChannel> {
         let key = self
             .state
             .finish(peer_message)
@@ -98,7 +104,7 @@ impl PakeHandshake {
         }
         let mut secret = [0u8; 32];
         secret.copy_from_slice(&key);
-        Ok(SealedChannel::from_shared_secret(&secret))
+        SealedChannel::from_handshake_secret(&secret, transcript, role)
     }
 }
 
@@ -110,8 +116,15 @@ mod tests {
     fn matching_password_interoperates() {
         let a = start(b"correct horse");
         let b = start(b"correct horse");
-        let chan_a = a.handshake.finish(&b.message).unwrap();
-        let chan_b = b.handshake.finish(&a.message).unwrap();
+        let transcript = b"rivetlink-pake-test";
+        let chan_a = a
+            .handshake
+            .finish(&b.message, transcript, ChannelRole::Initiator)
+            .unwrap();
+        let chan_b = b
+            .handshake
+            .finish(&a.message, transcript, ChannelRole::Responder)
+            .unwrap();
 
         let sealed = chan_a.seal(b"secret").unwrap();
         assert_eq!(chan_b.open(&sealed).unwrap(), b"secret");
@@ -122,8 +135,15 @@ mod tests {
         let a = start(b"1234");
         let b = start(b"9999");
         // Both finish (SPAKE2 derives a key regardless)…
-        let chan_a = a.handshake.finish(&b.message).unwrap();
-        let chan_b = b.handshake.finish(&a.message).unwrap();
+        let transcript = b"rivetlink-pake-test";
+        let chan_a = a
+            .handshake
+            .finish(&b.message, transcript, ChannelRole::Initiator)
+            .unwrap();
+        let chan_b = b
+            .handshake
+            .finish(&a.message, transcript, ChannelRole::Responder)
+            .unwrap();
         // …but the keys differ, so the AEAD tag fails to authenticate.
         let sealed = chan_a.seal(b"secret").unwrap();
         assert!(chan_b.open(&sealed).is_err());
@@ -133,7 +153,11 @@ mod tests {
     fn malformed_peer_message_is_rejected() {
         let a = start(b"pw");
         assert!(matches!(
-            a.handshake.finish(b"not a valid spake message"),
+            a.handshake.finish(
+                b"not a valid spake message",
+                b"rivetlink-pake-test",
+                ChannelRole::Initiator,
+            ),
             Err(CryptoError::PakeFailed)
         ));
     }
@@ -144,11 +168,17 @@ mod tests {
         // different keys (forward secrecy across sessions).
         let a1 = start(b"pw");
         let b1 = start(b"pw");
-        let chan1 = a1.handshake.finish(&b1.message).unwrap();
+        let chan1 = a1
+            .handshake
+            .finish(&b1.message, b"run1", ChannelRole::Initiator)
+            .unwrap();
 
         let a2 = start(b"pw");
         let b2 = start(b"pw");
-        let chan2 = a2.handshake.finish(&b2.message).unwrap();
+        let chan2 = a2
+            .handshake
+            .finish(&b2.message, b"run2", ChannelRole::Initiator)
+            .unwrap();
 
         let sealed = chan1.seal(b"x").unwrap();
         assert!(chan2.open(&sealed).is_err());

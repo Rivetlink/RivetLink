@@ -14,6 +14,7 @@ use base64::Engine;
 use ed25519_dalek::SigningKey;
 use tokio::net::{TcpListener, TcpStream};
 use tokio::sync::mpsc::Sender;
+use tokio::sync::Semaphore;
 use tokio::sync::{oneshot, watch};
 
 use rivetlink_crypto::sealed::SealedChannel;
@@ -37,6 +38,11 @@ use crate::trusted::TrustedClients;
 
 #[cfg(target_os = "linux")]
 const LOGIN_SCREEN_AVAILABLE_MESSAGE: &str = "physical-console login screen is available";
+const MAX_LAN_SESSIONS: usize = 32;
+#[cfg(target_os = "linux")]
+const MAX_PHYSICAL_CONSOLE_SESSIONS: usize = 16;
+#[cfg(target_os = "linux")]
+const PHYSICAL_CONSOLE_HANDSHAKE_TIMEOUT: Duration = Duration::from_secs(10);
 
 /// A change in LAN host session state, for an embedding app to drive its UI.
 /// The CLI agent ignores these (it logs instead); a desktop host surfaces them
@@ -161,6 +167,7 @@ pub async fn serve_physical_console(
     );
 
     let trusted = Arc::new(trusted);
+    let session_slots = Arc::new(Semaphore::new(MAX_PHYSICAL_CONSOLE_SESSIONS));
     let mut sessions = tokio::task::JoinSet::new();
     loop {
         tokio::select! {
@@ -171,7 +178,12 @@ pub async fn serve_physical_console(
                 let trusted = Arc::clone(&trusted);
                 let limits = limits.clone();
                 let source = source.clone();
+                let Ok(slot) = Arc::clone(&session_slots).try_acquire_owned() else {
+                    tracing::warn!(%peer, "physical-console LAN connection refused: session limit reached");
+                    continue;
+                };
                 sessions.spawn(async move {
+                    let _slot = slot;
                     // The desktop app performs a lightweight TCP health probe for
                     // saved LAN devices.  It intentionally opens and closes the
                     // socket without starting the authenticated protocol, so keep
@@ -212,13 +224,17 @@ async fn serve_physical_console_client(
     source: ConsoleWorkerPool,
 ) -> AgentResult<()> {
     let identity = Identity::from_signing_key(signing_key);
-    let (channel, client) = direct::host_accept_key(&mut stream, &identity, |id| {
-        // Reload at the handshake boundary too, so revoking a key takes
-        // effect for the next LAN connection without restarting the broker.
-        TrustedClients::load_or_empty(trusted.path())
-            .is_ok_and(|live| live.may_view_unattended_console(id))
-    })
+    let (channel, client) = tokio::time::timeout(
+        PHYSICAL_CONSOLE_HANDSHAKE_TIMEOUT,
+        direct::host_accept_key(&mut stream, &identity, |id| {
+            // Reload at the handshake boundary too, so revoking a key takes
+            // effect for the next LAN connection without restarting the broker.
+            TrustedClients::load_or_empty(trusted.path())
+                .is_ok_and(|live| live.may_view_unattended_console(id))
+        }),
+    )
     .await
+    .map_err(|_| AgentError::Lan("physical-console handshake timed out".to_string()))?
     .map_err(|e| AgentError::Lan(e.to_string()))?;
     tracing::info!(client = %client, "trusted physical-console LAN client authenticated");
 
@@ -582,6 +598,7 @@ pub async fn serve_with_events(
     );
 
     let auth = Arc::new(auth);
+    let session_slots = Arc::new(Semaphore::new(MAX_LAN_SESSIONS));
     // Sessions live in a JoinSet owned by this future. Cancelling serve
     // (dropping the future — e.g. the desktop app stopping the host) drops the
     // set, which aborts every active session and closes its socket, so the
@@ -622,7 +639,12 @@ pub async fn serve_with_events(
                     rx
                 });
                 let consent = consent.clone();
+                let Ok(slot) = Arc::clone(&session_slots).try_acquire_owned() else {
+                    tracing::warn!(%peer, "LAN connection refused: session limit reached");
+                    continue;
+                };
                 sessions.spawn(async move {
+                    let _slot = slot;
                     if let Err(e) = handle(
                         stream, signing_key, &auth, peer, events, kick, share_all, control, consent,
                     )
@@ -722,7 +744,8 @@ async fn handle(
 
     tracing::info!(%peer, label = %label, "LAN: session established, serving");
     // Share the channel (Arc) so a live stream can read control messages in a
-    // side task while it writes frames — the sealed channel is stateless.
+    // side task while it writes frames. Directional send/receive counters are
+    // independent, so this preserves ordered anti-replay semantics.
     // The connected/disconnected events are emitted inside serve_loop, bracketing
     // the *stream* (StartStream..end) — not the bare handshake — so the host only
     // shows "connected" once the client is actually viewing.

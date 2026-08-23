@@ -7,8 +7,8 @@
 //! - **Host agents** (devices) send `{"type":"DEVICE_HELLO","device_id":"..."}`,
 //!   the server replies with a random `DEVICE_CHALLENGE { nonce }`, and the
 //!   agent must respond with `DEVICE_AUTH { signature }` proving possession of
-//!   the device's Ed25519 signing key. The signature covers the raw nonce
-//!   bytes — no JWT, no shared bearer secret.
+//!   the device's Ed25519 signing key. The signature covers a fresh challenge
+//!   bound to the device id and protocol version — no JWT, no shared secret.
 
 use axum::{
     extract::{
@@ -33,6 +33,8 @@ use crate::websocket::connection::{ConnectedClient, PrincipalKind};
 use crate::websocket::heartbeat::HeartbeatTracker;
 
 const DEVICE_CHALLENGE_SIZE: usize = 32;
+const DEVICE_AUTH_PROTOCOL_VERSION: u16 = 2;
+const DEVICE_AUTH_DOMAIN: &[u8] = b"rivetlink-relay-device-auth-v2";
 
 /// First-frame handshake messages accepted from the client.
 #[derive(Debug, Deserialize)]
@@ -41,7 +43,10 @@ enum WsHandshakeMessage {
     #[serde(rename = "AUTH")]
     UserAuth { token: String },
     #[serde(rename = "DEVICE_HELLO")]
-    DeviceHello { device_id: Uuid },
+    DeviceHello {
+        device_id: Uuid,
+        protocol_version: u16,
+    },
 }
 
 /// Second-frame from the device after receiving a `DEVICE_CHALLENGE`.
@@ -187,7 +192,13 @@ async fn wait_for_auth(
 
     match msg {
         WsHandshakeMessage::UserAuth { token } => authenticate_user(&token, state),
-        WsHandshakeMessage::DeviceHello { device_id } => {
+        WsHandshakeMessage::DeviceHello {
+            device_id,
+            protocol_version,
+        } => {
+            if protocol_version != DEVICE_AUTH_PROTOCOL_VERSION {
+                return Err("unsupported secure device-auth protocol".to_string());
+            }
             authenticate_device(device_id, stream, sink, state).await
         },
     }
@@ -222,7 +233,12 @@ async fn authenticate_device(
     OsRng.fill_bytes(&mut nonce);
     let nonce_b64 = base64::engine::general_purpose::STANDARD.encode(nonce);
 
-    let challenge = serde_json::json!({"type": "DEVICE_CHALLENGE", "nonce": nonce_b64}).to_string();
+    let challenge = serde_json::json!({
+        "type": "DEVICE_CHALLENGE",
+        "protocol_version": DEVICE_AUTH_PROTOCOL_VERSION,
+        "nonce": nonce_b64,
+    })
+    .to_string();
     sink.send(Message::Text(challenge))
         .await
         .map_err(|e| format!("send DEVICE_CHALLENGE failed: {e}"))?;
@@ -247,7 +263,7 @@ async fn authenticate_device(
 
     use ed25519_dalek::Verifier;
     verifying_key
-        .verify(&nonce, &sig)
+        .verify(&device_challenge_binding(device_id, &nonce), &sig)
         .map_err(|_| "invalid signature".to_string())?;
 
     // Note: we do not persist nonces because each challenge is consumed
@@ -259,6 +275,16 @@ async fn authenticate_device(
         org_id: device.organization_id,
         kind: PrincipalKind::Device,
     })
+}
+
+fn device_challenge_binding(device_id: Uuid, nonce: &[u8; DEVICE_CHALLENGE_SIZE]) -> Vec<u8> {
+    let mut binding =
+        Vec::with_capacity(DEVICE_AUTH_DOMAIN.len() + 2 + device_id.as_bytes().len() + nonce.len());
+    binding.extend_from_slice(DEVICE_AUTH_DOMAIN);
+    binding.extend_from_slice(&DEVICE_AUTH_PROTOCOL_VERSION.to_be_bytes());
+    binding.extend_from_slice(device_id.as_bytes());
+    binding.extend_from_slice(nonce);
+    binding
 }
 
 /// Read frames until we get a text payload, propagating errors and closure.
@@ -316,5 +342,16 @@ mod tests {
     fn parse_public_key_rejects_wrong_length() {
         let short = base64::engine::general_purpose::STANDARD.encode([1u8; 16]);
         assert!(parse_public_key(&short).is_err());
+    }
+
+    #[test]
+    fn device_challenge_is_bound_to_the_device_and_protocol() {
+        let nonce = [7u8; DEVICE_CHALLENGE_SIZE];
+        let first = Uuid::now_v7();
+        let second = Uuid::now_v7();
+        assert_ne!(
+            device_challenge_binding(first, &nonce),
+            device_challenge_binding(second, &nonce)
+        );
     }
 }

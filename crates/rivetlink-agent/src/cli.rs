@@ -21,11 +21,11 @@ pub enum Command {
     /// Generate or refresh the keystore and write a starter config file.
     Init {
         /// Relay server WebSocket URL.
-        #[arg(long, default_value = "ws://127.0.0.1:8080/ws")]
+        #[arg(long, default_value = "wss://relay.example/ws")]
         relay_url: String,
 
         /// Relay server HTTP base URL for REST calls (register etc.).
-        #[arg(long, default_value = "http://127.0.0.1:8080")]
+        #[arg(long, default_value = "https://relay.example")]
         relay_http_url: String,
 
         /// Device display name reported to the relay.

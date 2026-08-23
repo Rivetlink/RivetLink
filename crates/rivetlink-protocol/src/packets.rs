@@ -3,6 +3,11 @@
 use rivetlink_core::{DeviceId, SessionId, SessionRole};
 use serde::{Deserialize, Serialize};
 
+/// Version of the relay end-to-end handshake. It is carried in, and later
+/// bound into, the authenticated transcript. Unsupported values are rejected;
+/// a relay cannot silently negotiate an older security construction.
+pub const RELAY_PROTOCOL_VERSION: u16 = 2;
+
 /// The graphical-console state a Linux host reports to an authenticated
 /// RivetLink client. These states describe the *physical* console on seat0;
 /// they never imply that RivetLink knows an Ubuntu account password.
@@ -56,6 +61,10 @@ pub enum SignalPacket {
     SessionRequest {
         device_id: DeviceId,
         client_public_key: String,
+        /// Security protocol version requested by the client. This field is
+        /// intentionally mandatory: accepting a missing value would create a
+        /// downgrade path for a hostile relay.
+        protocol_version: u16,
         /// Kept optional on the wire for compatibility with screenshot-only
         /// clients. Missing means `Screenshot`, never `ConsoleControl`.
         #[serde(default)]
@@ -212,6 +221,7 @@ mod tests {
         let packet = SignalPacket::SessionRequest {
             device_id: DeviceId::new(),
             client_public_key: "test_key".to_string(),
+            protocol_version: RELAY_PROTOCOL_VERSION,
             requested_capability: SessionCapability::Screenshot,
             session_id: None,
         };
@@ -302,9 +312,9 @@ mod tests {
     }
 
     #[test]
-    fn old_session_request_defaults_to_screenshot_capability() {
+    fn current_session_request_defaults_to_screenshot_capability() {
         let parsed: SignalPacket = serde_json::from_str(
-            r#"{"type":"SESSION_REQUEST","device_id":"00000000-0000-0000-0000-000000000001","client_public_key":"test"}"#,
+            r#"{"type":"SESSION_REQUEST","device_id":"00000000-0000-0000-0000-000000000001","client_public_key":"test","protocol_version":2}"#,
         )
         .unwrap();
         assert!(matches!(

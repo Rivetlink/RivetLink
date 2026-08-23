@@ -8,9 +8,9 @@ use crate::error::{SdkError, SdkResult};
 /// Persisted client configuration.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ClientConfig {
-    /// Relay WebSocket URL (e.g. `ws://192.168.1.10:8080/ws`).
+    /// Relay WebSocket URL. Public relay connections require `wss://`.
     pub relay_ws_url: String,
-    /// Relay HTTP base URL (e.g. `http://192.168.1.10:8080`).
+    /// Relay REST base URL. Public relay connections require `https://`.
     pub relay_http_url: String,
     /// Path to the client's Ed25519 identity file.
     pub identity_path: PathBuf,
@@ -37,16 +37,14 @@ impl ClientConfig {
 
     /// Reject malformed URLs early.
     pub fn validate(&self) -> SdkResult<()> {
-        if !self.relay_ws_url.starts_with("ws://") && !self.relay_ws_url.starts_with("wss://") {
+        if !self.relay_ws_url.starts_with("wss://") {
             return Err(SdkError::Config(
-                "relay_ws_url must start with ws:// or wss://".to_string(),
+                "relay_ws_url must use wss://; plaintext relay WebSockets are unsafe".to_string(),
             ));
         }
-        if !self.relay_http_url.starts_with("http://")
-            && !self.relay_http_url.starts_with("https://")
-        {
+        if !self.relay_http_url.starts_with("https://") {
             return Err(SdkError::Config(
-                "relay_http_url must start with http:// or https://".to_string(),
+                "relay_http_url must use https://; plaintext relay HTTP is unsafe".to_string(),
             ));
         }
         Ok(())
@@ -68,8 +66,8 @@ mod tests {
 
     fn sample() -> ClientConfig {
         ClientConfig {
-            relay_ws_url: "ws://127.0.0.1:8080/ws".into(),
-            relay_http_url: "http://127.0.0.1:8080".into(),
+            relay_ws_url: "wss://relay.example/ws".into(),
+            relay_http_url: "https://relay.example".into(),
             identity_path: PathBuf::from("/tmp/id.json"),
         }
     }
@@ -95,6 +93,16 @@ mod tests {
     fn validate_rejects_bad_http() {
         let mut cfg = sample();
         cfg.relay_http_url = "ftp://x".into();
+        assert!(cfg.validate().is_err());
+    }
+
+    #[test]
+    fn validate_rejects_plaintext_relay_transport() {
+        let mut cfg = sample();
+        cfg.relay_ws_url = "ws://relay.example/ws".into();
+        assert!(cfg.validate().is_err());
+        let mut cfg = sample();
+        cfg.relay_http_url = "http://relay.example".into();
         assert!(cfg.validate().is_err());
     }
 }

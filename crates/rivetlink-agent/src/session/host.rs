@@ -16,8 +16,10 @@ use base64::Engine;
 use ed25519_dalek::{SigningKey, VerifyingKey};
 use rivetlink_core::{SessionId, SessionRole};
 use rivetlink_crypto::handshake::{self, LocalKeyExchange};
-use rivetlink_crypto::sealed::SealedChannel;
-use rivetlink_protocol::{ConsoleInputPacket, HostConsoleState, SessionCapability, SignalPacket};
+use rivetlink_crypto::sealed::{ChannelRole, SealedChannel};
+use rivetlink_protocol::{
+    ConsoleInputPacket, HostConsoleState, SessionCapability, SignalPacket, RELAY_PROTOCOL_VERSION,
+};
 use std::time::{Duration, Instant};
 
 use crate::capture::screenshot;
@@ -231,6 +233,7 @@ impl ScreenshotHost {
     async fn on_session_request(
         &mut self,
         client_public_key: String,
+        protocol_version: u16,
         requested_capability: SessionCapability,
         session_id: Option<SessionId>,
     ) -> AgentResult<Vec<String>> {
@@ -238,6 +241,10 @@ impl ScreenshotHost {
             tracing::warn!("session request without session_id (relay should stamp it)");
             return Ok(Vec::new());
         };
+        if protocol_version != RELAY_PROTOCOL_VERSION {
+            tracing::warn!(session = %sid, protocol_version, "unsupported relay protocol version rejected");
+            return Ok(vec![reject(sid, "unsupported secure protocol version")?]);
+        }
         tracing::info!(session = %sid, "session request received");
 
         if requested_capability == SessionCapability::ConsoleControl
@@ -280,7 +287,10 @@ impl ScreenshotHost {
         self.session_id = Some(sid);
         self.capability = Some(requested_capability);
         self.client_identity = Some(client_identity);
-        let kex = handshake::start(&self.signing_key);
+        let kex = handshake::start(
+            &self.signing_key,
+            &relay_kex_binding(sid, b"host", &self.identity_b64),
+        );
         let kex_frame = self.key_exchange_frame(sid, &kex)?;
         self.local_kex = Some(kex);
 
@@ -306,10 +316,16 @@ impl ScreenshotHost {
     /// Handle the client's `SessionKeyExchange`.
     fn on_key_exchange(
         &mut self,
+        session_id: SessionId,
         ephemeral_public_key: &str,
         identity_public_key: &str,
         signature: &str,
     ) -> AgentResult<Vec<String>> {
+        if self.session_id != Some(session_id) {
+            return Err(AgentError::Relay(
+                "client key exchange does not match the active session".to_string(),
+            ));
+        }
         let client_identity = self
             .client_identity
             .ok_or_else(|| AgentError::Relay("key exchange before session request".to_string()))?;
@@ -324,14 +340,46 @@ impl ScreenshotHost {
 
         let peer_eph = decode_32(ephemeral_public_key)?;
         let peer_sig = decode_64(signature)?;
-        handshake::verify_peer(&client_identity, &peer_eph, &peer_sig)
-            .map_err(|e| AgentError::Relay(format!("client key exchange invalid: {e}")))?;
+        handshake::verify_peer(
+            &client_identity,
+            &peer_eph,
+            &peer_sig,
+            &relay_kex_binding(session_id, b"client", identity_public_key),
+        )
+        .map_err(|e| AgentError::Relay(format!("client key exchange invalid: {e}")))?;
 
         let kex = self
             .local_kex
             .take()
             .ok_or_else(|| AgentError::Relay("missing local key exchange".to_string()))?;
-        self.channel = Some(kex.into_channel(&peer_eph));
+        let sid = session_id;
+        let host_packet = SignalPacket::SessionKeyExchange {
+            session_id: sid,
+            ephemeral_public_key: base64::engine::general_purpose::STANDARD
+                .encode(kex.ephemeral_public()),
+            identity_public_key: self.identity_b64.clone(),
+            signature: base64::engine::general_purpose::STANDARD.encode(kex.signature()),
+        };
+        let client_packet = SignalPacket::SessionKeyExchange {
+            session_id: sid,
+            ephemeral_public_key: ephemeral_public_key.to_string(),
+            identity_public_key: identity_public_key.to_string(),
+            signature: signature.to_string(),
+        };
+        self.channel = Some(
+            kex.into_channel(
+                &peer_eph,
+                &relay_transcript(
+                    sid,
+                    identity_public_key,
+                    &self.identity_b64,
+                    &client_packet,
+                    &host_packet,
+                )?,
+                ChannelRole::Responder,
+            )
+            .map_err(|e| AgentError::Relay(format!("session key derivation failed: {e}")))?,
+        );
         tracing::info!("secure channel established with client");
         Ok(Vec::new())
     }
@@ -454,6 +502,32 @@ impl ScreenshotHost {
     }
 }
 
+fn relay_kex_binding(session_id: SessionId, role: &[u8], identity_b64: &str) -> Vec<u8> {
+    let mut binding = Vec::with_capacity(128);
+    binding.extend_from_slice(b"rivetlink-relay-v2");
+    binding.extend_from_slice(session_id.to_string().as_bytes());
+    binding.extend_from_slice(role);
+    binding.extend_from_slice(identity_b64.trim().as_bytes());
+    binding
+}
+
+fn relay_transcript(
+    session_id: SessionId,
+    client_identity: &str,
+    host_identity: &str,
+    client_kex: &SignalPacket,
+    host_kex: &SignalPacket,
+) -> AgentResult<Vec<u8>> {
+    let mut transcript = Vec::new();
+    transcript.extend_from_slice(b"rivetlink-relay-v2");
+    transcript.extend_from_slice(session_id.to_string().as_bytes());
+    transcript.extend_from_slice(client_identity.trim().as_bytes());
+    transcript.extend_from_slice(host_identity.trim().as_bytes());
+    transcript.extend_from_slice(&serde_json::to_vec(client_kex)?);
+    transcript.extend_from_slice(&serde_json::to_vec(host_kex)?);
+    Ok(transcript)
+}
+
 fn validate_console_input(event: &ConsoleInputPacket) -> AgentResult<()> {
     if let ConsoleInputPacket::Key { code, .. } = event {
         if code.is_empty()
@@ -490,19 +564,31 @@ impl HostHandler for ScreenshotHost {
         match packet {
             SignalPacket::SessionRequest {
                 client_public_key,
+                protocol_version,
                 requested_capability,
                 session_id,
                 ..
             } => {
-                self.on_session_request(client_public_key, requested_capability, session_id)
-                    .await
+                self.on_session_request(
+                    client_public_key,
+                    protocol_version,
+                    requested_capability,
+                    session_id,
+                )
+                .await
             },
             SignalPacket::SessionKeyExchange {
+                session_id,
                 ephemeral_public_key,
                 identity_public_key,
                 signature,
                 ..
-            } => self.on_key_exchange(&ephemeral_public_key, &identity_public_key, &signature),
+            } => self.on_key_exchange(
+                session_id,
+                &ephemeral_public_key,
+                &identity_public_key,
+                &signature,
+            ),
             SignalPacket::ScreenshotRequest { session_id } => {
                 match self.on_screenshot_request(session_id).await {
                     Ok(frames) => Ok(frames),
@@ -788,6 +874,7 @@ mod tests {
         let out = h
             .on_session_request(
                 "not-base64-!!".to_string(),
+                RELAY_PROTOCOL_VERSION,
                 SessionCapability::Screenshot,
                 Some(SessionId::new()),
             )
@@ -814,6 +901,7 @@ mod tests {
         let out = h
             .on_session_request(
                 client_b64,
+                RELAY_PROTOCOL_VERSION,
                 SessionCapability::Screenshot,
                 Some(SessionId::new()),
             )
@@ -841,6 +929,7 @@ mod tests {
         let out = h
             .on_session_request(
                 client_b64,
+                RELAY_PROTOCOL_VERSION,
                 SessionCapability::ConsoleControl,
                 Some(SessionId::new()),
             )
@@ -849,6 +938,33 @@ mod tests {
         let packet: SignalPacket = serde_json::from_str(&out[0]).unwrap();
         assert!(matches!(packet, SignalPacket::SessionRejected { .. }));
         assert!(h.session_id.is_none());
+    }
+
+    #[tokio::test]
+    async fn relay_version_downgrade_is_rejected_before_consent_or_capture() {
+        let mut h = host(ConsentPolicy::HeadlessTrustedOnly {
+            min_capture_interval: Duration::ZERO,
+            capture_timeout: Duration::from_secs(1),
+            max_capture_bytes: 1024,
+        });
+        let client = SigningKey::from_bytes(&[21u8; 32]);
+        let client_b64 =
+            base64::engine::general_purpose::STANDARD.encode(client.verifying_key().as_bytes());
+        let session_id = SessionId::new();
+        let out = h
+            .on_session_request(
+                client_b64,
+                RELAY_PROTOCOL_VERSION - 1,
+                SessionCapability::Screenshot,
+                Some(session_id),
+            )
+            .await
+            .unwrap();
+        assert!(matches!(
+            serde_json::from_str::<SignalPacket>(&out[0]).unwrap(),
+            SignalPacket::SessionRejected { session_id: rejected, .. } if rejected == session_id
+        ));
+        assert!(h.channel.is_none());
     }
 
     #[tokio::test]
@@ -878,26 +994,63 @@ mod tests {
         let frames = h
             .on_session_request(
                 client_b64.clone(),
+                RELAY_PROTOCOL_VERSION,
                 SessionCapability::ConsoleControl,
                 Some(session_id),
             )
             .await
             .unwrap();
+        let host_packet: SignalPacket = serde_json::from_str(&frames[1]).unwrap();
         let SignalPacket::SessionKeyExchange {
             ephemeral_public_key,
+            identity_public_key: host_identity,
+            signature: _host_signature,
             ..
-        } = serde_json::from_str(&frames[1]).unwrap()
+        } = &host_packet
         else {
             panic!("host did not send a key exchange");
         };
-        let client_kex = handshake::start(&client);
+        let client_kex = handshake::start(
+            &client,
+            &relay_kex_binding(session_id, b"client", &client_b64),
+        );
+        let client_packet = SignalPacket::SessionKeyExchange {
+            session_id,
+            ephemeral_public_key: base64::engine::general_purpose::STANDARD
+                .encode(client_kex.ephemeral_public()),
+            identity_public_key: client_b64.clone(),
+            signature: base64::engine::general_purpose::STANDARD.encode(client_kex.signature()),
+        };
         h.on_key_exchange(
-            &base64::engine::general_purpose::STANDARD.encode(client_kex.ephemeral_public()),
+            session_id,
+            match &client_packet {
+                SignalPacket::SessionKeyExchange {
+                    ephemeral_public_key,
+                    ..
+                } => ephemeral_public_key,
+                _ => unreachable!(),
+            },
             &client_b64,
-            &base64::engine::general_purpose::STANDARD.encode(client_kex.signature()),
+            match &client_packet {
+                SignalPacket::SessionKeyExchange { signature, .. } => signature,
+                _ => unreachable!(),
+            },
         )
         .unwrap();
-        let channel = client_kex.into_channel(&decode_32(&ephemeral_public_key).unwrap());
+        let channel = client_kex
+            .into_channel(
+                &decode_32(ephemeral_public_key).unwrap(),
+                &relay_transcript(
+                    session_id,
+                    &client_b64,
+                    host_identity,
+                    &client_packet,
+                    &host_packet,
+                )
+                .unwrap(),
+                ChannelRole::Initiator,
+            )
+            .unwrap();
         let encoded_event = serde_json::to_vec(&ConsoleInputPacket::Key {
             code: "Enter".to_string(),
             down: true,
@@ -905,7 +1058,10 @@ mod tests {
         .unwrap();
         let ciphertext =
             base64::engine::general_purpose::STANDARD.encode(channel.seal(&encoded_event).unwrap());
-        h.on_console_input(session_id, ciphertext).await.unwrap();
+        h.on_console_input(session_id, ciphertext.clone())
+            .await
+            .unwrap();
+        assert!(h.on_console_input(session_id, ciphertext).await.is_err());
         let received = received.lock().unwrap();
         assert_eq!(received.len(), 1);
         assert!(matches!(
@@ -927,27 +1083,57 @@ mod tests {
         trust_viewer(&mut h, &client_b64);
         let sid = SessionId::new();
         let host_frames = h
-            .on_session_request(client_b64.clone(), SessionCapability::Screenshot, Some(sid))
+            .on_session_request(
+                client_b64.clone(),
+                RELAY_PROTOCOL_VERSION,
+                SessionCapability::Screenshot,
+                Some(sid),
+            )
             .await
             .unwrap();
         let host_kex: SignalPacket = serde_json::from_str(&host_frames[1]).unwrap();
         let SignalPacket::SessionKeyExchange {
             ephemeral_public_key,
+            identity_public_key: host_identity,
             ..
-        } = host_kex
+        } = &host_kex
         else {
             panic!("host did not send its key exchange");
         };
 
-        let client_kex = handshake::start(&client);
+        let client_kex = handshake::start(&client, &relay_kex_binding(sid, b"client", &client_b64));
+        let client_packet = SignalPacket::SessionKeyExchange {
+            session_id: sid,
+            ephemeral_public_key: base64::engine::general_purpose::STANDARD
+                .encode(client_kex.ephemeral_public()),
+            identity_public_key: client_b64.clone(),
+            signature: base64::engine::general_purpose::STANDARD.encode(client_kex.signature()),
+        };
         h.on_key_exchange(
-            &base64::engine::general_purpose::STANDARD.encode(client_kex.ephemeral_public()),
+            sid,
+            match &client_packet {
+                SignalPacket::SessionKeyExchange {
+                    ephemeral_public_key,
+                    ..
+                } => ephemeral_public_key,
+                _ => unreachable!(),
+            },
             &client_b64,
-            &base64::engine::general_purpose::STANDARD.encode(client_kex.signature()),
+            match &client_packet {
+                SignalPacket::SessionKeyExchange { signature, .. } => signature,
+                _ => unreachable!(),
+            },
         )
         .unwrap();
-        let host_ephemeral = decode_32(&ephemeral_public_key).unwrap();
-        let client_channel = client_kex.into_channel(&host_ephemeral);
+        let host_ephemeral = decode_32(ephemeral_public_key).unwrap();
+        let client_channel = client_kex
+            .into_channel(
+                &host_ephemeral,
+                &relay_transcript(sid, &client_b64, host_identity, &client_packet, &host_kex)
+                    .unwrap(),
+                ChannelRole::Initiator,
+            )
+            .unwrap();
 
         std::env::set_var("RIVET_FAKE_CAPTURE", "128");
         let frames = h.on_screenshot_request(sid).await.unwrap();

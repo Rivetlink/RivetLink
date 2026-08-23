@@ -199,20 +199,14 @@ impl AgentConfig {
                 "at least one console transport (lan or relay) must be enabled".to_string(),
             ));
         }
-        if self.console_transports.relay.enabled
-            && !self.relay_url.starts_with("ws://")
-            && !self.relay_url.starts_with("wss://")
-        {
+        if self.console_transports.relay.enabled && !self.relay_url.starts_with("wss://") {
             return Err(AgentError::Config(
-                "relay_url must start with ws:// or wss://".to_string(),
+                "relay_url must use wss://; plaintext relay WebSockets are unsafe".to_string(),
             ));
         }
-        if self.console_transports.relay.enabled
-            && !self.relay_http_url.starts_with("http://")
-            && !self.relay_http_url.starts_with("https://")
-        {
+        if self.console_transports.relay.enabled && !self.relay_http_url.starts_with("https://") {
             return Err(AgentError::Config(
-                "relay_http_url must start with http:// or https://".to_string(),
+                "relay_http_url must use https://; plaintext relay HTTP is unsafe".to_string(),
             ));
         }
         if self.console_transports.lan.enabled
