@@ -214,6 +214,11 @@ fn spawn_worker(display: &str, authority: &Path) -> AgentResult<u32> {
         .env("DISPLAY", display)
         .env("XAUTHORITY", authority)
         .env("XDG_SESSION_CLASS", "greeter")
+        // `runuser --login` deliberately clears the greeter environment.
+        // RivetLink's worker must still know that this already-authorized
+        // local display is Xorg, otherwise it correctly refuses to route a
+        // protected pre-login session through a generic Wayland backend.
+        .env("XDG_SESSION_TYPE", "x11")
         .env("USER", LIGHTDM_USER)
         .stdin(Stdio::null())
         .stdout(Stdio::null())
