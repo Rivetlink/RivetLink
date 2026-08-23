@@ -23,6 +23,8 @@ const WORKER_PID: &str = "/run/rivetlink/lightdm-worker.pid";
 const FIND_GREETER_TIMEOUT: Duration = Duration::from_secs(20);
 const FIND_GREETER_INTERVAL: Duration = Duration::from_millis(200);
 const VERIFY_TIMEOUT: Duration = Duration::from_secs(30);
+const FIND_WORKER_CHILD_TIMEOUT: Duration = Duration::from_secs(3);
+const FIND_WORKER_CHILD_INTERVAL: Duration = Duration::from_millis(50);
 
 /// Spawn a detached, fixed watcher from LightDM's root hook.
 #[allow(clippy::disallowed_methods)] // LightDM supplies this fixed hook environment.
@@ -225,7 +227,62 @@ fn spawn_worker(display: &str, authority: &Path) -> AgentResult<u32> {
         .stderr(Stdio::null())
         .spawn()
         .map_err(|error| AgentError::Config(format!("start LightDM console worker: {error}")))?;
-    Ok(child.id())
+    // `runuser` stays alive as root while it owns the PAM session and forks
+    // the real `rivet-agent` as the LightDM account. Do not record its PID:
+    // the verifier and teardown intentionally require a non-root worker.
+    find_lightdm_worker_child(child.id())
+}
+
+fn find_lightdm_worker_child(launcher_pid: u32) -> AgentResult<u32> {
+    let deadline = Instant::now() + FIND_WORKER_CHILD_TIMEOUT;
+    loop {
+        for entry in fs::read_dir("/proc")
+            .map_err(|error| AgentError::Config(format!("inspect worker processes: {error}")))?
+        {
+            let Ok(entry) = entry else { continue };
+            let Ok(pid) = entry.file_name().to_string_lossy().parse::<i32>() else {
+                continue;
+            };
+            if pid <= 1 {
+                continue;
+            }
+            let Ok(status) = fs::read_to_string(entry.path().join("status")) else {
+                continue;
+            };
+            if !is_descendant_of_launcher(launcher_pid, &status) {
+                continue;
+            }
+            if is_our_lightdm_worker(pid)? {
+                return u32::try_from(pid)
+                    .map_err(|_| AgentError::Config("invalid LightDM worker process ID".into()));
+            }
+        }
+        if Instant::now() >= deadline {
+            return Err(AgentError::Config(
+                "LightDM worker launcher did not create an authorized worker".into(),
+            ));
+        }
+        thread::sleep(FIND_WORKER_CHILD_INTERVAL);
+    }
+}
+
+/// `runuser` normally forks the agent directly, but PAM implementations may
+/// insert one short-lived session process. Restrict the search to a descendant
+/// of this exact launcher rather than accepting an unrelated LightDM worker.
+fn is_descendant_of_launcher(launcher_pid: u32, status: &str) -> bool {
+    let mut parent = process_parent_pid(status);
+    for _ in 0..4 {
+        match parent {
+            Some(parent_pid) if parent_pid == launcher_pid => return true,
+            Some(parent_pid) if parent_pid > 1 => {
+                parent = fs::read_to_string(format!("/proc/{parent_pid}/status"))
+                    .ok()
+                    .and_then(|parent_status| process_parent_pid(&parent_status));
+            },
+            _ => return false,
+        }
+    }
+    false
 }
 
 fn write_worker_pid(pid: u32) -> AgentResult<()> {
@@ -345,6 +402,15 @@ fn process_real_uid(status: &str) -> Option<u32> {
         .ok()
 }
 
+fn process_parent_pid(status: &str) -> Option<u32> {
+    status
+        .lines()
+        .find_map(|line| line.strip_prefix("PPid:"))?
+        .trim()
+        .parse()
+        .ok()
+}
+
 fn valid_lightdm_authority(path: &Path, lightdm_uid: u32) -> bool {
     path.is_absolute()
         && path.is_file()
@@ -399,6 +465,21 @@ mod tests {
             Some(110)
         );
         assert_eq!(process_real_uid("Name:\tfoo\n"), None);
+    }
+
+    #[test]
+    fn extracts_the_parent_pid_only() {
+        assert_eq!(
+            process_parent_pid("Name:\tfoo\nPPid:\t3409\nUid:\t112\n"),
+            Some(3409)
+        );
+        assert_eq!(process_parent_pid("Name:\tfoo\n"), None);
+    }
+
+    #[test]
+    fn accepts_only_a_descendant_of_the_worker_launcher() {
+        assert!(is_descendant_of_launcher(3409, "PPid:\t3409\n"));
+        assert!(!is_descendant_of_launcher(3409, "PPid:\t3408\n"));
     }
 
     #[test]
