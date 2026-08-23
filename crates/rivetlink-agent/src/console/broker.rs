@@ -12,10 +12,9 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
 use std::sync::RwLock;
 use std::time::Duration;
-use tokio::net::unix::{OwnedReadHalf, OwnedWriteHalf};
+use tokio::net::unix::OwnedWriteHalf;
 use tokio::net::{UnixListener, UnixStream};
-use tokio::sync::watch;
-use tokio::sync::Mutex;
+use tokio::sync::{broadcast, mpsc, watch, Mutex};
 
 use super::worker::{
     read_packet_with_limit, write_packet, ConsoleInput, WorkerErrorCode, WorkerRequest,
@@ -24,7 +23,7 @@ use super::worker::{
 use crate::error::{AgentError, AgentResult};
 use crate::session::{ConsentPolicy, ConsoleInputSink, ConsoleStateProvider, ScreenshotCapturer};
 use rivetlink_protocol::{ConsoleInputPacket, HostConsoleState, MouseButton};
-use rivetlink_sdk::lan::PtrButton;
+use rivetlink_sdk::lan::{FrameDelta, PtrButton};
 
 /// Upper bound for a base64 PNG response (~9 MiB decoded), matching the
 /// unattended host's configured maximum without trusting worker input blindly.
@@ -270,6 +269,12 @@ impl ConsoleWorkerPool {
             .clone()
             .ok_or_else(|| AgentError::Relay("no active graphical console worker".to_string()))
     }
+
+    /// Open the normal high-performance desktop engine only after the active
+    /// graphical worker has reported `DesktopReady`.
+    pub async fn start_desktop_stream(&self, fps: u16) -> AgentResult<ConsoleDesktopStream> {
+        self.current().await?.start_desktop_stream(fps).await
+    }
 }
 
 /// A single, authenticated connection to the current physical-console owner.
@@ -277,14 +282,22 @@ impl ConsoleWorkerPool {
 /// interleaved across a GDM ↔ GNOME handover.
 #[derive(Clone, Debug)]
 pub struct ConsoleWorkerClient {
-    inner: Arc<Mutex<WorkerConnection>>,
+    writer: Arc<Mutex<OwnedWriteHalf>>,
+    responses: Arc<Mutex<mpsc::Receiver<WorkerResponse>>>,
+    request_lock: Arc<Mutex<()>>,
+    desktop_frames: broadcast::Sender<FrameDelta>,
+    desktop_ended: broadcast::Sender<WorkerErrorCode>,
+    desktop_stream_active: Arc<std::sync::atomic::AtomicBool>,
     state: HostConsoleState,
 }
 
+/// An active normal desktop stream from a worker in an authenticated GNOME
+/// session. It is impossible to create this handle from a login worker.
 #[derive(Debug)]
-struct WorkerConnection {
-    reader: OwnedReadHalf,
-    writer: OwnedWriteHalf,
+pub struct ConsoleDesktopStream {
+    worker: ConsoleWorkerClient,
+    frames: broadcast::Receiver<FrameDelta>,
+    ended: broadcast::Receiver<WorkerErrorCode>,
 }
 
 impl ConsoleWorkerClient {
@@ -298,8 +311,46 @@ impl ConsoleWorkerClient {
             ));
         };
         tracing::info!(?state, "authenticated graphical console worker connected");
+        let (responses_tx, responses_rx) = mpsc::channel(16);
+        let (desktop_frames, _) = broadcast::channel(4);
+        let (desktop_ended, _) = broadcast::channel(4);
+        let active = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let reader_frames = desktop_frames.clone();
+        let reader_ended = desktop_ended.clone();
+        let reader_active = Arc::clone(&active);
+        tokio::spawn(async move {
+            loop {
+                let response: AgentResult<WorkerResponse> =
+                    read_packet_with_limit(&mut reader, MAX_WORKER_RESPONSE).await;
+                match response {
+                    Ok(WorkerResponse::DesktopFrame { delta }) => {
+                        let _ = reader_frames.send(delta);
+                    },
+                    Ok(WorkerResponse::DesktopStreamEnded { code }) => {
+                        reader_active.store(false, Ordering::Release);
+                        let _ = reader_ended.send(code);
+                    },
+                    Ok(response) => {
+                        if responses_tx.send(response).await.is_err() {
+                            break;
+                        }
+                    },
+                    Err(error) => {
+                        tracing::debug!(error = %error, "console worker IPC reader ended");
+                        reader_active.store(false, Ordering::Release);
+                        let _ = reader_ended.send(WorkerErrorCode::CompositorFailure);
+                        break;
+                    },
+                }
+            }
+        });
         Ok(Self {
-            inner: Arc::new(Mutex::new(WorkerConnection { reader, writer })),
+            writer: Arc::new(Mutex::new(writer)),
+            responses: Arc::new(Mutex::new(responses_rx)),
+            request_lock: Arc::new(Mutex::new(())),
+            desktop_frames,
+            desktop_ended,
+            desktop_stream_active: active,
             state,
         })
     }
@@ -341,10 +392,106 @@ impl ConsoleWorkerClient {
         }
     }
 
+    /// Start the existing normal Mutter/PipeWire tile-delta engine in the
+    /// authenticated desktop worker. The socket remains local; only the
+    /// broker's already-authenticated network session receives these frames.
+    pub async fn start_desktop_stream(&self, fps: u16) -> AgentResult<ConsoleDesktopStream> {
+        if self.state != HostConsoleState::DesktopReady {
+            return Err(AgentError::Relay(
+                "normal desktop stream is unavailable before an authenticated desktop is ready"
+                    .to_string(),
+            ));
+        }
+        if self
+            .desktop_stream_active
+            .swap(true, std::sync::atomic::Ordering::AcqRel)
+        {
+            return Err(AgentError::Relay(
+                "normal desktop stream is already active".to_string(),
+            ));
+        }
+        let frames = self.desktop_frames.subscribe();
+        let ended = self.desktop_ended.subscribe();
+        match self
+            .request(WorkerRequest::StartDesktopStream { fps })
+            .await
+        {
+            Ok(WorkerResponse::DesktopStreamStarted) => Ok(ConsoleDesktopStream {
+                worker: self.clone(),
+                frames,
+                ended,
+            }),
+            Ok(WorkerResponse::Error { code }) => {
+                self.desktop_stream_active
+                    .store(false, std::sync::atomic::Ordering::Release);
+                Err(worker_error(code))
+            },
+            Ok(_) => {
+                self.desktop_stream_active
+                    .store(false, std::sync::atomic::Ordering::Release);
+                Err(AgentError::Config(
+                    "unexpected console worker desktop-stream response".to_string(),
+                ))
+            },
+            Err(error) => {
+                self.desktop_stream_active
+                    .store(false, std::sync::atomic::Ordering::Release);
+                Err(error)
+            },
+        }
+    }
+
+    async fn stop_desktop_stream(&self) -> AgentResult<()> {
+        self.desktop_stream_active
+            .store(false, std::sync::atomic::Ordering::Release);
+        match self.request(WorkerRequest::StopDesktopStream).await? {
+            WorkerResponse::DesktopStreamStopped => Ok(()),
+            WorkerResponse::Error { code } => Err(worker_error(code)),
+            _ => Err(AgentError::Config(
+                "unexpected console worker desktop-stream stop response".to_string(),
+            )),
+        }
+    }
+
     async fn request(&self, request: WorkerRequest) -> AgentResult<WorkerResponse> {
-        let mut connection = self.inner.lock().await;
-        write_packet(&mut connection.writer, &request).await?;
-        read_packet_with_limit(&mut connection.reader, MAX_WORKER_RESPONSE).await
+        // Control requests stay ordered, while the independent IPC reader
+        // forwards desktop frames through a lossy newest-frame channel.
+        let _request = self.request_lock.lock().await;
+        {
+            let mut writer = self.writer.lock().await;
+            write_packet(&mut *writer, &request).await?;
+        }
+        self.responses
+            .lock()
+            .await
+            .recv()
+            .await
+            .ok_or_else(|| AgentError::Relay("console worker disconnected".to_string()))
+    }
+}
+
+impl ConsoleDesktopStream {
+    /// Return the freshest encoded desktop frame, or a non-sensitive terminal
+    /// error when the worker/session disappears.
+    pub async fn next(&mut self) -> AgentResult<FrameDelta> {
+        loop {
+            tokio::select! {
+                frame = self.frames.recv() => match frame {
+                    Ok(frame) => return Ok(frame),
+                    Err(broadcast::error::RecvError::Lagged(_)) => continue,
+                    Err(broadcast::error::RecvError::Closed) => return Err(AgentError::Relay("normal desktop stream closed".to_string())),
+                },
+                ended = self.ended.recv() => match ended {
+                    Ok(code) => return Err(worker_error(code)),
+                    Err(broadcast::error::RecvError::Lagged(_)) => continue,
+                    Err(broadcast::error::RecvError::Closed) => return Err(AgentError::Relay("normal desktop stream closed".to_string())),
+                },
+            }
+        }
+    }
+
+    pub async fn stop(self) -> AgentResult<()> {
+        self.worker.stop_desktop_stream().await
     }
 }
 

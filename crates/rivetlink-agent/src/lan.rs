@@ -6,6 +6,7 @@
 //! encrypted channel, then serves screenshot requests over it.
 
 use std::sync::Arc;
+#[cfg(target_os = "linux")]
 use std::time::{Duration, Instant};
 
 use base64::engine::general_purpose::STANDARD as B64;
@@ -16,6 +17,8 @@ use tokio::sync::mpsc::Sender;
 use tokio::sync::{oneshot, watch};
 
 use rivetlink_crypto::sealed::SealedChannel;
+#[cfg(target_os = "linux")]
+use rivetlink_protocol::{ConsoleInputPacket, HostConsoleState};
 use rivetlink_sdk::direct;
 use rivetlink_sdk::identity::Identity;
 use rivetlink_sdk::lan::{
@@ -23,10 +26,17 @@ use rivetlink_sdk::lan::{
 };
 
 use crate::capture::screenshot;
+#[cfg(target_os = "linux")]
 use crate::config::{LanConsoleTransportConfig, UnattendedConsoleConfig};
+#[cfg(target_os = "linux")]
+use crate::console::broker::ConsoleWorkerPool;
 use crate::error::{AgentError, AgentResult};
+#[cfg(target_os = "linux")]
 use crate::session::{ConsentPolicy, ConsoleInputSink, ConsoleStateProvider, ScreenshotCapturer};
 use crate::trusted::TrustedClients;
+
+#[cfg(target_os = "linux")]
+const LOGIN_SCREEN_AVAILABLE_MESSAGE: &str = "physical-console login screen is available";
 
 /// A change in LAN host session state, for an embedding app to drive its UI.
 /// The CLI agent ignores these (it logs instead); a desktop host surfaces them
@@ -110,17 +120,15 @@ pub async fn serve(
 /// There is no PIN or TOFU fallback here. A peer must first complete the
 /// signed direct handshake with a locally trusted device identity, then have
 /// the explicit unattended-console opt-in in the shared trust store.
-pub async fn serve_physical_console<C>(
+#[cfg(target_os = "linux")]
+pub async fn serve_physical_console(
     signing_key: SigningKey,
     device_name: String,
     transport: LanConsoleTransportConfig,
     trusted: TrustedClients,
     limits: UnattendedConsoleConfig,
-    source: C,
-) -> AgentResult<()>
-where
-    C: ScreenshotCapturer + ConsoleInputSink + ConsoleStateProvider + Clone + Send + 'static,
-{
+    source: ConsoleWorkerPool,
+) -> AgentResult<()> {
     // Physical-console deployments document a fixed firewall port. Do not
     // silently fall back to another port if it is occupied: retrying visibly is
     // safer than exposing a service on an unexpected port.
@@ -187,6 +195,7 @@ where
 /// A saved-device health probe reaches the TCP listener but deliberately does
 /// not send a direct-LAN handshake.  SDK framing reports that as an early EOF.
 /// It occurs before authentication and cannot carry capture or input data.
+#[cfg(any(target_os = "linux", test))]
 fn is_lan_health_probe_disconnect(error: &AgentError) -> bool {
     matches!(error, AgentError::Lan(message) if message.contains("early eof"))
 }
@@ -194,16 +203,14 @@ fn is_lan_health_probe_disconnect(error: &AgentError) -> bool {
 // One sequential authenticated transaction loop; splitting it would obscure
 // the trust-before-input ordering that is security-critical here.
 #[allow(clippy::too_many_lines)]
-async fn serve_physical_console_client<C>(
+#[cfg(target_os = "linux")]
+async fn serve_physical_console_client(
     mut stream: TcpStream,
     signing_key: SigningKey,
     trusted: Arc<TrustedClients>,
     limits: UnattendedConsoleConfig,
-    source: C,
-) -> AgentResult<()>
-where
-    C: ScreenshotCapturer + ConsoleInputSink + ConsoleStateProvider + Clone + Send + 'static,
-{
+    source: ConsoleWorkerPool,
+) -> AgentResult<()> {
     let identity = Identity::from_signing_key(signing_key);
     let (channel, client) = direct::host_accept_key(&mut stream, &identity, |id| {
         // Reload at the handshake boundary too, so revoking a key takes
@@ -225,97 +232,308 @@ where
         let Ok(request) = lan::recv_request(&mut stream, &channel).await else {
             return Ok(());
         };
-        let rivetlink_sdk::lan::LanRequest::ConsoleCapture { inputs } = request else {
+        match request {
+            // The same broker and trusted identity now serve the normal
+            // desktop stream after a successful LightDM login. This is a
+            // backend handoff, not a second LAN listener or a new trust path.
+            LanRequest::ListDisplays => {
+                let response = match source.console_state().await {
+                    Some((HostConsoleState::DesktopReady, _)) => LanResponse::Displays {
+                        // Linux's Mutter backend owns monitor selection. An
+                        // empty list retains the existing client's primary
+                        // monitor behaviour and avoids leaking local topology.
+                        displays: Vec::new(),
+                    },
+                    _ => LanResponse::Error {
+                        message: "normal desktop engine is not ready".to_string(),
+                    },
+                };
+                lan::send_response(&mut stream, &channel, &response)
+                    .await
+                    .map_err(|error| AgentError::Lan(error.to_string()))?;
+                continue;
+            },
+            LanRequest::StartStream { fps, .. } => {
+                return stream_authenticated_desktop(
+                    stream,
+                    Arc::new(channel),
+                    client,
+                    trusted,
+                    source,
+                    fps,
+                )
+                .await;
+            },
+            LanRequest::ConsoleCapture { inputs } => {
+                serve_console_capture_request(
+                    &mut stream,
+                    &channel,
+                    &client,
+                    &trusted,
+                    &limits,
+                    &source,
+                    &policy,
+                    &mut last_capture,
+                    inputs,
+                )
+                .await?;
+            },
+            _ => {
+                let _ = lan::send_response(
+                    &mut stream,
+                    &channel,
+                    &LanResponse::Error {
+                        message: "this physical-console listener accepts console capture before login or the normal desktop stream after login".to_string(),
+                    },
+                )
+                .await;
+                return Ok(());
+            },
+        }
+    }
+}
+
+#[cfg(target_os = "linux")]
+#[allow(clippy::too_many_arguments)]
+async fn serve_console_capture_request(
+    stream: &mut TcpStream,
+    channel: &rivetlink_crypto::sealed::SealedChannel,
+    client: &str,
+    trusted: &Arc<TrustedClients>,
+    limits: &UnattendedConsoleConfig,
+    source: &ConsoleWorkerPool,
+    policy: &ConsentPolicy,
+    last_capture: &mut Option<Instant>,
+    inputs: Vec<ConsoleInputPacket>,
+) -> AgentResult<()> {
+    if inputs.is_empty()
+        && last_capture.is_some_and(|at: Instant| {
+            at.elapsed() < Duration::from_secs(limits.min_capture_interval_secs)
+        })
+    {
+        lan::send_response(
+            stream,
+            channel,
+            &LanResponse::Error {
+                message: "screenshot request rate limit reached; try again shortly".to_string(),
+            },
+        )
+        .await
+        .map_err(|e| AgentError::Lan(e.to_string()))?;
+        return Ok(());
+    }
+    if !inputs.is_empty() {
+        // Authentication completed above, but view authorization does not
+        // imply control. Re-check the live trust store before injection so
+        // an entry revoked between handshake and request cannot send input.
+        let live = TrustedClients::load_or_empty(trusted.path())?;
+        if !live.may_control_unattended_console(client) {
+            lan::send_response(
+                stream,
+                channel,
+                &LanResponse::Error {
+                    message: "this trusted device is not authorized for physical-console input"
+                        .to_string(),
+                },
+            )
+            .await
+            .map_err(|e| AgentError::Lan(e.to_string()))?;
+            return Ok(());
+        }
+        let mut input_source = source.clone();
+        for event in inputs {
+            input_source.inject(event).await?;
+        }
+    }
+    *last_capture = Some(Instant::now());
+    let mut capture_source = source.clone();
+    let response = match tokio::time::timeout(
+        Duration::from_secs(limits.capture_timeout_secs),
+        capture_source.capture(*policy),
+    )
+    .await
+    {
+        Ok(Ok(png)) if png.len() <= limits.max_capture_bytes => {
+            let (state, generation) = source
+                .console_state()
+                .await
+                .map_or((None, None), |(state, generation)| {
+                    (Some(state), Some(generation))
+                });
+            LanResponse::ConsoleCapture {
+                png_b64: B64.encode(png),
+                state,
+                generation,
+            }
+        },
+        Ok(Ok(_)) => LanResponse::Error {
+            message: "screenshot exceeds the configured safety limit".to_string(),
+        },
+        Ok(Err(error)) => {
+            tracing::warn!(client = %client, error = %error, "physical-console LAN capture failed");
+            LanResponse::Error {
+                message: "physical-console capture failed".to_string(),
+            }
+        },
+        Err(_) => {
+            tracing::warn!(client = %client, "physical-console LAN capture timed out");
+            LanResponse::Error {
+                message: "physical-console capture timed out".to_string(),
+            }
+        },
+    };
+    lan::send_response(stream, channel, &response)
+        .await
+        .map_err(|e| AgentError::Lan(e.to_string()))?;
+    Ok(())
+}
+
+/// Run the existing normal 30fps desktop engine through the authenticated
+/// physical-console listener. This preserves the direct-LAN identity and trust
+/// relationship across LightDM → GNOME; only the capture backend changes.
+#[cfg(target_os = "linux")]
+async fn stream_authenticated_desktop(
+    stream: TcpStream,
+    channel: Arc<SealedChannel>,
+    client: String,
+    trusted: Arc<TrustedClients>,
+    source: ConsoleWorkerPool,
+    fps: u16,
+) -> AgentResult<()> {
+    if !matches!(
+        source.console_state().await,
+        Some((HostConsoleState::DesktopReady, _))
+    ) {
+        let mut stream = stream;
+        let _ = lan::send_response(
+            &mut stream,
+            &channel,
+            &LanResponse::Error {
+                message: "normal desktop engine is not ready".to_string(),
+            },
+        )
+        .await;
+        return Ok(());
+    }
+    let mut desktop = match source.start_desktop_stream(fps.clamp(1, 30)).await {
+        Ok(stream) => stream,
+        Err(error) => {
+            tracing::warn!(client = %client, error = %error, "normal desktop engine could not start");
+            let mut stream = stream;
             let _ = lan::send_response(
                 &mut stream,
                 &channel,
                 &LanResponse::Error {
-                    message: "this physical-console listener accepts console capture only"
-                        .to_string(),
+                    message: "normal desktop engine is unavailable".to_string(),
                 },
             )
             .await;
             return Ok(());
-        };
-        if inputs.is_empty()
-            && last_capture.is_some_and(|at: Instant| {
-                at.elapsed() < Duration::from_secs(limits.min_capture_interval_secs)
-            })
-        {
-            lan::send_response(
-                &mut stream,
-                &channel,
-                &LanResponse::Error {
-                    message: "screenshot request rate limit reached; try again shortly".to_string(),
+        },
+    };
+    tracing::info!(
+        client = %client,
+        backend = "NormalDesktopEngine",
+        state = "DesktopReady",
+        fps = fps.clamp(1, 30),
+        "physical-console handoff: normal desktop engine started"
+    );
+
+    let (mut reader, mut writer) = stream.into_split();
+    let (control_tx, mut control_rx) = tokio::sync::mpsc::channel::<LanRequest>(64);
+    let reader_channel = Arc::clone(&channel);
+    let reader_task = tokio::spawn(async move {
+        while let Ok(request) = lan::recv_request(&mut reader, &reader_channel).await {
+            if control_tx.send(request).await.is_err() {
+                break;
+            }
+        }
+    });
+
+    let result = loop {
+        tokio::select! {
+            frame = desktop.next() => match frame {
+                Ok(delta) => {
+                    if lan::send_response(&mut writer, &channel, &LanResponse::Frame(delta)).await.is_err() {
+                        break Ok(());
+                    }
                 },
-            )
-            .await
-            .map_err(|e| AgentError::Lan(e.to_string()))?;
-            continue;
+                Err(error) => {
+                    tracing::warn!(client = %client, error = %error, "normal desktop engine ended");
+                    let message = if wait_for_login_screen(&source).await {
+                        LOGIN_SCREEN_AVAILABLE_MESSAGE.to_string()
+                    } else {
+                        "normal desktop engine ended".to_string()
+                    };
+                    let _ = lan::send_response(&mut writer, &channel, &LanResponse::Error {
+                        message,
+                    }).await;
+                    break Ok(());
+                },
+            },
+            request = control_rx.recv() => match request {
+                Some(request) => {
+                    if let Some(input) = desktop_input(request) {
+                        let live = TrustedClients::load_or_empty(trusted.path())?;
+                        if !live.may_control_unattended_console(&client) {
+                            let _ = lan::send_response(&mut writer, &channel, &LanResponse::Error {
+                                message: "this trusted device is not authorized for remote input".to_string(),
+                            }).await;
+                            break Ok(());
+                        }
+                        let mut input_source = source.clone();
+                        if let Err(error) = input_source.inject(input).await {
+                            tracing::warn!(client = %client, error = %error, "normal desktop input failed");
+                            let _ = lan::send_response(&mut writer, &channel, &LanResponse::Error {
+                                message: "normal desktop input is unavailable".to_string(),
+                            }).await;
+                            break Ok(());
+                        }
+                    }
+                },
+                None => break Ok(()),
+            },
         }
-        if !inputs.is_empty() {
-            // Authentication completed above, but view authorization does not
-            // imply control. Re-check the live trust store before injection so
-            // an entry revoked between handshake and request cannot send input.
-            let live = TrustedClients::load_or_empty(trusted.path())?;
-            if !live.may_control_unattended_console(&client) {
-                lan::send_response(
-                    &mut stream,
-                    &channel,
-                    &LanResponse::Error {
-                        message: "this trusted device is not authorized for physical-console input"
-                            .to_string(),
-                    },
-                )
-                .await
-                .map_err(|e| AgentError::Lan(e.to_string()))?;
-                continue;
-            }
-            let mut input_source = source.clone();
-            for event in inputs {
-                input_source.inject(event).await?;
-            }
+    };
+    reader_task.abort();
+    let _ = desktop.stop().await;
+    tracing::info!(client = %client, "physical-console handoff: normal desktop engine stopped");
+    result
+}
+
+/// A successful logout replaces the GNOME desktop worker with LightDM's X11
+/// worker. Wait briefly for that normal transition before telling the client to
+/// return to physical-console mode; a capture failure while still desktop-ready
+/// must not masquerade as a logout.
+#[cfg(target_os = "linux")]
+async fn wait_for_login_screen(source: &ConsoleWorkerPool) -> bool {
+    for _ in 0..30 {
+        if matches!(
+            source.console_state().await,
+            Some((HostConsoleState::GdmLogin, _))
+        ) {
+            return true;
         }
-        last_capture = Some(Instant::now());
-        let mut capture_source = source.clone();
-        let response = match tokio::time::timeout(
-            Duration::from_secs(limits.capture_timeout_secs),
-            capture_source.capture(policy),
-        )
-        .await
-        {
-            Ok(Ok(png)) if png.len() <= limits.max_capture_bytes => {
-                let (state, generation) = source
-                    .console_state()
-                    .await
-                    .map_or((None, None), |(state, generation)| {
-                        (Some(state), Some(generation))
-                    });
-                LanResponse::ConsoleCapture {
-                    png_b64: B64.encode(png),
-                    state,
-                    generation,
-                }
+        tokio::time::sleep(Duration::from_secs(1)).await;
+    }
+    false
+}
+
+#[cfg(target_os = "linux")]
+fn desktop_input(request: LanRequest) -> Option<ConsoleInputPacket> {
+    match request {
+        LanRequest::PointerMove { x, y } => Some(ConsoleInputPacket::PointerMove { x, y }),
+        LanRequest::PointerButton { button, down } => Some(ConsoleInputPacket::PointerButton {
+            button: match button {
+                rivetlink_sdk::lan::PtrButton::Left => rivetlink_protocol::MouseButton::Left,
+                rivetlink_sdk::lan::PtrButton::Right => rivetlink_protocol::MouseButton::Right,
+                rivetlink_sdk::lan::PtrButton::Middle => rivetlink_protocol::MouseButton::Middle,
             },
-            Ok(Ok(_)) => LanResponse::Error {
-                message: "screenshot exceeds the configured safety limit".to_string(),
-            },
-            Ok(Err(error)) => {
-                tracing::warn!(client = %client, error = %error, "physical-console LAN capture failed");
-                LanResponse::Error {
-                    message: "physical-console capture failed".to_string(),
-                }
-            },
-            Err(_) => {
-                tracing::warn!(client = %client, "physical-console LAN capture timed out");
-                LanResponse::Error {
-                    message: "physical-console capture timed out".to_string(),
-                }
-            },
-        };
-        lan::send_response(&mut stream, &channel, &response)
-            .await
-            .map_err(|e| AgentError::Lan(e.to_string()))?;
+            down,
+        }),
+        LanRequest::Scroll { dx, dy } => Some(ConsoleInputPacket::Scroll { dx, dy }),
+        LanRequest::Key { code, down } => Some(ConsoleInputPacket::Key { code, down }),
+        _ => None,
     }
 }
 
@@ -969,35 +1187,6 @@ async fn stream_screen(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use rivetlink_protocol::{ConsoleInputPacket, HostConsoleState};
-    use std::sync::Mutex as StdMutex;
-
-    #[derive(Clone, Default)]
-    struct TestConsoleSource {
-        inputs: Arc<StdMutex<Vec<ConsoleInputPacket>>>,
-    }
-
-    #[async_trait::async_trait]
-    impl ScreenshotCapturer for TestConsoleSource {
-        async fn capture(&mut self, _policy: ConsentPolicy) -> AgentResult<Vec<u8>> {
-            Ok(vec![137, 80, 78, 71])
-        }
-    }
-
-    #[async_trait::async_trait]
-    impl ConsoleInputSink for TestConsoleSource {
-        async fn inject(&mut self, input: ConsoleInputPacket) -> AgentResult<()> {
-            self.inputs.lock().unwrap().push(input);
-            Ok(())
-        }
-    }
-
-    #[async_trait::async_trait]
-    impl ConsoleStateProvider for TestConsoleSource {
-        async fn console_state(&self) -> Option<(HostConsoleState, u64)> {
-            Some((HostConsoleState::GdmLogin, 7))
-        }
-    }
 
     // The privacy default: a `None` channel (the CLI agent, no UI gate) shares
     // every screen; an explicit flag is honoured verbatim. If this flips, an
@@ -1024,68 +1213,23 @@ mod tests {
         )));
     }
 
-    #[tokio::test]
-    async fn physical_console_lan_requires_trust_and_control_opt_in() {
-        let path = std::env::temp_dir().join(format!(
-            "rivetlink-physical-lan-test-{}.json",
-            uuid::Uuid::now_v7()
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn desktop_handoff_forwards_only_normalized_input() {
+        assert!(matches!(
+            desktop_input(LanRequest::Key {
+                code: "Enter".to_string(),
+                down: true,
+            }),
+            Some(ConsoleInputPacket::Key { .. })
         ));
-        let client_identity = Identity::from_signing_key(SigningKey::from_bytes(&[3; 32]));
-        let mut trusted = TrustedClients::load_or_empty(&path).unwrap();
-        trusted
-            .trust(
-                &client_identity.public_key_b64(),
-                crate::trusted::TrustedEntry {
-                    name: "controller".to_string(),
-                    can_view: true,
-                    can_control: false,
-                    can_unattended_console: true,
-                },
-            )
-            .unwrap();
-        let trusted = Arc::new(TrustedClients::load_or_empty(&path).unwrap());
-        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
-        let addr = listener.local_addr().unwrap();
-        let source = TestConsoleSource::default();
-        let seen = Arc::clone(&source.inputs);
-        let host = tokio::spawn(async move {
-            let (stream, _) = listener.accept().await.unwrap();
-            serve_physical_console_client(
-                stream,
-                SigningKey::from_bytes(&[4; 32]),
-                trusted,
-                UnattendedConsoleConfig {
-                    enabled: true,
-                    allow_trusted_clients: true,
-                    ..UnattendedConsoleConfig::default()
-                },
-                source,
-            )
-            .await
-        });
-        let (mut stream, channel) =
-            rivetlink_sdk::lan::connect_key_pinned(addr, &client_identity, None)
-                .await
-                .unwrap();
-        rivetlink_sdk::lan::send_request(
-            &mut stream,
-            &channel,
-            &LanRequest::ConsoleCapture {
-                inputs: vec![ConsoleInputPacket::Key {
-                    code: "KeyA".to_string(),
-                    down: true,
-                }],
-            },
-        )
-        .await
-        .unwrap();
-        let response = rivetlink_sdk::lan::recv_response(&mut stream, &channel)
-            .await
-            .unwrap();
-        assert!(matches!(response, LanResponse::Error { .. }));
-        assert!(seen.lock().unwrap().is_empty());
-        drop(stream);
-        host.await.unwrap().unwrap();
-        let _ = std::fs::remove_file(path);
+        assert!(desktop_input(LanRequest::StartStream {
+            fps: 30,
+            display: None,
+            name: None,
+            identity_key: None,
+            identity_sig: None,
+        })
+        .is_none());
     }
 }

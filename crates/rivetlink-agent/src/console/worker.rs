@@ -7,7 +7,7 @@
 
 use base64::Engine;
 use rivetlink_protocol::HostConsoleState;
-use rivetlink_sdk::lan::PtrButton;
+use rivetlink_sdk::lan::{FrameDelta, PtrButton};
 use serde::{Deserialize, Serialize};
 use std::path::{Path, PathBuf};
 use std::time::Duration;
@@ -45,8 +45,20 @@ pub enum ConsoleInput {
 #[serde(tag = "type", rename_all = "snake_case")]
 pub enum WorkerRequest {
     Ping,
-    Capture { timeout_ms: u64 },
-    Input { event: ConsoleInput },
+    Capture {
+        timeout_ms: u64,
+    },
+    /// Start the normal low-latency desktop stream. This is intentionally
+    /// accepted only from the authenticated seat owner after login; the X11
+    /// login worker remains a bounded PNG capture/input path.
+    StartDesktopStream {
+        fps: u16,
+    },
+    /// Stop the desktop stream and release its Mutter/PipeWire resources.
+    StopDesktopStream,
+    Input {
+        event: ConsoleInput,
+    },
     Stop,
 }
 
@@ -55,11 +67,28 @@ pub enum WorkerRequest {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(tag = "type", rename_all = "snake_case")]
 pub enum WorkerResponse {
-    Ready { state: HostConsoleState },
+    Ready {
+        state: HostConsoleState,
+    },
     Pong,
-    Capture { png_b64: String },
+    Capture {
+        png_b64: String,
+    },
+    DesktopStreamStarted,
+    /// A tile-delta frame from the normal desktop engine. Pixels stay on the
+    /// local worker → broker Unix socket until the broker seals them for its
+    /// already-authorized LAN or relay client.
+    DesktopFrame {
+        delta: FrameDelta,
+    },
+    DesktopStreamStopped,
+    DesktopStreamEnded {
+        code: WorkerErrorCode,
+    },
     InputAccepted,
-    Error { code: WorkerErrorCode },
+    Error {
+        code: WorkerErrorCode,
+    },
 }
 
 /// Stable, non-sensitive worker errors for the broker/client UX.
@@ -141,29 +170,123 @@ fn should_retry_broker_connect(kind: std::io::ErrorKind) -> bool {
 /// after an ownership transition, which makes GDM → GNOME and logout explicit
 /// rather than accidentally reusing a stale D-Bus session.
 pub async fn serve(stream: UnixStream) -> AgentResult<()> {
-    let (mut reader, mut writer) = stream.into_split();
+    let (mut reader, writer) = stream.into_split();
+    let writer = std::sync::Arc::new(tokio::sync::Mutex::new(writer));
     // A worker belongs to exactly one graphical D-Bus session.  On GDM →
     // GNOME the broker accepts a fresh worker rather than reusing this state.
     let session = graphical_session();
-    write_packet(
-        &mut writer,
+    write_worker_response(
+        &writer,
         &WorkerResponse::Ready {
             state: session.state,
         },
     )
     .await?;
     let mut input: Option<InputHandle> = None;
+    let mut desktop_stream: Option<tokio::task::JoinHandle<()>> = None;
+    let desktop_stream_active = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
 
     loop {
         let request: WorkerRequest = read_packet(&mut reader).await?;
         let response = match request {
             WorkerRequest::Ping => WorkerResponse::Pong,
             WorkerRequest::Capture { timeout_ms } => capture(timeout_ms, &session).await,
+            WorkerRequest::StartDesktopStream { fps } => {
+                if !supports_normal_desktop_stream(&session) {
+                    WorkerResponse::Error {
+                        code: WorkerErrorCode::ScreenCastUnavailable,
+                    }
+                } else if desktop_stream_active.swap(true, std::sync::atomic::Ordering::AcqRel) {
+                    // One authenticated viewer gets one PipeWire session. This
+                    // avoids accidentally retaining both the PNG physical
+                    // capture loop and a duplicate desktop stream.
+                    WorkerResponse::Error {
+                        code: WorkerErrorCode::InvalidRequest,
+                    }
+                } else {
+                    // A start acknowledgement is emitted before the capture
+                    // task can publish a frame, so the broker can switch its
+                    // own protocol cleanly at this boundary.
+                    write_worker_response(&writer, &WorkerResponse::DesktopStreamStarted).await?;
+                    let (frames_tx, mut frames_rx) = tokio::sync::mpsc::channel(2);
+                    let active = std::sync::Arc::clone(&desktop_stream_active);
+                    let stream_writer = std::sync::Arc::clone(&writer);
+                    let handle = tokio::spawn(async move {
+                        let capture = tokio::task::spawn_blocking(move || {
+                            crate::capture::screencast::stream_tiles_blocking(
+                                fps.clamp(1, 30),
+                                60,
+                                None,
+                                frames_tx,
+                            )
+                        });
+                        while let Some(delta) = frames_rx.recv().await {
+                            if write_worker_response(
+                                &stream_writer,
+                                &WorkerResponse::DesktopFrame { delta },
+                            )
+                            .await
+                            .is_err()
+                            {
+                                break;
+                            }
+                        }
+                        let code = match capture.await {
+                            Ok(Ok(())) => WorkerErrorCode::CompositorFailure,
+                            Ok(Err(error)) => {
+                                tracing::warn!(error = %error, "desktop stream capture failed");
+                                capture_error_code(HostConsoleState::DesktopReady, &error)
+                            },
+                            Err(error) => {
+                                tracing::warn!(error = %error, "desktop stream capture task failed");
+                                WorkerErrorCode::CompositorFailure
+                            },
+                        };
+                        active.store(false, std::sync::atomic::Ordering::Release);
+                        let _ = write_worker_response(
+                            &stream_writer,
+                            &WorkerResponse::DesktopStreamEnded { code },
+                        )
+                        .await;
+                    });
+                    desktop_stream = Some(handle);
+                    // Start was already sent before the producer was launched.
+                    continue;
+                }
+            },
+            WorkerRequest::StopDesktopStream => {
+                if let Some(handle) = desktop_stream.take() {
+                    handle.abort();
+                }
+                desktop_stream_active.store(false, std::sync::atomic::Ordering::Release);
+                WorkerResponse::DesktopStreamStopped
+            },
             WorkerRequest::Input { event } => apply_input(&session, &mut input, event),
-            WorkerRequest::Stop => return Ok(()),
+            WorkerRequest::Stop => {
+                if let Some(handle) = desktop_stream.take() {
+                    handle.abort();
+                }
+                return Ok(());
+            },
         };
-        write_packet(&mut writer, &response).await?;
+        write_worker_response(&writer, &response).await?;
     }
+}
+
+async fn write_worker_response(
+    writer: &std::sync::Arc<tokio::sync::Mutex<tokio::net::unix::OwnedWriteHalf>>,
+    response: &WorkerResponse,
+) -> AgentResult<()> {
+    let mut writer = writer.lock().await;
+    write_packet(&mut *writer, response).await
+}
+
+/// The normal engine is Mutter/PipeWire's tile-delta stream, not a faster
+/// variant of the pre-login PNG poller. It can only run inside the authenticated
+/// GNOME Wayland session which owns the current worker.
+fn supports_normal_desktop_stream(session: &GraphicalSession) -> bool {
+    session.state == HostConsoleState::DesktopReady
+        && matches!(session.backend, GraphicalBackend::Wayland)
 }
 
 /// Classify only the session that owns this worker. Both GDM and LightDM set
@@ -480,6 +603,9 @@ mod tests {
             },
         };
         assert_eq!(capture_backend(&desktop_x11).unwrap(), CaptureBackend::X11);
+        assert!(!supports_normal_desktop_stream(&gdm_x11));
+        assert!(supports_normal_desktop_stream(&desktop_wayland));
+        assert!(!supports_normal_desktop_stream(&desktop_x11));
     }
 
     #[test]

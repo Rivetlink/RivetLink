@@ -471,7 +471,7 @@ pub struct DisplayInfo {
 }
 
 /// One changed tile of a frame: its row-major index plus JPEG bytes (base64).
-#[derive(Debug, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct TilePatch {
     pub i: u32,
     pub jpeg_b64: String,
@@ -480,7 +480,7 @@ pub struct TilePatch {
 /// A delta frame: the tiles that changed since the previous frame. On a
 /// `keyframe` every tile is present, so the client can (re)build the full image
 /// and recover from any desync.
-#[derive(Debug, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct FrameDelta {
     /// Full frame width / height in pixels.
     pub w: u32,
