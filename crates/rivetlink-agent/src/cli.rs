@@ -195,6 +195,12 @@ pub enum Command {
         display: String,
     },
 
+    /// Verify, after boot, that the selected LightDM greeter actually exposed
+    /// RivetLink's constrained X11 worker.  This is invoked only by the fixed
+    /// system unit installed by the optional unattended-console setup.
+    #[command(hide = true)]
+    ConsoleLightdmGreeterVerify,
+
     /// Stop the fixed LightDM worker recorded in RivetLink's protected runtime
     /// directory. This has no arbitrary PID or command parameter.
     #[command(hide = true)]

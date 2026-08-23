@@ -141,6 +141,46 @@ GNOME Remote Login uses a separate RDP-owned display and does not expose a
 public raw-frame/input API for RivetLink's protocol. See
 [the remote-login integration boundary](docs/ubuntu-gnome-remote-login.md).
 
+### Optional LightDM X11 login screen
+
+For systems where pre-login access is explicitly required, RivetLink can
+optionally configure **LightDM** with a local X11 greeter. This is a
+display-manager migration, not a normal update setting: it keeps Ubuntu/PAM
+authentication intact and is reversible, but it requires a reboot and SSH or
+physical recovery access.
+
+The setup never calls the mode active merely because configuration files exist.
+At the next boot, `rivetlink-lightdm-verify.service` waits for the LightDM Xorg
+greeter and the constrained `lightdm` RivetLink worker. Only then does the app
+report **LightDM X11 enabled**. It also verifies that GDM is not active. The
+normal GNOME Wayland session remains the selected post-login session when the
+installed Ubuntu session supports it.
+
+To check a boot over SSH while still at the greeter:
+
+```bash
+cat /etc/X11/default-display-manager
+systemctl is-enabled lightdm; systemctl is-enabled gdm
+systemctl status display-manager lightdm rivetlink-lightdm-verify --no-pager
+ps aux | grep -E '[X]org|[l]ightdm|[g]reeter'
+sudo ls -l /run/rivetlink/lightdm-worker.pid
+sudo journalctl -u rivetlink-lightdm-verify -b --no-pager
+```
+
+Expected: the selected manager is `/usr/sbin/lightdm`, `lightdm` and
+`rivetlink-lightdm-verify` are active, GDM is inactive, and the PID file exists
+while the greeter is visible. On failure, restore GDM over SSH and reboot:
+
+```bash
+sudo /usr/local/lib/rivetlink/rivet-agent --help >/dev/null # confirm native install
+sudo /path/to/RivetLink.AppImage --rivetlink-console-lightdm-restore
+sudo reboot
+```
+
+When using an installed desktop executable rather than an AppImage, substitute
+that executable path in the restore command. The app's **Restore GDM** button
+performs the same fixed rollback; it does not remove LightDM packages.
+
 ## Development
 
 ```bash

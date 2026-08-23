@@ -99,6 +99,7 @@ pub async fn run(cli: Cli) -> AgentResult<()> {
         Some(Command::ConsoleWorker { socket }) => console_worker(&socket).await,
         Some(Command::ConsoleLightdmGreeterStart) => lightdm_greeter_start(),
         Some(Command::ConsoleLightdmGreeterWatch { display }) => lightdm_greeter_watch(&display),
+        Some(Command::ConsoleLightdmGreeterVerify) => lightdm_greeter_verify(),
         Some(Command::ConsoleLightdmGreeterStop) => lightdm_greeter_stop(),
         Some(Command::ConsoleBroker {
             socket,
@@ -131,6 +132,19 @@ fn lightdm_greeter_watch(display: &str) -> AgentResult<()> {
     #[cfg(not(target_os = "linux"))]
     {
         let _ = display;
+        Err(AgentError::Config(
+            "LightDM console integration is supported on Linux only".to_string(),
+        ))
+    }
+}
+
+fn lightdm_greeter_verify() -> AgentResult<()> {
+    #[cfg(target_os = "linux")]
+    {
+        crate::console::lightdm::verify()
+    }
+    #[cfg(not(target_os = "linux"))]
+    {
         Err(AgentError::Config(
             "LightDM console integration is supported on Linux only".to_string(),
         ))

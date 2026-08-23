@@ -9,7 +9,7 @@
 
 use std::collections::BTreeMap;
 use std::fs;
-use std::os::unix::fs::MetadataExt;
+use std::os::unix::fs::{FileTypeExt, MetadataExt};
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
 use std::thread;
@@ -22,6 +22,7 @@ const WORKER_SOCKET: &str = "/run/rivetlink/console.sock";
 const WORKER_PID: &str = "/run/rivetlink/lightdm-worker.pid";
 const FIND_GREETER_TIMEOUT: Duration = Duration::from_secs(20);
 const FIND_GREETER_INTERVAL: Duration = Duration::from_millis(200);
+const VERIFY_TIMEOUT: Duration = Duration::from_secs(30);
 
 /// Spawn a detached, fixed watcher from LightDM's root hook.
 #[allow(clippy::disallowed_methods)] // LightDM supplies this fixed hook environment.
@@ -56,15 +57,62 @@ pub fn watch(display: &str) -> AgentResult<()> {
     let deadline = Instant::now() + FIND_GREETER_TIMEOUT;
     loop {
         if let Some(authority) = find_lightdm_greeter_authority(display)? {
-            stop()?;
-            let pid = spawn_worker(display, &authority)?;
-            write_worker_pid(pid)?;
-            tracing::info!("started unprivileged LightDM X11 console worker");
-            return Ok(());
+            if broker_socket_is_ready() {
+                stop()?;
+                let pid = spawn_worker(display, &authority)?;
+                write_worker_pid(pid)?;
+                tracing::info!("started unprivileged LightDM X11 console worker");
+                return Ok(());
+            }
         }
         if Instant::now() >= deadline {
             return Err(AgentError::Config(
                 "LightDM greeter did not expose an authorized local X11 session".into(),
+            ));
+        }
+        thread::sleep(FIND_GREETER_INTERVAL);
+    }
+}
+
+fn broker_socket_is_ready() -> bool {
+    fs::metadata(WORKER_SOCKET).is_ok_and(|metadata| metadata.file_type().is_socket())
+}
+
+/// Confirm the post-boot invariant required before setup may call LightDM
+/// mode active: LightDM is the selected local display manager, GDM is not
+/// running beside it, and the greeter hook has started our constrained worker.
+///
+/// This is deliberately a verifier rather than a recovery mechanism.  A
+/// display-manager configuration mistake must remain recoverable over SSH;
+/// this command neither starts a competing GDM instance nor changes a user's
+/// display-manager selection behind their back.
+pub fn verify() -> AgentResult<()> {
+    require_root()?;
+    if !selected_display_manager_is_lightdm()? {
+        return Err(AgentError::Config(
+            "LightDM is not the selected display manager".into(),
+        ));
+    }
+    if !systemd_unit_active("lightdm.service")? {
+        return Err(AgentError::Config("LightDM is not active".into()));
+    }
+    for gdm_unit in ["gdm.service", "gdm3.service"] {
+        if systemd_unit_active(gdm_unit)? {
+            return Err(AgentError::Config(
+                "GDM is still active; refusing to verify LightDM login mode".into(),
+            ));
+        }
+    }
+
+    let deadline = Instant::now() + VERIFY_TIMEOUT;
+    loop {
+        if lightdm_worker_is_active()? {
+            tracing::info!("LightDM X11 greeter and RivetLink worker verified");
+            return Ok(());
+        }
+        if Instant::now() >= deadline {
+            return Err(AgentError::Config(
+                "LightDM did not start RivetLink's X11 greeter worker within 30 seconds".into(),
             ));
         }
         thread::sleep(FIND_GREETER_INTERVAL);
@@ -219,6 +267,43 @@ fn is_our_lightdm_worker(pid: i32) -> AgentResult<bool> {
         && words.contains(&WORKER_SOCKET))
 }
 
+fn lightdm_worker_is_active() -> AgentResult<bool> {
+    let pid = match fs::read_to_string(WORKER_PID) {
+        Ok(value) => value
+            .trim()
+            .parse::<i32>()
+            .map_err(|_| AgentError::Config("invalid LightDM worker PID file".into()))?,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(false),
+        Err(error) => {
+            return Err(AgentError::Config(format!(
+                "read LightDM worker PID file: {error}"
+            )))
+        },
+    };
+    Ok(pid > 1 && is_our_lightdm_worker(pid)?)
+}
+
+fn selected_display_manager_is_lightdm() -> AgentResult<bool> {
+    let selection = fs::read_to_string("/etc/X11/default-display-manager")
+        .map_err(|error| AgentError::Config(format!("read display-manager selection: {error}")))?;
+    Ok(selection
+        .trim()
+        .rsplit('/')
+        .next()
+        .is_some_and(|name| name == "lightdm"))
+}
+
+fn systemd_unit_active(unit: &str) -> AgentResult<bool> {
+    let status = Command::new("/usr/bin/systemctl")
+        .args(["is-active", "--quiet", unit])
+        .stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .status()
+        .map_err(|error| AgentError::Config(format!("inspect {unit}: {error}")))?;
+    Ok(status.success())
+}
+
 fn account_id(flag: &str) -> AgentResult<u32> {
     let output = Command::new("/usr/bin/id")
         .args([flag, LIGHTDM_USER])
@@ -309,5 +394,17 @@ mod tests {
             Some(110)
         );
         assert_eq!(process_real_uid("Name:\tfoo\n"), None);
+    }
+
+    #[test]
+    fn recognizes_only_lightdm_selection_names() {
+        assert!("/usr/sbin/lightdm"
+            .rsplit('/')
+            .next()
+            .is_some_and(|name| name == "lightdm"));
+        assert!(!"/usr/sbin/gdm3"
+            .rsplit('/')
+            .next()
+            .is_some_and(|name| name == "lightdm"));
     }
 }
