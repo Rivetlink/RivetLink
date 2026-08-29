@@ -28,6 +28,10 @@ const MAX_CAPTURE_TIMEOUT_MS: u64 = 15_000;
 /// immediately and remain diagnosable.
 const BROKER_SOCKET_WAIT: Duration = Duration::from_secs(12);
 const BROKER_SOCKET_RETRY: Duration = Duration::from_millis(250);
+/// A user manager can outlive the graphical seat that originally started it.
+/// Do not let that stale worker supersede the currently visible login greeter.
+#[cfg(target_os = "linux")]
+const ACTIVE_SEAT_RETRY: Duration = Duration::from_secs(1);
 
 /// Input accepted from the broker after its independent trusted-client check.
 /// This excludes clipboard, files, shell commands, and arbitrary keycode data.
@@ -133,7 +137,9 @@ enum CaptureBackend {
 /// The systemd unit must arrange the socket permissions; this process never
 /// creates one and never changes ownership or mode itself.
 pub async fn run(socket_path: &Path) -> AgentResult<()> {
-    require_graphical_session()?;
+    let session = graphical_session();
+    require_graphical_session(&session)?;
+    wait_until_worker_owns_active_seat(&session).await;
     let stream = connect_to_broker(socket_path).await.map_err(|error| {
         // This is a local Unix-socket access failure, not an invalid RivetLink
         // configuration.  Keeping its OS error kind lets the journal and UI
@@ -143,7 +149,7 @@ pub async fn run(socket_path: &Path) -> AgentResult<()> {
             format!("connect console broker: {error}"),
         ))
     })?;
-    serve(stream).await
+    serve_with_session(stream, session).await
 }
 
 async fn connect_to_broker(socket_path: &Path) -> std::io::Result<UnixStream> {
@@ -170,11 +176,15 @@ fn should_retry_broker_connect(kind: std::io::ErrorKind) -> bool {
 /// after an ownership transition, which makes GDM → GNOME and logout explicit
 /// rather than accidentally reusing a stale D-Bus session.
 pub async fn serve(stream: UnixStream) -> AgentResult<()> {
+    let session = graphical_session();
+    serve_with_session(stream, session).await
+}
+
+async fn serve_with_session(stream: UnixStream, session: GraphicalSession) -> AgentResult<()> {
     let (mut reader, writer) = stream.into_split();
     let writer = std::sync::Arc::new(tokio::sync::Mutex::new(writer));
     // A worker belongs to exactly one graphical D-Bus session.  On GDM →
     // GNOME the broker accepts a fresh worker rather than reusing this state.
-    let session = graphical_session();
     write_worker_response(
         &writer,
         &WorkerResponse::Ready {
@@ -379,12 +389,12 @@ fn capture_backend(session: &GraphicalSession) -> AgentResult<CaptureBackend> {
     }
 }
 
-fn require_graphical_session() -> AgentResult<()> {
+fn require_graphical_session(session: &GraphicalSession) -> AgentResult<()> {
     // LightDM's X11 greeter is not backed by a systemd user manager. It has a
     // valid, cookie-authenticated Xauthority session but no per-user D-Bus
     // session. X11 capture/input need neither; requiring D-Bus here would
     // incorrectly force a root worker or a global access relaxation.
-    if matches!(graphical_session().backend, GraphicalBackend::X11 { .. }) {
+    if matches!(session.backend, GraphicalBackend::X11 { .. }) {
         return Ok(());
     }
     let has_runtime = std::env::var_os("XDG_RUNTIME_DIR").is_some();
@@ -396,6 +406,168 @@ fn require_graphical_session() -> AgentResult<()> {
             "console worker requires an active login-manager or GNOME graphical session"
                 .to_string(),
         ))
+    }
+}
+
+/// Minimal logind facts used solely to keep a stale per-user worker from
+/// claiming a display it no longer owns.  They are deliberately not sent over
+/// the RivetLink protocol and contain neither account names nor display paths.
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct ActiveSeatSession {
+    uid: u32,
+    seat: String,
+    class: String,
+    session_type: String,
+    active: bool,
+}
+
+/// A systemd user manager can remain alive after logout (or while the desktop
+/// is suspended behind LightDM).  It must wait until its UID owns the active
+/// graphical seat before it may connect to the broker.  Without this check an
+/// old Wayland worker can overwrite the active LightDM X11 worker and route a
+/// client to an invisible desktop.
+async fn wait_until_worker_owns_active_seat(session: &GraphicalSession) {
+    #[cfg(target_os = "linux")]
+    loop {
+        if worker_owns_active_seat(session) {
+            return;
+        }
+        tracing::debug!(state = ?session.state, "console worker waiting for its active seat0 session");
+        tokio::time::sleep(ACTIVE_SEAT_RETRY).await;
+    }
+
+    #[cfg(not(target_os = "linux"))]
+    let _ = session;
+}
+
+#[cfg(target_os = "linux")]
+fn worker_owns_active_seat(session: &GraphicalSession) -> bool {
+    let Some(uid) = worker_uid() else {
+        return false;
+    };
+    active_logind_sessions()
+        .iter()
+        .any(|candidate| active_session_matches_worker(candidate, uid, session))
+}
+
+#[cfg(target_os = "linux")]
+fn worker_uid() -> Option<u32> {
+    let output = std::process::Command::new("/usr/bin/id")
+        .arg("-u")
+        .stdin(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null())
+        .output()
+        .ok()?;
+    output.status.success().then_some(())?;
+    std::str::from_utf8(&output.stdout)
+        .ok()?
+        .trim()
+        .parse()
+        .ok()
+}
+
+#[cfg(target_os = "linux")]
+fn active_logind_sessions() -> Vec<ActiveSeatSession> {
+    let output = std::process::Command::new("/usr/bin/loginctl")
+        .args(["list-sessions", "--no-legend", "--no-pager"])
+        .stdin(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null())
+        .output();
+    let Ok(output) = output else {
+        return Vec::new();
+    };
+    if !output.status.success() {
+        return Vec::new();
+    }
+    String::from_utf8_lossy(&output.stdout)
+        .lines()
+        .filter_map(|line| line.split_whitespace().next())
+        .filter_map(logind_session_details)
+        .collect()
+}
+
+#[cfg(target_os = "linux")]
+fn logind_session_details(session_id: &str) -> Option<ActiveSeatSession> {
+    let output = std::process::Command::new("/usr/bin/loginctl")
+        .args([
+            "show-session",
+            session_id,
+            "-p",
+            "User",
+            "-p",
+            "Seat",
+            "-p",
+            "Class",
+            "-p",
+            "Type",
+            "-p",
+            "Active",
+        ])
+        .stdin(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null())
+        .output()
+        .ok()?;
+    if !output.status.success() {
+        return None;
+    }
+    parse_logind_session_details(&String::from_utf8_lossy(&output.stdout))
+}
+
+fn parse_logind_session_details(output: &str) -> Option<ActiveSeatSession> {
+    let mut uid = None;
+    let mut seat = None;
+    let mut class = None;
+    let mut session_type = None;
+    let mut active = None;
+    for line in output.lines() {
+        let (key, value) = line.split_once('=')?;
+        match key {
+            "User" => uid = value.parse().ok(),
+            "Seat" => seat = Some(value.to_string()),
+            "Class" => class = Some(value.to_string()),
+            "Type" => session_type = Some(value.to_string()),
+            // logind prints these booleans as `yes`/`no`, unlike Rust's
+            // `bool` parser. Accept only those two values so a malformed
+            // response cannot accidentally authorize a worker.
+            "Active" => {
+                active = match value {
+                    "yes" => Some(true),
+                    "no" => Some(false),
+                    _ => None,
+                }
+            },
+            _ => {},
+        }
+    }
+    Some(ActiveSeatSession {
+        uid: uid?,
+        seat: seat?,
+        class: class?,
+        session_type: session_type?,
+        active: active?,
+    })
+}
+
+fn active_session_matches_worker(
+    candidate: &ActiveSeatSession,
+    worker_uid: u32,
+    session: &GraphicalSession,
+) -> bool {
+    if !candidate.active || candidate.seat != "seat0" || candidate.uid != worker_uid {
+        return false;
+    }
+    let expected_class = if session.state == HostConsoleState::GdmLogin {
+        "greeter"
+    } else {
+        "user"
+    };
+    if candidate.class != expected_class {
+        return false;
+    }
+    match session.backend {
+        GraphicalBackend::Wayland => candidate.session_type == "wayland",
+        GraphicalBackend::X11 { .. } => candidate.session_type == "x11",
+        GraphicalBackend::Unknown => false,
     }
 }
 
@@ -614,6 +786,54 @@ mod tests {
         assert!(!should_retry_broker_connect(
             std::io::ErrorKind::PermissionDenied
         ));
+    }
+
+    #[test]
+    fn only_the_active_seat_owner_may_claim_the_console() {
+        let lightdm = ActiveSeatSession {
+            uid: 112,
+            seat: "seat0".to_string(),
+            class: "greeter".to_string(),
+            session_type: "x11".to_string(),
+            active: true,
+        };
+        let inactive_wayland_user = ActiveSeatSession {
+            uid: 1000,
+            seat: "seat0".to_string(),
+            class: "user".to_string(),
+            session_type: "wayland".to_string(),
+            active: false,
+        };
+        let greeter = GraphicalSession {
+            state: HostConsoleState::GdmLogin,
+            backend: GraphicalBackend::X11 {
+                display: ":0".to_string(),
+            },
+        };
+        let desktop = GraphicalSession {
+            state: HostConsoleState::DesktopReady,
+            backend: GraphicalBackend::Wayland,
+        };
+
+        assert!(active_session_matches_worker(&lightdm, 112, &greeter));
+        assert!(!active_session_matches_worker(
+            &inactive_wayland_user,
+            1000,
+            &desktop
+        ));
+        assert!(!active_session_matches_worker(&lightdm, 1000, &desktop));
+    }
+
+    #[test]
+    fn parses_only_complete_logind_session_details() {
+        let session = parse_logind_session_details(
+            "User=112\nSeat=seat0\nClass=greeter\nType=x11\nActive=yes\n",
+        )
+        .unwrap();
+        assert_eq!(session.uid, 112);
+        assert_eq!(session.seat, "seat0");
+        assert!(session.active);
+        assert!(parse_logind_session_details("User=112\nSeat=seat0\n").is_none());
     }
 
     #[test]
