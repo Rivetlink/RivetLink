@@ -103,7 +103,23 @@ impl ConsoleBrokerListener {
                     Ok(worker) => {
                         let generation = generation_for_accept.fetch_add(1, Ordering::Relaxed) + 1;
                         tracing::info!(generation, "graphical console worker became active");
+                        let mut closed = worker.closed.clone();
                         let _ = tx.send(Some(worker));
+                        let clear_tx = tx.clone();
+                        let clear_generation = Arc::clone(&generation_for_accept);
+                        tokio::spawn(async move {
+                            let already_closed = *closed.borrow();
+                            if !already_closed && closed.changed().await.is_err() {
+                                return;
+                            }
+                            if clear_generation.load(Ordering::Relaxed) == generation {
+                                tracing::warn!(
+                                    generation,
+                                    "active graphical console worker disconnected"
+                                );
+                                let _ = clear_tx.send(None);
+                            }
+                        });
                     },
                     Err(error) => {
                         tracing::warn!(error = %error, "console worker accept failed; retrying");
@@ -288,6 +304,7 @@ pub struct ConsoleWorkerClient {
     desktop_frames: broadcast::Sender<FrameDelta>,
     desktop_ended: broadcast::Sender<WorkerErrorCode>,
     desktop_stream_active: Arc<std::sync::atomic::AtomicBool>,
+    closed: watch::Receiver<bool>,
     state: HostConsoleState,
 }
 
@@ -318,6 +335,7 @@ impl ConsoleWorkerClient {
         let reader_frames = desktop_frames.clone();
         let reader_ended = desktop_ended.clone();
         let reader_active = Arc::clone(&active);
+        let (closed_tx, closed) = watch::channel(false);
         tokio::spawn(async move {
             loop {
                 let response: AgentResult<WorkerResponse> =
@@ -336,9 +354,10 @@ impl ConsoleWorkerClient {
                         }
                     },
                     Err(error) => {
-                        tracing::debug!(error = %error, "console worker IPC reader ended");
+                        tracing::warn!(error = %error, "console worker IPC reader ended");
                         reader_active.store(false, Ordering::Release);
                         let _ = reader_ended.send(WorkerErrorCode::CompositorFailure);
+                        let _ = closed_tx.send(true);
                         break;
                     },
                 }
@@ -351,6 +370,7 @@ impl ConsoleWorkerClient {
             desktop_frames,
             desktop_ended,
             desktop_stream_active: active,
+            closed,
             state,
         })
     }
@@ -571,6 +591,7 @@ fn worker_error(code: WorkerErrorCode) -> AgentError {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use tokio::io::AsyncWriteExt as _;
 
     #[test]
     fn local_worker_uid_allow_list_must_not_be_empty() {
@@ -606,5 +627,37 @@ mod tests {
             parse_greeter_session_uid("c2 110 lightdm seat0 2000 greeter tty7 no -"),
             Some(110)
         );
+    }
+
+    #[tokio::test]
+    async fn oversized_worker_response_marks_connection_closed() {
+        let (mut worker_stream, broker_stream) = UnixStream::pair().unwrap();
+        let worker = tokio::spawn(async move {
+            write_packet(
+                &mut worker_stream,
+                &WorkerResponse::Ready {
+                    state: HostConsoleState::GdmLogin,
+                },
+            )
+            .await
+            .unwrap();
+            worker_stream
+                .write_u32(u32::try_from(MAX_WORKER_RESPONSE + 1).unwrap())
+                .await
+                .unwrap();
+        });
+
+        let client = ConsoleWorkerClient::from_stream(broker_stream)
+            .await
+            .unwrap();
+        let mut closed = client.closed.clone();
+        tokio::time::timeout(Duration::from_secs(1), async {
+            while !*closed.borrow() {
+                closed.changed().await.unwrap();
+            }
+        })
+        .await
+        .unwrap();
+        worker.await.unwrap();
     }
 }

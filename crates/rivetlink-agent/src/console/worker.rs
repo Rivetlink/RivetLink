@@ -132,6 +132,13 @@ enum CaptureBackend {
     Mutter,
 }
 
+/// The broker accepts a 12 MiB JSON packet. Base64 expands binary data by
+/// roughly one third, so cap the PNG itself at 8 MiB before serialization.
+/// This turns an unexpected high-entropy frame into a bounded capture error
+/// instead of blocking the worker forever on a response the broker rejects.
+const MAX_CAPTURE_PNG_BYTES: usize = 8 * 1024 * 1024;
+const BROKER_RECONNECT_DELAY: Duration = Duration::from_secs(1);
+
 /// Run the worker against the broker's already-created Unix socket.
 ///
 /// The systemd unit must arrange the socket permissions; this process never
@@ -139,17 +146,25 @@ enum CaptureBackend {
 pub async fn run(socket_path: &Path) -> AgentResult<()> {
     let session = graphical_session();
     require_graphical_session(&session)?;
-    wait_until_worker_owns_active_seat(&session).await;
-    let stream = connect_to_broker(socket_path).await.map_err(|error| {
-        // This is a local Unix-socket access failure, not an invalid RivetLink
-        // configuration.  Keeping its OS error kind lets the journal and UI
-        // distinguish a permission boundary problem from a missing display.
-        AgentError::Io(std::io::Error::new(
-            error.kind(),
-            format!("connect console broker: {error}"),
-        ))
-    })?;
-    serve_with_session(stream, session).await
+    loop {
+        wait_until_worker_owns_active_seat(&session).await;
+        let stream = connect_to_broker(socket_path).await.map_err(|error| {
+            // This is a local Unix-socket access failure, not an invalid RivetLink
+            // configuration.  Keeping its OS error kind lets the journal and UI
+            // distinguish a permission boundary problem from a missing display.
+            AgentError::Io(std::io::Error::new(
+                error.kind(),
+                format!("connect console broker: {error}"),
+            ))
+        })?;
+        match serve_with_session(stream, session.clone()).await {
+            Ok(()) => return Ok(()),
+            Err(error) => {
+                tracing::warn!(error = %error, "console broker connection ended; reconnecting");
+                tokio::time::sleep(BROKER_RECONNECT_DELAY).await;
+            },
+        }
+    }
 }
 
 async fn connect_to_broker(socket_path: &Path) -> std::io::Result<UnixStream> {
@@ -169,7 +184,10 @@ async fn connect_to_broker(socket_path: &Path) -> std::io::Result<UnixStream> {
 }
 
 fn should_retry_broker_connect(kind: std::io::ErrorKind) -> bool {
-    kind == std::io::ErrorKind::NotFound
+    matches!(
+        kind,
+        std::io::ErrorKind::NotFound | std::io::ErrorKind::ConnectionRefused
+    )
 }
 
 /// Serve one broker connection. A broker must open a fresh worker connection
@@ -580,8 +598,14 @@ async fn capture(timeout_ms: u64, session: &GraphicalSession) -> WorkerResponse 
     })
     .await
     {
-        Ok(Ok(png)) => WorkerResponse::Capture {
+        Ok(Ok(png)) if png.len() <= MAX_CAPTURE_PNG_BYTES => WorkerResponse::Capture {
             png_b64: base64::engine::general_purpose::STANDARD.encode(png),
+        },
+        Ok(Ok(_)) => {
+            tracing::warn!("console capture exceeded the in-memory frame limit");
+            WorkerResponse::Error {
+                code: WorkerErrorCode::FrameEncodingFailed,
+            }
         },
         Ok(Err(error)) => {
             tracing::warn!(error = %error, "console capture failed");
@@ -781,8 +805,11 @@ mod tests {
     }
 
     #[test]
-    fn only_a_missing_broker_socket_is_a_normal_boot_race() {
+    fn missing_or_not_yet_listening_broker_socket_is_a_normal_boot_race() {
         assert!(should_retry_broker_connect(std::io::ErrorKind::NotFound));
+        assert!(should_retry_broker_connect(
+            std::io::ErrorKind::ConnectionRefused
+        ));
         assert!(!should_retry_broker_connect(
             std::io::ErrorKind::PermissionDenied
         ));

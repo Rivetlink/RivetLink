@@ -17,13 +17,16 @@
 //! confirmation step.
 //!
 //! ```
-//! use rivetlink_crypto::pake;
+//! use rivetlink_crypto::{pake, sealed::ChannelRole};
 //!
 //! // Both peers start with the same PIN and exchange their messages.
 //! let a = pake::start(b"4821");
 //! let b = pake::start(b"4821");
-//! let chan_a = a.handshake.finish(&b.message).unwrap();
-//! let chan_b = b.handshake.finish(&a.message).unwrap();
+//! let transcript = b"rivetlink-direct-session-transcript";
+//! let chan_a = a.handshake
+//!     .finish(&b.message, transcript, ChannelRole::Initiator).unwrap();
+//! let chan_b = b.handshake
+//!     .finish(&a.message, transcript, ChannelRole::Responder).unwrap();
 //!
 //! // Matching PINs -> interoperable channel.
 //! let sealed = chan_a.seal(b"hello").unwrap();

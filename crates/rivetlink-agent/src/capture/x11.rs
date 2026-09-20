@@ -16,6 +16,14 @@ use crate::error::{AgentError, AgentResult};
 /// corrupt geometry.
 const MAX_X11_PIXELS: usize = 33_554_432;
 
+/// Keep the JSON/base64 worker response comfortably below the broker's
+/// authenticated IPC limit.  Xorg may select a 4K mode for an HDMI dummy even
+/// though the login stream is displayed in a much smaller client window.
+/// Capturing the real root window first preserves the physical-console
+/// semantics; only the in-memory frame sent to RivetLink is scaled.
+const MAX_STREAM_WIDTH: usize = 1_920;
+const MAX_STREAM_HEIGHT: usize = 1_080;
+
 /// Capture the X screen belonging to `display` and encode it in memory.
 ///
 /// X11's `GetImage` copies the root window without creating an image file.
@@ -65,10 +73,15 @@ pub fn capture_png(display: &str) -> AgentResult<Vec<u8>> {
             "unsupported X11 root visual class".to_string(),
         ));
     }
-    let rgba = decode_root_image(
+    let width = usize::from(geometry.width);
+    let height = usize::from(geometry.height);
+    let (stream_width, stream_height) = fit_stream_dimensions(width, height);
+    let rgba = decode_root_image_scaled(
         &image.data,
-        usize::from(geometry.width),
-        usize::from(geometry.height),
+        width,
+        height,
+        stream_width,
+        stream_height,
         connection
             .setup()
             .pixmap_formats
@@ -81,7 +94,83 @@ pub fn capture_png(display: &str) -> AgentResult<Vec<u8>> {
         u8::from(connection.setup().image_byte_order),
         visual,
     )?;
-    encode_rgba_png(u32::from(geometry.width), u32::from(geometry.height), &rgba)
+    encode_rgba_png(
+        u32::try_from(stream_width).expect("bounded stream width fits u32"),
+        u32::try_from(stream_height).expect("bounded stream height fits u32"),
+        &rgba,
+    )
+}
+
+fn fit_stream_dimensions(width: usize, height: usize) -> (usize, usize) {
+    if width <= MAX_STREAM_WIDTH && height <= MAX_STREAM_HEIGHT {
+        return (width, height);
+    }
+    let width_limited_height = height.saturating_mul(MAX_STREAM_WIDTH) / width;
+    if width_limited_height <= MAX_STREAM_HEIGHT {
+        (MAX_STREAM_WIDTH, width_limited_height.max(1))
+    } else {
+        let height_limited_width = width.saturating_mul(MAX_STREAM_HEIGHT) / height;
+        (height_limited_width.max(1), MAX_STREAM_HEIGHT)
+    }
+}
+
+/// Decode only the pixels needed by the bounded login stream. X11 still
+/// captures the real full root window, while avoiding a second 33 MiB RGBA
+/// allocation when an HDMI dummy advertises 4K.
+fn decode_root_image_scaled(
+    bytes: &[u8],
+    source_width: usize,
+    source_height: usize,
+    target_width: usize,
+    target_height: usize,
+    bits_per_pixel: u8,
+    image_byte_order: u8,
+    visual: &Visualtype,
+) -> AgentResult<Vec<u8>> {
+    if source_width == 0 || source_height == 0 || target_width == 0 || target_height == 0 {
+        return Err(AgentError::Config(
+            "invalid X11 image dimensions for scaling".to_string(),
+        ));
+    }
+    let bytes_per_pixel = usize::from(bits_per_pixel).div_ceil(8);
+    if !(1..=4).contains(&bytes_per_pixel) {
+        return Err(AgentError::Config(
+            "unsupported X11 root pixel format".to_string(),
+        ));
+    }
+    let stride = bytes
+        .len()
+        .checked_div(source_height)
+        .filter(|stride| {
+            bytes.len().is_multiple_of(source_height)
+                && *stride >= source_width.saturating_mul(bytes_per_pixel)
+        })
+        .ok_or_else(|| AgentError::Config("invalid X11 image stride".to_string()))?;
+    let target_len = target_width
+        .checked_mul(target_height)
+        .and_then(|pixels| pixels.checked_mul(4))
+        .ok_or_else(|| AgentError::Config("X11 stream dimensions are too large".to_string()))?;
+    let mut target = Vec::with_capacity(target_len);
+    for target_y in 0..target_height {
+        let source_y = target_y.saturating_mul(source_height) / target_height;
+        let row = &bytes[source_y * stride..(source_y + 1) * stride];
+        for target_x in 0..target_width {
+            let source_x = target_x.saturating_mul(source_width) / target_width;
+            let source_offset = source_x * bytes_per_pixel;
+            let value = read_pixel(
+                &row[source_offset..source_offset + bytes_per_pixel],
+                image_byte_order,
+            );
+            target.extend_from_slice(&[
+                component(value, visual.red_mask),
+                component(value, visual.green_mask),
+                component(value, visual.blue_mask),
+                255,
+            ]);
+        }
+    }
+    debug_assert_eq!(target.len(), target_len);
+    Ok(target)
 }
 
 fn visual_for_root(
@@ -109,39 +198,16 @@ fn decode_root_image(
     image_byte_order: u8,
     visual: &Visualtype,
 ) -> AgentResult<Vec<u8>> {
-    let bytes_per_pixel = usize::from(bits_per_pixel).div_ceil(8);
-    if !(1..=4).contains(&bytes_per_pixel) {
-        return Err(AgentError::Config(
-            "unsupported X11 root pixel format".to_string(),
-        ));
-    }
-    let stride = bytes
-        .len()
-        .checked_div(height)
-        .filter(|stride| {
-            bytes.len().is_multiple_of(height) && *stride >= width.saturating_mul(bytes_per_pixel)
-        })
-        .ok_or_else(|| AgentError::Config("invalid X11 image stride".to_string()))?;
-    let size = width
-        .checked_mul(height)
-        .and_then(|pixel_count| pixel_count.checked_mul(4))
-        .ok_or_else(|| AgentError::Config("X11 image dimensions are too large".to_string()))?;
-    let mut rgba = Vec::with_capacity(size);
-    for row in bytes.chunks_exact(stride).take(height) {
-        for pixel in row.chunks_exact(bytes_per_pixel).take(width) {
-            let value = read_pixel(pixel, image_byte_order);
-            rgba.extend_from_slice(&[
-                component(value, visual.red_mask),
-                component(value, visual.green_mask),
-                component(value, visual.blue_mask),
-                255,
-            ]);
-        }
-    }
-    if rgba.len() != size {
-        return Err(AgentError::Config("truncated X11 image data".to_string()));
-    }
-    Ok(rgba)
+    decode_root_image_scaled(
+        bytes,
+        width,
+        height,
+        width,
+        height,
+        bits_per_pixel,
+        image_byte_order,
+        visual,
+    )
 }
 
 fn read_pixel(bytes: &[u8], image_byte_order: u8) -> u32 {
@@ -218,5 +284,22 @@ mod tests {
     fn rejects_invalid_image_strides() {
         let error = decode_root_image(&[0; 3], 1, 1, 32, 0, &rgb_visual()).unwrap_err();
         assert!(error.to_string().contains("stride"));
+    }
+
+    #[test]
+    fn bounds_four_k_dummy_frames_without_changing_aspect_ratio() {
+        assert_eq!(fit_stream_dimensions(3_840, 2_160), (1_920, 1_080));
+        assert_eq!(fit_stream_dimensions(3_440, 1_440), (1_920, 803));
+        assert_eq!(fit_stream_dimensions(1_280, 720), (1_280, 720));
+    }
+
+    #[test]
+    fn scales_rgba_frames_entirely_in_memory() {
+        let source = vec![
+            3, 2, 1, 0, 6, 5, 4, 0, // first X11 BGRX row
+            9, 8, 7, 0, 12, 11, 10, 0, // second X11 BGRX row
+        ];
+        let scaled = decode_root_image_scaled(&source, 2, 2, 1, 1, 32, 0, &rgb_visual()).unwrap();
+        assert_eq!(scaled, vec![1, 2, 3, 255]);
     }
 }
