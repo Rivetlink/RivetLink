@@ -311,6 +311,18 @@ async fn serve_physical_console_client(
                         // empty list retains the existing client's primary
                         // monitor behaviour and avoids leaking local topology.
                         displays: Vec::new(),
+                        // Devices allowed to control the desktop may also
+                        // share its clipboard and the RivetLink folder.
+                        features: if TrustedClients::load_or_empty(trusted.path())
+                            .is_ok_and(|live| live.may_control_unattended_console(&client))
+                        {
+                            vec![
+                                rivetlink_sdk::share::FEATURE_CLIPBOARD.to_string(),
+                                rivetlink_sdk::share::FEATURE_FILES.to_string(),
+                            ]
+                        } else {
+                            Vec::new()
+                        },
                     },
                     _ => LanResponse::Error {
                         message: "normal desktop engine is not ready".to_string(),
@@ -459,6 +471,10 @@ async fn serve_console_capture_request(
 /// Run the existing normal 30fps desktop engine through the authenticated
 /// physical-console listener. This preserves the direct-LAN identity and trust
 /// relationship across LightDM → GNOME; only the capture backend changes.
+// One select loop owns the socket's write half: frames, input, clipboard and
+// file traffic all funnel through it, so splitting it would add shared-writer
+// plumbing without making the authorization checks easier to follow.
+#[allow(clippy::too_many_lines)]
 #[cfg(target_os = "linux")]
 async fn stream_authenticated_desktop(
     stream: TcpStream,
@@ -518,6 +534,15 @@ async fn stream_authenticated_desktop(
         }
     });
 
+    // Clipboard and file sharing (only after the client sends EnableSharing).
+    // Download chunks are produced by background tasks and sent from here so
+    // the socket keeps a single writer.
+    let worker = desktop.worker();
+    let mut clipboard_changes = worker.clipboard_changes();
+    let mut clipboard_enabled = false;
+    let (share_tx, mut share_rx) = tokio::sync::mpsc::channel::<LanResponse>(8);
+    let mut downloads = tokio::task::JoinSet::new();
+
     let result = loop {
         tokio::select! {
             frame = desktop.next() => match frame {
@@ -540,7 +565,43 @@ async fn stream_authenticated_desktop(
                     break Ok(());
                 },
             },
+            text = clipboard_changes.recv(), if clipboard_enabled => match text {
+                Ok(text) => {
+                    if !send_share(&mut writer, &channel, &LanResponse::ClipboardText { text }).await {
+                        break Ok(());
+                    }
+                },
+                Err(tokio::sync::broadcast::error::RecvError::Lagged(_)) => {},
+                Err(tokio::sync::broadcast::error::RecvError::Closed) => clipboard_enabled = false,
+            },
+            Some(response) = share_rx.recv() => {
+                if !send_share(&mut writer, &channel, &response).await {
+                    break Ok(());
+                }
+            },
             request = control_rx.recv() => match request {
+                Some(request) if is_share_request(&request) => {
+                    let live = TrustedClients::load_or_empty(trusted.path())?;
+                    let response = if live.may_control_unattended_console(&client) {
+                        handle_share_request(
+                            request,
+                            &worker,
+                            &mut clipboard_enabled,
+                            &share_tx,
+                            &mut downloads,
+                        )
+                        .await
+                    } else {
+                        Some(LanResponse::Error {
+                            message: "this trusted device is not authorized for clipboard or file sharing".to_string(),
+                        })
+                    };
+                    if let Some(response) = response {
+                        if !send_share(&mut writer, &channel, &response).await {
+                            break Ok(());
+                        }
+                    }
+                },
                 Some(request) => {
                     if let Some(input) = desktop_input(request) {
                         let live = TrustedClients::load_or_empty(trusted.path())?;
@@ -562,8 +623,10 @@ async fn stream_authenticated_desktop(
                 },
                 None => break Ok(()),
             },
+            Some(_) = downloads.join_next(), if !downloads.is_empty() => {},
         }
     };
+    downloads.abort_all();
     reader_task.abort();
     let _ = desktop.stop().await;
     tracing::info!(client = %client, "physical-console handoff: normal desktop engine stopped");
@@ -603,6 +666,151 @@ fn desktop_input(request: LanRequest) -> Option<ConsoleInputPacket> {
         LanRequest::Scroll { dx, dy } => Some(ConsoleInputPacket::Scroll { dx, dy }),
         LanRequest::Key { code, down } => Some(ConsoleInputPacket::Key { code, down }),
         _ => None,
+    }
+}
+
+#[cfg(target_os = "linux")]
+fn is_share_request(request: &LanRequest) -> bool {
+    matches!(
+        request,
+        LanRequest::EnableSharing
+            | LanRequest::ClipboardSet { .. }
+            | LanRequest::FileUploadStart { .. }
+            | LanRequest::FileUploadChunk { .. }
+            | LanRequest::FileUploadEnd { .. }
+            | LanRequest::ListSharedFiles
+            | LanRequest::FileDownload { .. }
+    )
+}
+
+/// Send one clipboard/file response, bounded like a frame write.
+#[cfg(target_os = "linux")]
+async fn send_share<W: AsyncWrite + Unpin>(
+    writer: &mut W,
+    channel: &SealedChannel,
+    response: &LanResponse,
+) -> bool {
+    matches!(
+        tokio::time::timeout(
+            FRAME_SEND_TIMEOUT,
+            lan::send_response(writer, channel, response)
+        )
+        .await,
+        Ok(Ok(()))
+    )
+}
+
+/// Serve one sharing request for an authorized client. Returns the immediate
+/// response, if any; downloads stream their chunks through `share_tx`.
+#[cfg(target_os = "linux")]
+async fn handle_share_request(
+    request: LanRequest,
+    worker: &crate::console::broker::ConsoleWorkerClient,
+    clipboard_enabled: &mut bool,
+    share_tx: &tokio::sync::mpsc::Sender<LanResponse>,
+    downloads: &mut tokio::task::JoinSet<()>,
+) -> Option<LanResponse> {
+    use rivetlink_sdk::share::MAX_CLIPBOARD_BYTES;
+    let file_error = |id: u32, error: AgentError| LanResponse::FileError {
+        id,
+        message: share_message(&error),
+    };
+    match request {
+        LanRequest::EnableSharing => {
+            let clipboard = match worker.enable_clipboard().await {
+                Ok(()) => true,
+                Err(error) => {
+                    tracing::warn!(error = %error, "clipboard sharing unavailable");
+                    false
+                },
+            };
+            *clipboard_enabled = clipboard;
+            Some(LanResponse::SharingEnabled {
+                clipboard,
+                files: true,
+            })
+        },
+        LanRequest::ClipboardSet { text } => {
+            if !*clipboard_enabled || text.len() > MAX_CLIPBOARD_BYTES {
+                return Some(LanResponse::Error {
+                    message: "clipboard text was not accepted".to_string(),
+                });
+            }
+            worker
+                .set_clipboard(text)
+                .await
+                .err()
+                .map(|error| LanResponse::Error {
+                    message: share_message(&error),
+                })
+        },
+        LanRequest::FileUploadStart { id, path, size } => worker
+            .upload_start(id, path, size)
+            .await
+            .err()
+            .map(|error| file_error(id, error)),
+        LanRequest::FileUploadChunk { id, data_b64 } => worker
+            .upload_chunk(id, data_b64)
+            .await
+            .err()
+            .map(|error| file_error(id, error)),
+        LanRequest::FileUploadEnd { id } => Some(match worker.upload_end(id).await {
+            Ok(path) => LanResponse::FileUploaded { id, path },
+            Err(error) => file_error(id, error),
+        }),
+        LanRequest::ListSharedFiles => Some(match worker.list_shared().await {
+            Ok(entries) => LanResponse::SharedFiles { entries },
+            Err(error) => LanResponse::Error {
+                message: share_message(&error),
+            },
+        }),
+        LanRequest::FileDownload { id, path } => {
+            let worker = worker.clone();
+            let share_tx = share_tx.clone();
+            downloads.spawn(async move {
+                let mut offset = 0_u64;
+                loop {
+                    let response = match worker.read_shared(path.clone(), offset).await {
+                        Ok((data_b64, size, eof)) => {
+                            let read = base64_decoded_len(&data_b64);
+                            offset += read;
+                            let done = eof || read == 0;
+                            let chunk = LanResponse::FileChunk {
+                                id,
+                                size,
+                                data_b64,
+                                eof: done,
+                            };
+                            if share_tx.send(chunk).await.is_err() || done {
+                                return;
+                            }
+                            continue;
+                        },
+                        Err(error) => file_error(id, error),
+                    };
+                    let _ = share_tx.send(response).await;
+                    return;
+                }
+            });
+            None
+        },
+        _ => None,
+    }
+}
+
+/// Byte length of a padded base64 string without decoding it.
+#[cfg(target_os = "linux")]
+fn base64_decoded_len(data_b64: &str) -> u64 {
+    let padding = data_b64.bytes().rev().take_while(|&b| b == b'=').count();
+    ((data_b64.len() / 4 * 3).saturating_sub(padding)) as u64
+}
+
+/// A client-safe message for a sharing failure.
+#[cfg(target_os = "linux")]
+fn share_message(error: &AgentError) -> String {
+    match error {
+        AgentError::Share(message) => message.clone(),
+        _ => "the host could not complete the clipboard or file request".to_string(),
     }
 }
 
@@ -835,7 +1043,9 @@ impl Drop for AbortOnDrop {
 /// the client sends `StartStream` (using its device name if given, else the
 /// network `label`), and `ClientDisconnected` when that stream ends. A
 /// screenshot-only or connect-then-leave session never reports "connected".
-#[allow(clippy::too_many_arguments)] // session params; bundling them adds ceremony
+// One flat dispatch over every LanRequest variant; session params are bundled
+// as arguments because a struct would only add ceremony.
+#[allow(clippy::too_many_arguments, clippy::too_many_lines)]
 async fn serve_loop(
     mut stream: TcpStream,
     channel: Arc<SealedChannel>,
@@ -872,9 +1082,16 @@ async fn serve_loop(
                 // primary display so the client's picker stays hidden.
                 let displays = allowed_displays(share_all_now(&share_all)).await;
                 tracing::info!(count = displays.len(), "LAN serve: ListDisplays request");
-                lan::send_response(&mut stream, &channel, &LanResponse::Displays { displays })
-                    .await
-                    .map_err(|e| AgentError::Lan(e.to_string()))?;
+                lan::send_response(
+                    &mut stream,
+                    &channel,
+                    &LanResponse::Displays {
+                        displays,
+                        features: Vec::new(),
+                    },
+                )
+                .await
+                .map_err(|e| AgentError::Lan(e.to_string()))?;
             },
             LanRequest::StartStream {
                 fps,
@@ -949,6 +1166,15 @@ async fn serve_loop(
             | LanRequest::Scroll { .. }
             | LanRequest::Key { .. }
             | LanRequest::ConsoleCapture { .. } => {},
+            // This host never advertises sharing features, so a conforming
+            // client does not send these; ignore them.
+            LanRequest::EnableSharing
+            | LanRequest::ClipboardSet { .. }
+            | LanRequest::FileUploadStart { .. }
+            | LanRequest::FileUploadChunk { .. }
+            | LanRequest::FileUploadEnd { .. }
+            | LanRequest::ListSharedFiles
+            | LanRequest::FileDownload { .. } => {},
         }
     }
 }
@@ -1170,7 +1396,10 @@ async fn stream_screen(
                         let _ = lan::send_response(
                             &mut wr,
                             &channel,
-                            &LanResponse::Displays { displays },
+                            &LanResponse::Displays {
+                                displays,
+                                features: Vec::new(),
+                            },
                         )
                         .await;
                     },
@@ -1211,7 +1440,10 @@ async fn stream_screen(
                     let _ = lan::send_response(
                         &mut wr,
                         &channel,
-                        &LanResponse::Displays { displays: displays.clone() },
+                        &LanResponse::Displays {
+                            displays: displays.clone(),
+                            features: Vec::new(),
+                        },
                     )
                     .await;
                     if !on {

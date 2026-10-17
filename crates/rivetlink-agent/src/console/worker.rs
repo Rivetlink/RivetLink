@@ -14,12 +14,15 @@ use std::time::Duration;
 use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
 use tokio::net::UnixStream;
 
+use crate::console::clipboard::ClipboardBridge;
+use crate::console::shared_folder::{ShareError, SharedFolder};
 use crate::error::{AgentError, AgentResult};
 use crate::input::{InputAction, InputHandle};
 
 /// Maximum accepted JSON IPC frame. Capture output is encoded in a response,
-/// while commands remain small and are rejected before allocation grows.
-const MAX_IPC_FRAME: usize = 64 * 1024;
+/// while commands remain small and are rejected before allocation grows. The
+/// largest command is one base64 file chunk or clipboard text.
+const MAX_IPC_FRAME: usize = 512 * 1024;
 /// Capture is deliberately bounded even if a compromised broker requests more.
 const MAX_CAPTURE_TIMEOUT_MS: u64 = 15_000;
 /// GDM's user manager can start before the boot-time broker has created its
@@ -34,7 +37,7 @@ const BROKER_SOCKET_RETRY: Duration = Duration::from_millis(250);
 const ACTIVE_SEAT_RETRY: Duration = Duration::from_secs(1);
 
 /// Input accepted from the broker after its independent trusted-client check.
-/// This excludes clipboard, files, shell commands, and arbitrary keycode data.
+/// This excludes shell commands and arbitrary keycode data.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(tag = "type", rename_all = "snake_case")]
 pub enum ConsoleInput {
@@ -63,6 +66,29 @@ pub enum WorkerRequest {
     Input {
         event: ConsoleInput,
     },
+    /// Start the clipboard bridge; host copies then arrive as
+    /// [`WorkerResponse::ClipboardChanged`].
+    ClipboardEnable,
+    ClipboardSet {
+        text: String,
+    },
+    FileUploadStart {
+        id: u32,
+        path: String,
+        size: u64,
+    },
+    FileUploadChunk {
+        id: u32,
+        data_b64: String,
+    },
+    FileUploadEnd {
+        id: u32,
+    },
+    ListSharedFiles,
+    ReadSharedFile {
+        path: String,
+        offset: u64,
+    },
     Stop,
 }
 
@@ -90,6 +116,24 @@ pub enum WorkerResponse {
         code: WorkerErrorCode,
     },
     InputAccepted,
+    ClipboardEnabled,
+    ClipboardAccepted,
+    /// Pushed asynchronously when the host clipboard gets new text.
+    ClipboardChanged {
+        text: String,
+    },
+    FileAccepted,
+    FileUploaded {
+        path: String,
+    },
+    SharedFiles {
+        entries: Vec<rivetlink_sdk::share::SharedEntry>,
+    },
+    SharedFileData {
+        data_b64: String,
+        size: u64,
+        eof: bool,
+    },
     Error {
         code: WorkerErrorCode,
     },
@@ -108,6 +152,11 @@ pub enum WorkerErrorCode {
     CaptureAuthorizationDenied,
     CompositorFailure,
     FrameEncodingFailed,
+    /// Clipboard/file sharing is only available in a logged-in desktop.
+    SharingUnavailable,
+    ClipboardUnavailable,
+    FileRejected,
+    FileIoFailed,
 }
 
 /// The compositor/socket family owned by this graphical worker. This is kept
@@ -198,6 +247,8 @@ pub async fn serve(stream: UnixStream) -> AgentResult<()> {
     serve_with_session(stream, session).await
 }
 
+// One flat dispatch over every WorkerRequest; each arm delegates to a helper.
+#[allow(clippy::too_many_lines)]
 async fn serve_with_session(stream: UnixStream, session: GraphicalSession) -> AgentResult<()> {
     let (mut reader, writer) = stream.into_split();
     let writer = std::sync::Arc::new(tokio::sync::Mutex::new(writer));
@@ -211,6 +262,9 @@ async fn serve_with_session(stream: UnixStream, session: GraphicalSession) -> Ag
     )
     .await?;
     let mut input: Option<InputHandle> = None;
+    let mut clipboard: Option<ClipboardBridge> = None;
+    let mut clipboard_forwarder: Option<tokio::task::JoinHandle<()>> = None;
+    let mut shared: Option<SharedFolder> = None;
     let mut desktop_stream: Option<tokio::task::JoinHandle<()>> = None;
     let desktop_stream_active = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
 
@@ -290,8 +344,22 @@ async fn serve_with_session(stream: UnixStream, session: GraphicalSession) -> Ag
                 WorkerResponse::DesktopStreamStopped
             },
             WorkerRequest::Input { event } => apply_input(&session, &mut input, event),
+            WorkerRequest::ClipboardEnable => {
+                enable_clipboard(&session, &writer, &mut clipboard, &mut clipboard_forwarder).await
+            },
+            WorkerRequest::ClipboardSet { text } => set_clipboard(clipboard.as_ref(), text).await,
+            request @ (WorkerRequest::FileUploadStart { .. }
+            | WorkerRequest::FileUploadChunk { .. }
+            | WorkerRequest::FileUploadEnd { .. }
+            | WorkerRequest::ListSharedFiles
+            | WorkerRequest::ReadSharedFile { .. }) => {
+                shared_folder_request(&session, &mut shared, request)
+            },
             WorkerRequest::Stop => {
                 if let Some(handle) = desktop_stream.take() {
+                    handle.abort();
+                }
+                if let Some(handle) = clipboard_forwarder.take() {
                     handle.abort();
                 }
                 return Ok(());
@@ -681,6 +749,124 @@ fn apply_input(
     });
     handle.send(action);
     WorkerResponse::InputAccepted
+}
+
+/// Start the clipboard bridge once and forward host copies to the broker.
+async fn enable_clipboard(
+    session: &GraphicalSession,
+    writer: &std::sync::Arc<tokio::sync::Mutex<tokio::net::unix::OwnedWriteHalf>>,
+    clipboard: &mut Option<ClipboardBridge>,
+    forwarder: &mut Option<tokio::task::JoinHandle<()>>,
+) -> WorkerResponse {
+    if !supports_normal_desktop_stream(session) {
+        return WorkerResponse::Error {
+            code: WorkerErrorCode::SharingUnavailable,
+        };
+    }
+    if clipboard.is_some() {
+        return WorkerResponse::ClipboardEnabled;
+    }
+    let (changes_tx, mut changes_rx) = tokio::sync::mpsc::channel(4);
+    match ClipboardBridge::start(changes_tx).await {
+        Ok(bridge) => {
+            *clipboard = Some(bridge);
+            let writer = std::sync::Arc::clone(writer);
+            *forwarder = Some(tokio::spawn(async move {
+                while let Some(text) = changes_rx.recv().await {
+                    let changed = WorkerResponse::ClipboardChanged { text };
+                    if write_worker_response(&writer, &changed).await.is_err() {
+                        break;
+                    }
+                }
+            }));
+            WorkerResponse::ClipboardEnabled
+        },
+        Err(error) => {
+            tracing::warn!(error = %error, "clipboard bridge unavailable");
+            WorkerResponse::Error {
+                code: WorkerErrorCode::ClipboardUnavailable,
+            }
+        },
+    }
+}
+
+async fn set_clipboard(clipboard: Option<&ClipboardBridge>, text: String) -> WorkerResponse {
+    let Some(bridge) = clipboard else {
+        return WorkerResponse::Error {
+            code: WorkerErrorCode::ClipboardUnavailable,
+        };
+    };
+    if text.len() > rivetlink_sdk::share::MAX_CLIPBOARD_BYTES {
+        return WorkerResponse::Error {
+            code: WorkerErrorCode::InvalidRequest,
+        };
+    }
+    match bridge.set(text).await {
+        Ok(()) => WorkerResponse::ClipboardAccepted,
+        Err(_) => WorkerResponse::Error {
+            code: WorkerErrorCode::ClipboardUnavailable,
+        },
+    }
+}
+
+/// Apply one shared-folder request, only in a logged-in desktop. Paths are
+/// validated inside [`SharedFolder`].
+fn shared_folder_request(
+    session: &GraphicalSession,
+    shared: &mut Option<SharedFolder>,
+    request: WorkerRequest,
+) -> WorkerResponse {
+    if !supports_normal_desktop_stream(session) {
+        return WorkerResponse::Error {
+            code: WorkerErrorCode::SharingUnavailable,
+        };
+    }
+    if shared.is_none() {
+        *shared = SharedFolder::for_current_user();
+    }
+    let Some(folder) = shared.as_mut() else {
+        return WorkerResponse::Error {
+            code: WorkerErrorCode::FileIoFailed,
+        };
+    };
+    let result = match request {
+        WorkerRequest::FileUploadStart { id, path, size } => folder
+            .start_upload(id, &path, size)
+            .map(|()| WorkerResponse::FileAccepted),
+        WorkerRequest::FileUploadChunk { id, data_b64 } => {
+            match base64::engine::general_purpose::STANDARD.decode(data_b64) {
+                Ok(data) => folder
+                    .write_chunk(id, &data)
+                    .map(|()| WorkerResponse::FileAccepted),
+                Err(_) => {
+                    folder.abort_upload(id);
+                    Err(ShareError::Rejected)
+                },
+            }
+        },
+        WorkerRequest::FileUploadEnd { id } => folder
+            .finish_upload(id)
+            .map(|path| WorkerResponse::FileUploaded { path }),
+        WorkerRequest::ListSharedFiles => folder
+            .list()
+            .map(|entries| WorkerResponse::SharedFiles { entries }),
+        WorkerRequest::ReadSharedFile { path, offset } => {
+            folder.read_chunk(&path, offset).map(|(data, size, eof)| {
+                WorkerResponse::SharedFileData {
+                    data_b64: base64::engine::general_purpose::STANDARD.encode(data),
+                    size,
+                    eof,
+                }
+            })
+        },
+        _ => Err(ShareError::Rejected),
+    };
+    result.unwrap_or_else(|error| WorkerResponse::Error {
+        code: match error {
+            ShareError::Rejected => WorkerErrorCode::FileRejected,
+            ShareError::Io => WorkerErrorCode::FileIoFailed,
+        },
+    })
 }
 
 fn uses_x11_input(session: &GraphicalSession) -> bool {

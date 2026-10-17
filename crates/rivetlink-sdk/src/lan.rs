@@ -452,6 +452,27 @@ pub enum LanRequest {
         #[serde(default)]
         inputs: Vec<ConsoleInputPacket>,
     },
+    /// Turn on clipboard/file sharing for this stream. Send only when the host
+    /// listed a sharing feature in [`LanResponse::Displays`]; older hosts do not
+    /// know this request. The host answers [`LanResponse::SharingEnabled`] and
+    /// from then on pushes [`LanResponse::ClipboardText`] on host copies.
+    EnableSharing,
+    /// Put text on the host clipboard (at most [`crate::share::MAX_CLIPBOARD_BYTES`]).
+    ClipboardSet { text: String },
+    /// Begin uploading a file into the host's shared folder. `path` is relative
+    /// and `/`-separated (folders are created); see
+    /// [`crate::share::relative_components`].
+    FileUploadStart { id: u32, path: String, size: u64 },
+    /// The next chunk of an upload, base64, at most
+    /// [`crate::share::FILE_CHUNK_BYTES`] raw bytes.
+    FileUploadChunk { id: u32, data_b64: String },
+    /// Finish an upload; the host answers [`LanResponse::FileUploaded`].
+    FileUploadEnd { id: u32 },
+    /// List the host's shared folder (recursively).
+    ListSharedFiles,
+    /// Download one file from the host's shared folder. The host answers with
+    /// [`LanResponse::FileChunk`]s for `id` until `eof`.
+    FileDownload { id: u32, path: String },
 }
 
 /// A mouse button, for [`LanRequest::PointerButton`].
@@ -502,7 +523,13 @@ pub enum LanResponse {
     /// One live frame as changed tiles (dirty-rectangle delta encoding).
     Frame(FrameDelta),
     /// The displays the host can share (reply to [`LanRequest::ListDisplays`]).
-    Displays { displays: Vec<DisplayInfo> },
+    /// `features` lists optional capabilities this client may use on this host
+    /// (see [`crate::share`]); older hosts omit it.
+    Displays {
+        displays: Vec<DisplayInfo>,
+        #[serde(default, skip_serializing_if = "Vec::is_empty")]
+        features: Vec<String>,
+    },
     /// A physical-console capture plus non-sensitive lifecycle state. The
     /// state lets a client distinguish GDM, desktop and lock transitions
     /// without exposing session identifiers or account details.
@@ -511,6 +538,26 @@ pub enum LanResponse {
         state: Option<HostConsoleState>,
         generation: Option<u64>,
     },
+    /// Reply to [`LanRequest::EnableSharing`]: which features are now active.
+    SharingEnabled { clipboard: bool, files: bool },
+    /// The host clipboard changed to this text.
+    ClipboardText { text: String },
+    /// An upload finished; `path` is where it landed (it may have been renamed
+    /// to avoid overwriting an existing file).
+    FileUploaded { id: u32, path: String },
+    /// The host's shared folder contents (reply to [`LanRequest::ListSharedFiles`]).
+    SharedFiles {
+        entries: Vec<crate::share::SharedEntry>,
+    },
+    /// The next chunk of a download. `size` is the full file size.
+    FileChunk {
+        id: u32,
+        size: u64,
+        data_b64: String,
+        eof: bool,
+    },
+    /// A transfer failed; the host dropped any partial data for `id`.
+    FileError { id: u32, message: String },
     /// The host could not satisfy the request.
     Error { message: String },
 }
@@ -739,12 +786,10 @@ async fn fetch_screenshot(stream: &mut TcpStream, channel: &SealedChannel) -> Sd
         LanResponse::Screenshot { png_b64 } => B64
             .decode(png_b64.trim())
             .map_err(|e| SdkError::Base64(e.to_string())),
-        LanResponse::Frame(_)
-        | LanResponse::Displays { .. }
-        | LanResponse::ConsoleCapture { .. } => Err(SdkError::Crypto(
+        LanResponse::Error { message } => Err(SdkError::Lan(message)),
+        _ => Err(SdkError::Crypto(
             "expected screenshot, got another response".to_string(),
         )),
-        LanResponse::Error { message } => Err(SdkError::Lan(message)),
     }
 }
 
@@ -754,11 +799,22 @@ pub async fn list_displays(
     stream: &mut TcpStream,
     channel: &SealedChannel,
 ) -> SdkResult<Vec<DisplayInfo>> {
+    list_displays_and_features(stream, channel)
+        .await
+        .map(|(displays, _)| displays)
+}
+
+/// Like [`list_displays`], plus the optional features (see [`crate::share`])
+/// this client may use on the host. Empty for hosts without sharing.
+pub async fn list_displays_and_features(
+    stream: &mut TcpStream,
+    channel: &SealedChannel,
+) -> SdkResult<(Vec<DisplayInfo>, Vec<String>)> {
     send_request(stream, channel, &LanRequest::ListDisplays).await?;
     match recv_response(stream, channel).await? {
-        LanResponse::Displays { displays } => Ok(displays),
+        LanResponse::Displays { displays, features } => Ok((displays, features)),
         LanResponse::Error { message } => Err(SdkError::Lan(message)),
-        _ => Ok(Vec::new()),
+        _ => Ok((Vec::new(), Vec::new())),
     }
 }
 
@@ -774,7 +830,7 @@ pub async fn list_displays(
 // identity, control channel, sink); bundling them into a struct would add
 // ceremony without clarity.
 #[allow(clippy::too_many_arguments, clippy::cognitive_complexity)]
-pub async fn stream_frames<F, D>(
+pub async fn stream_frames<F, D, E>(
     stream: TcpStream,
     channel: SealedChannel,
     fps: u16,
@@ -785,10 +841,12 @@ pub async fn stream_frames<F, D>(
     mut input_rx: tokio::sync::mpsc::Receiver<LanRequest>,
     mut on_frame: F,
     mut on_displays: D,
+    mut on_share: E,
 ) -> SdkResult<()>
 where
     F: FnMut(&FrameDelta) -> bool,
     D: FnMut(Vec<DisplayInfo>),
+    E: FnMut(LanResponse),
 {
     // Own the read/write halves so the write side can live in its own task. The
     // sealed channel has independent directional sequence state. The reader only
@@ -861,7 +919,14 @@ where
             // The host pushes a fresh display list mid-stream when it grants or
             // revokes "share all screens" — surface it so the viewer can show or
             // hide its screen picker live.
-            LanResponse::Displays { displays } => on_displays(displays),
+            LanResponse::Displays { displays, .. } => on_displays(displays),
+            // Clipboard and file-transfer traffic (only after EnableSharing).
+            share @ (LanResponse::SharingEnabled { .. }
+            | LanResponse::ClipboardText { .. }
+            | LanResponse::FileUploaded { .. }
+            | LanResponse::SharedFiles { .. }
+            | LanResponse::FileChunk { .. }
+            | LanResponse::FileError { .. }) => on_share(share),
             LanResponse::Screenshot { .. } | LanResponse::ConsoleCapture { .. } => {},
         }
     }

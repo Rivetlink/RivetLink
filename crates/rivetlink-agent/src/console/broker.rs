@@ -304,6 +304,7 @@ pub struct ConsoleWorkerClient {
     desktop_frames: broadcast::Sender<FrameDelta>,
     desktop_ended: broadcast::Sender<WorkerErrorCode>,
     desktop_stream_active: Arc<std::sync::atomic::AtomicBool>,
+    clipboard_changes: broadcast::Sender<String>,
     closed: watch::Receiver<bool>,
     state: HostConsoleState,
 }
@@ -331,6 +332,8 @@ impl ConsoleWorkerClient {
         let (responses_tx, responses_rx) = mpsc::channel(16);
         let (desktop_frames, _) = broadcast::channel(4);
         let (desktop_ended, _) = broadcast::channel(4);
+        let (clipboard_changes, _) = broadcast::channel(4);
+        let reader_clipboard = clipboard_changes.clone();
         let active = Arc::new(std::sync::atomic::AtomicBool::new(false));
         let reader_frames = desktop_frames.clone();
         let reader_ended = desktop_ended.clone();
@@ -343,6 +346,9 @@ impl ConsoleWorkerClient {
                 match response {
                     Ok(WorkerResponse::DesktopFrame { delta }) => {
                         let _ = reader_frames.send(delta);
+                    },
+                    Ok(WorkerResponse::ClipboardChanged { text }) => {
+                        let _ = reader_clipboard.send(text);
                     },
                     Ok(WorkerResponse::DesktopStreamEnded { code }) => {
                         reader_active.store(false, Ordering::Release);
@@ -370,6 +376,7 @@ impl ConsoleWorkerClient {
             desktop_frames,
             desktop_ended,
             desktop_stream_active: active,
+            clipboard_changes,
             closed,
             state,
         })
@@ -473,6 +480,76 @@ impl ConsoleWorkerClient {
         }
     }
 
+    /// Start the worker's clipboard bridge. Host copies are then delivered to
+    /// every [`Self::clipboard_changes`] subscriber.
+    pub async fn enable_clipboard(&self) -> AgentResult<()> {
+        match self.request(WorkerRequest::ClipboardEnable).await? {
+            WorkerResponse::ClipboardEnabled => Ok(()),
+            response => Err(unexpected_share_response(&response)),
+        }
+    }
+
+    pub fn clipboard_changes(&self) -> broadcast::Receiver<String> {
+        self.clipboard_changes.subscribe()
+    }
+
+    pub async fn set_clipboard(&self, text: String) -> AgentResult<()> {
+        match self.request(WorkerRequest::ClipboardSet { text }).await? {
+            WorkerResponse::ClipboardAccepted => Ok(()),
+            response => Err(unexpected_share_response(&response)),
+        }
+    }
+
+    pub async fn upload_start(&self, id: u32, path: String, size: u64) -> AgentResult<()> {
+        match self
+            .request(WorkerRequest::FileUploadStart { id, path, size })
+            .await?
+        {
+            WorkerResponse::FileAccepted => Ok(()),
+            response => Err(unexpected_share_response(&response)),
+        }
+    }
+
+    pub async fn upload_chunk(&self, id: u32, data_b64: String) -> AgentResult<()> {
+        match self
+            .request(WorkerRequest::FileUploadChunk { id, data_b64 })
+            .await?
+        {
+            WorkerResponse::FileAccepted => Ok(()),
+            response => Err(unexpected_share_response(&response)),
+        }
+    }
+
+    /// Finish an upload; returns its final path inside the shared folder.
+    pub async fn upload_end(&self, id: u32) -> AgentResult<String> {
+        match self.request(WorkerRequest::FileUploadEnd { id }).await? {
+            WorkerResponse::FileUploaded { path } => Ok(path),
+            response => Err(unexpected_share_response(&response)),
+        }
+    }
+
+    pub async fn list_shared(&self) -> AgentResult<Vec<rivetlink_sdk::share::SharedEntry>> {
+        match self.request(WorkerRequest::ListSharedFiles).await? {
+            WorkerResponse::SharedFiles { entries } => Ok(entries),
+            response => Err(unexpected_share_response(&response)),
+        }
+    }
+
+    /// One chunk of a shared file: base64 data, full size, and end-of-file.
+    pub async fn read_shared(&self, path: String, offset: u64) -> AgentResult<(String, u64, bool)> {
+        match self
+            .request(WorkerRequest::ReadSharedFile { path, offset })
+            .await?
+        {
+            WorkerResponse::SharedFileData {
+                data_b64,
+                size,
+                eof,
+            } => Ok((data_b64, size, eof)),
+            response => Err(unexpected_share_response(&response)),
+        }
+    }
+
     async fn request(&self, request: WorkerRequest) -> AgentResult<WorkerResponse> {
         // Control requests stay ordered, while the independent IPC reader
         // forwards desktop frames through a lossy newest-frame channel.
@@ -490,7 +567,20 @@ impl ConsoleWorkerClient {
     }
 }
 
+fn unexpected_share_response(response: &WorkerResponse) -> AgentError {
+    match response {
+        WorkerResponse::Error { code } => worker_error(*code),
+        _ => AgentError::Share("the console worker sent an unexpected response".to_string()),
+    }
+}
+
 impl ConsoleDesktopStream {
+    /// The worker serving this stream, for clipboard and file requests that
+    /// must reach the same logged-in session.
+    pub fn worker(&self) -> ConsoleWorkerClient {
+        self.worker.clone()
+    }
+
     /// Return the freshest encoded desktop frame, or a non-sensitive terminal
     /// error when the worker/session disappears.
     pub async fn next(&mut self) -> AgentResult<FrameDelta> {
@@ -584,6 +674,28 @@ fn worker_error(code: WorkerErrorCode) -> AgentError {
             "the console compositor could not capture the active display"
         },
         WorkerErrorCode::FrameEncodingFailed => "the console frame could not be encoded",
+        WorkerErrorCode::SharingUnavailable => {
+            return AgentError::Share(
+                "clipboard and file sharing need a logged-in desktop".to_string(),
+            );
+        },
+        WorkerErrorCode::ClipboardUnavailable => {
+            return AgentError::Share("the host clipboard is unavailable".to_string());
+        },
+        WorkerErrorCode::FileRejected => {
+            return AgentError::Share(
+                crate::console::shared_folder::ShareError::Rejected
+                    .message()
+                    .to_string(),
+            );
+        },
+        WorkerErrorCode::FileIoFailed => {
+            return AgentError::Share(
+                crate::console::shared_folder::ShareError::Io
+                    .message()
+                    .to_string(),
+            );
+        },
     };
     AgentError::Relay(description.to_string())
 }

@@ -8,9 +8,10 @@
 pub mod state;
 
 // This runs inside GDM's or the logged-in user's existing GNOME session. It
-// deliberately has no relay credentials, filesystem API, or elevated device
-// access: the only operations it accepts are bounded capture and normalized
-// input for the session that owns the physical console.
+// deliberately has no relay credentials or elevated device access: it accepts
+// bounded capture and normalized input for the session that owns the physical
+// console, plus — in a logged-in desktop only — text clipboard and transfers
+// confined to ~/Downloads/RivetLink.
 #[cfg(target_os = "linux")]
 pub mod broker;
 
@@ -23,5 +24,13 @@ pub mod lightdm;
 
 #[cfg(target_os = "linux")]
 pub mod worker;
+
+// Clipboard and shared-folder support for the logged-in desktop session. Both
+// run inside the worker (as the logged-in user) and are only reachable after
+// the broker's trusted-client and remote-control checks.
+#[cfg(target_os = "linux")]
+pub mod clipboard;
+#[cfg(target_os = "linux")]
+pub mod shared_folder;
 
 pub use state::{ConsoleObservation, ConsoleStateMachine};

@@ -18,6 +18,7 @@ pub mod identity;
 pub mod lan;
 pub mod rest;
 pub mod session;
+pub mod share;
 
 mod client;
 
