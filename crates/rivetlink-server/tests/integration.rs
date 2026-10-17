@@ -1300,6 +1300,19 @@ mod rbac {
 
 mod device_auth {
     use super::*;
+
+    /// Device-auth protocol the relay expects (`gateway.rs`).
+    const DEVICE_AUTH_PROTOCOL_VERSION: u16 = 2;
+
+    /// Mirrors the relay's signature binding: domain || version || device id ||
+    /// nonce, so a signature can't be replayed for another device or protocol.
+    fn challenge_binding(device_id: &str, nonce: &[u8]) -> Vec<u8> {
+        let mut binding = b"rivetlink-relay-device-auth-v2".to_vec();
+        binding.extend_from_slice(&DEVICE_AUTH_PROTOCOL_VERSION.to_be_bytes());
+        binding.extend_from_slice(uuid::Uuid::parse_str(device_id).unwrap().as_bytes());
+        binding.extend_from_slice(nonce);
+        binding
+    }
     use base64::Engine;
     use ed25519_dalek::{Signer, SigningKey};
     use futures_util::{SinkExt, StreamExt};
@@ -1393,7 +1406,7 @@ mod device_auth {
         let (mut ws, _resp) = tokio_tungstenite::connect_async(&url).await.unwrap();
 
         ws.send(Message::Text(
-            json!({"type": "DEVICE_HELLO", "device_id": device_id}).to_string(),
+            json!({"type": "DEVICE_HELLO", "device_id": device_id, "protocol_version": DEVICE_AUTH_PROTOCOL_VERSION}).to_string(),
         ))
         .await
         .unwrap();
@@ -1416,7 +1429,7 @@ mod device_auth {
             .unwrap();
 
         // Sign it
-        let sig = device_signing.sign(&nonce);
+        let sig = device_signing.sign(&challenge_binding(&device_id, &nonce));
         let sig_b64 = base64::engine::general_purpose::STANDARD.encode(sig.to_bytes());
         ws.send(Message::Text(
             json!({"type": "DEVICE_AUTH", "signature": sig_b64}).to_string(),
@@ -1481,7 +1494,7 @@ mod device_auth {
         let (mut ws, _resp) = tokio_tungstenite::connect_async(&url).await.unwrap();
 
         ws.send(Message::Text(
-            json!({"type": "DEVICE_HELLO", "device_id": device_id}).to_string(),
+            json!({"type": "DEVICE_HELLO", "device_id": device_id, "protocol_version": DEVICE_AUTH_PROTOCOL_VERSION}).to_string(),
         ))
         .await
         .unwrap();
@@ -1497,7 +1510,7 @@ mod device_auth {
             .unwrap();
 
         // Sign with the wrong key
-        let sig = attacker_key.sign(&nonce);
+        let sig = attacker_key.sign(&challenge_binding(&device_id, &nonce));
         let sig_b64 = base64::engine::general_purpose::STANDARD.encode(sig.to_bytes());
         ws.send(Message::Text(
             json!({"type": "DEVICE_AUTH", "signature": sig_b64}).to_string(),
@@ -1535,7 +1548,7 @@ mod device_auth {
         // Random device_id that was never registered
         let bogus = uuid::Uuid::now_v7();
         ws.send(Message::Text(
-            json!({"type": "DEVICE_HELLO", "device_id": bogus}).to_string(),
+            json!({"type": "DEVICE_HELLO", "device_id": bogus, "protocol_version": DEVICE_AUTH_PROTOCOL_VERSION}).to_string(),
         ))
         .await
         .unwrap();

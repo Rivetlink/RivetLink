@@ -90,12 +90,24 @@ impl SealedChannel {
     /// hard error; callers must establish a fresh session rather than risk nonce
     /// reuse.
     pub fn seal(&self, plaintext: &[u8]) -> CryptoResult<Vec<u8>> {
-        let sequence = self
-            .next_send
-            .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |current| {
-                (current != u64::MAX).then_some(current + 1)
-            })
-            .map_err(|_| CryptoError::NonceExhausted)?;
+        // Claim the next sequence number; refuse to wrap. An explicit CAS loop
+        // instead of `fetch_update`, which newer toolchains deprecate in favour
+        // of `try_update` (unavailable on older ones).
+        let mut sequence = self.next_send.load(Ordering::Relaxed);
+        loop {
+            if sequence == u64::MAX {
+                return Err(CryptoError::NonceExhausted);
+            }
+            match self.next_send.compare_exchange_weak(
+                sequence,
+                sequence + 1,
+                Ordering::Relaxed,
+                Ordering::Relaxed,
+            ) {
+                Ok(_) => break,
+                Err(current) => sequence = current,
+            }
+        }
         let header = header(sequence);
         let cipher = ChaCha20Poly1305::new_from_slice(&self.send_key)
             .map_err(|error| CryptoError::Encryption(error.to_string()))?;

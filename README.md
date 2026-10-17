@@ -5,9 +5,18 @@ post-quantum-ready. The relay server only routes ciphertext — **the host devic
 decides who connects**, never the server.
 
 > Status: early. The secure session pipeline works end to end (auth, device
-> identity, host consent, signed key exchange, E2E-encrypted transfer). The
-> current capture path delivers **on-demand screenshots**; live video and input
-> injection are the next milestones.
+> identity, host consent, signed key exchange, E2E-encrypted transfer), over
+> the relay or directly on the LAN.
+>
+> | Host platform | Live view | Remote input |
+> | ------------- | --------- | ------------ |
+> | Linux (GNOME/Wayland, X11, GDM/LightDM console) | ✅ tile-delta JPEG stream | ✅ Mutter RemoteDesktop / XTest |
+> | macOS | ✅ ScreenCaptureKit | ❌ not yet (CGEvent backend missing) |
+> | Windows | ❌ viewer only | ❌ |
+>
+> Not yet implemented: a real video codec, WebRTC/NAT traversal (the bundled
+> coturn is unused), and wiring the ML-KEM/ML-DSA primitives in
+> `rivetlink-crypto` into the session handshake (today it is X25519 + Ed25519).
 
 ## Components
 
