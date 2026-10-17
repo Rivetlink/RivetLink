@@ -541,8 +541,8 @@ fn collect_gstreamer_stderr(
 /// plaintext image to disk.
 fn encode_bgrx_png(width: usize, height: usize, bgrx: &[u8]) -> AgentResult<Vec<u8>> {
     let mut rgba = Vec::with_capacity(bgrx.len());
-    for pixel in bgrx.chunks_exact(4) {
-        rgba.extend_from_slice(&[pixel[2], pixel[1], pixel[0], 255]);
+    for [b, g, r, _] in bgrx.as_chunks::<4>().0 {
+        rgba.extend_from_slice(&[*r, *g, *b, 255]);
     }
     let width = u32::try_from(width)
         .map_err(|_| AgentError::Config("virtual monitor width is invalid".to_string()))?;

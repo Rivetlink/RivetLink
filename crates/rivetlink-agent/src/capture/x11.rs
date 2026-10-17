@@ -94,11 +94,11 @@ pub fn capture_png(display: &str) -> AgentResult<Vec<u8>> {
         u8::from(connection.setup().image_byte_order),
         visual,
     )?;
-    encode_rgba_png(
-        u32::try_from(stream_width).expect("bounded stream width fits u32"),
-        u32::try_from(stream_height).expect("bounded stream height fits u32"),
-        &rgba,
-    )
+    let stream_width = u32::try_from(stream_width)
+        .map_err(|_| AgentError::Config("X11 stream width is invalid".to_string()))?;
+    let stream_height = u32::try_from(stream_height)
+        .map_err(|_| AgentError::Config("X11 stream height is invalid".to_string()))?;
+    encode_rgba_png(stream_width, stream_height, &rgba)
 }
 
 fn fit_stream_dimensions(width: usize, height: usize) -> (usize, usize) {
@@ -117,6 +117,7 @@ fn fit_stream_dimensions(width: usize, height: usize) -> (usize, usize) {
 /// Decode only the pixels needed by the bounded login stream. X11 still
 /// captures the real full root window, while avoiding a second 33 MiB RGBA
 /// allocation when an HDMI dummy advertises 4K.
+#[allow(clippy::too_many_arguments)] // flat pixel-format parameters of one X11 image
 fn decode_root_image_scaled(
     bytes: &[u8],
     source_width: usize,
@@ -190,6 +191,7 @@ fn visual_for_root(
 
 /// Decode a ZPixmap image using its server byte order and TrueColor masks.
 /// The output is tightly packed RGBA and never leaves process memory.
+#[cfg(test)]
 fn decode_root_image(
     bytes: &[u8],
     width: usize,
