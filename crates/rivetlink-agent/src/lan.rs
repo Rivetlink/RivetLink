@@ -6,12 +6,15 @@
 //! encrypted channel, then serves screenshot requests over it.
 
 use std::sync::Arc;
+use std::time::Duration;
 #[cfg(target_os = "linux")]
-use std::time::{Duration, Instant};
+use std::time::Instant;
 
 use base64::engine::general_purpose::STANDARD as B64;
 use base64::Engine;
 use ed25519_dalek::SigningKey;
+use socket2::{SockRef, TcpKeepalive};
+use tokio::io::AsyncWrite;
 use tokio::net::{TcpListener, TcpStream};
 use tokio::sync::mpsc::Sender;
 use tokio::sync::Semaphore;
@@ -43,6 +46,54 @@ const MAX_LAN_SESSIONS: usize = 32;
 const MAX_PHYSICAL_CONSOLE_SESSIONS: usize = 16;
 #[cfg(target_os = "linux")]
 const PHYSICAL_CONSOLE_HANDSHAKE_TIMEOUT: Duration = Duration::from_secs(10);
+
+/// A viewer that disappears without closing its socket (laptop sleep, Wi-Fi
+/// drop) must not keep its session — and the single desktop-stream slot —
+/// forever. Idle connections are probed after `DEAD_PEER_IDLE`, then every
+/// `DEAD_PEER_PROBE_INTERVAL`, and dropped after `DEAD_PEER_PROBES` misses.
+const DEAD_PEER_IDLE: Duration = Duration::from_secs(10);
+const DEAD_PEER_PROBE_INTERVAL: Duration = Duration::from_secs(3);
+const DEAD_PEER_PROBES: u32 = 3;
+/// While frames are in flight keepalive does not probe, so Linux additionally
+/// drops a connection whose sent data stays unacknowledged this long.
+#[cfg(target_os = "linux")]
+const DEAD_PEER_UNACKED_TIMEOUT: Duration = Duration::from_secs(15);
+/// A frame write that cannot complete in this time means the viewer stopped
+/// reading (the send buffer is full); end the stream instead of blocking.
+const FRAME_SEND_TIMEOUT: Duration = Duration::from_secs(10);
+
+/// Arm dead-peer detection on an accepted LAN connection. Failure only costs
+/// the faster cleanup, so it is logged rather than refusing the client.
+fn arm_dead_peer_detection(stream: &TcpStream) {
+    let socket = SockRef::from(stream);
+    let keepalive = TcpKeepalive::new()
+        .with_time(DEAD_PEER_IDLE)
+        .with_interval(DEAD_PEER_PROBE_INTERVAL)
+        .with_retries(DEAD_PEER_PROBES);
+    if let Err(error) = socket.set_tcp_keepalive(&keepalive) {
+        tracing::debug!(error = %error, "could not enable TCP keepalive on LAN session");
+    }
+    #[cfg(target_os = "linux")]
+    if let Err(error) = socket.set_tcp_user_timeout(Some(DEAD_PEER_UNACKED_TIMEOUT)) {
+        tracing::debug!(error = %error, "could not set TCP user timeout on LAN session");
+    }
+}
+
+/// Send one stream frame, treating a stalled write like a closed connection.
+async fn send_frame<W: AsyncWrite + Unpin>(
+    writer: &mut W,
+    channel: &SealedChannel,
+    delta: lan::FrameDelta,
+) -> bool {
+    matches!(
+        tokio::time::timeout(
+            FRAME_SEND_TIMEOUT,
+            lan::send_response(writer, channel, &LanResponse::Frame(delta)),
+        )
+        .await,
+        Ok(Ok(()))
+    )
+}
 
 /// A change in LAN host session state, for an embedding app to drive its UI.
 /// The CLI agent ignores these (it logs instead); a desktop host surfaces them
@@ -174,6 +225,7 @@ pub async fn serve_physical_console(
             accepted = listener.accept() => {
                 let (stream, peer) = accepted?;
                 let _ = stream.set_nodelay(true);
+                arm_dead_peer_detection(&stream);
                 let signing_key = signing_key.clone();
                 let trusted = Arc::clone(&trusted);
                 let limits = limits.clone();
@@ -470,7 +522,8 @@ async fn stream_authenticated_desktop(
         tokio::select! {
             frame = desktop.next() => match frame {
                 Ok(delta) => {
-                    if lan::send_response(&mut writer, &channel, &LanResponse::Frame(delta)).await.is_err() {
+                    if !send_frame(&mut writer, &channel, delta).await {
+                        tracing::info!(client = %client, "physical-console viewer stopped receiving frames");
                         break Ok(());
                     }
                 },
@@ -612,6 +665,7 @@ pub async fn serve_with_events(
                 // Disable Nagle: live streaming pushes many small sealed frames;
                 // coalescing them adds bursty stalls to the real-time view.
                 let _ = stream.set_nodelay(true);
+                arm_dead_peer_detection(&stream);
                 let signing_key = signing_key.clone();
                 let auth = Arc::clone(&auth);
                 let events = events.clone();
@@ -1074,11 +1128,8 @@ async fn stream_screen(
             tokio::select! {
                 frame = rx.recv() => match frame {
                     Some(delta) => {
-                        if lan::send_response(&mut wr, &channel, &LanResponse::Frame(delta))
-                            .await
-                            .is_err()
-                        {
-                            tracing::info!("LAN stream: client disconnected (frame send failed)");
+                        if !send_frame(&mut wr, &channel, delta).await {
+                            tracing::info!("LAN stream: client disconnected or stopped reading");
                             break 'session;
                         }
                     },
