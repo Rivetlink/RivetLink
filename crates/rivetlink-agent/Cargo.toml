@@ -32,6 +32,9 @@ ed25519-dalek = { workspace = true }
 x25519-dalek = { workspace = true }
 rand_08 = { workspace = true }
 base64 = { workspace = true }
+# TCP keepalive / TCP_USER_TIMEOUT on LAN sessions, so a viewer that vanishes
+# without closing (laptop sleep, Wi-Fi drop) releases its stream slot.
+socket2 = { version = "0.6", features = ["all"] }
 # Live-stream frames are JPEG tile-deltas on both host platforms, so this is general.
 jpeg-encoder = "0.6"
 
