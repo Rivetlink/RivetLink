@@ -31,6 +31,11 @@ pub enum AgentError {
 
     #[error("input injection error: {0}")]
     Input(String),
+
+    /// A clipboard/file-sharing failure whose message is safe to show the
+    /// remote client verbatim.
+    #[error("{0}")]
+    Share(String),
 }
 
 /// Result alias used throughout the agent.
