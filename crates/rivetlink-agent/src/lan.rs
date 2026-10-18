@@ -542,6 +542,10 @@ async fn stream_authenticated_desktop(
     let mut clipboard_enabled = false;
     let (share_tx, mut share_rx) = tokio::sync::mpsc::channel::<LanResponse>(8);
     let mut downloads = tokio::task::JoinSet::new();
+    let mut held = HeldInput::default();
+    // A modifier stuck by an earlier viewer (before held input was released
+    // on disconnect) would otherwise survive until the worker restarts.
+    HeldInput::release_modifiers(&source).await;
 
     let result = loop {
         tokio::select! {
@@ -611,6 +615,7 @@ async fn stream_authenticated_desktop(
                             }).await;
                             break Ok(());
                         }
+                        held.track(&input);
                         let mut input_source = source.clone();
                         if let Err(error) = input_source.inject(input).await {
                             tracing::warn!(client = %client, error = %error, "normal desktop input failed");
@@ -628,9 +633,107 @@ async fn stream_authenticated_desktop(
     };
     downloads.abort_all();
     reader_task.abort();
+    held.release(&source).await;
     let _ = desktop.stop().await;
     tracing::info!(client = %client, "physical-console handoff: normal desktop engine stopped");
     result
+}
+
+/// Keys and buttons a viewer holds down on the host. The console worker keeps
+/// one input session across viewers, so anything still pressed when a viewer
+/// goes away (a keyup lost to a focus change, a dropped connection) would stay
+/// pressed for every later viewer: a held Ctrl turns `d` into Ctrl+D. Released
+/// when the viewer ends.
+#[cfg(target_os = "linux")]
+#[derive(Debug, Default)]
+struct HeldInput {
+    keys: std::collections::BTreeSet<String>,
+    /// Left, right, middle.
+    buttons: [bool; 3],
+}
+
+#[cfg(target_os = "linux")]
+impl HeldInput {
+    fn button_index(button: rivetlink_protocol::MouseButton) -> usize {
+        match button {
+            rivetlink_protocol::MouseButton::Left => 0,
+            rivetlink_protocol::MouseButton::Right => 1,
+            rivetlink_protocol::MouseButton::Middle => 2,
+        }
+    }
+
+    fn track(&mut self, input: &ConsoleInputPacket) {
+        match input {
+            ConsoleInputPacket::Key { code, down: true } => {
+                self.keys.insert(code.clone());
+            },
+            ConsoleInputPacket::Key { code, down: false } => {
+                self.keys.remove(code);
+            },
+            ConsoleInputPacket::PointerButton { button, down } => {
+                self.buttons[Self::button_index(*button)] = *down;
+            },
+            ConsoleInputPacket::PointerMove { .. } | ConsoleInputPacket::Scroll { .. } => {},
+        }
+    }
+
+    fn releases(self) -> Vec<ConsoleInputPacket> {
+        let buttons = [
+            rivetlink_protocol::MouseButton::Left,
+            rivetlink_protocol::MouseButton::Right,
+            rivetlink_protocol::MouseButton::Middle,
+        ]
+        .into_iter()
+        .zip(self.buttons)
+        .filter(|(_, down)| *down)
+        .map(|(button, _)| ConsoleInputPacket::PointerButton {
+            button,
+            down: false,
+        });
+        self.keys
+            .into_iter()
+            .map(|code| ConsoleInputPacket::Key { code, down: false })
+            .chain(buttons)
+            .collect()
+    }
+
+    /// Modifiers released when a viewer starts. Releasing a key that is not
+    /// pressed is ignored by Mutter. `CommandMod` is `ControlLeft` on Linux.
+    const MODIFIERS: [&'static str; 8] = [
+        "ShiftLeft",
+        "ShiftRight",
+        "ControlLeft",
+        "ControlRight",
+        "AltLeft",
+        "AltRight",
+        "MetaLeft",
+        "MetaRight",
+    ];
+
+    async fn release_modifiers(source: &ConsoleWorkerPool) {
+        let held = Self {
+            keys: Self::MODIFIERS.iter().map(ToString::to_string).collect(),
+            buttons: [false; 3],
+        };
+        held.release(source).await;
+    }
+
+    async fn release(self, source: &ConsoleWorkerPool) {
+        let releases = self.releases();
+        if releases.is_empty() {
+            return;
+        }
+        tracing::info!(
+            count = releases.len(),
+            "physical-console: releasing held keys and buttons"
+        );
+        let mut source = source.clone();
+        for input in releases {
+            if source.inject(input).await.is_err() {
+                return;
+            }
+        }
+    }
 }
 
 /// A successful logout replaces the GNOME desktop worker with LightDM's X11
@@ -1517,6 +1620,45 @@ mod tests {
         assert!(!is_lan_health_probe_disconnect(&AgentError::Relay(
             "no active graphical console worker".to_string()
         )));
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn held_input_releases_only_what_is_still_pressed() {
+        let mut held = HeldInput::default();
+        let key = |code: &str, down| ConsoleInputPacket::Key {
+            code: code.to_string(),
+            down,
+        };
+        held.track(&key("CommandMod", true));
+        held.track(&key("KeyD", true));
+        held.track(&key("KeyD", false));
+        held.track(&ConsoleInputPacket::PointerButton {
+            button: rivetlink_protocol::MouseButton::Left,
+            down: true,
+        });
+        held.track(&ConsoleInputPacket::PointerButton {
+            button: rivetlink_protocol::MouseButton::Right,
+            down: true,
+        });
+        held.track(&ConsoleInputPacket::PointerButton {
+            button: rivetlink_protocol::MouseButton::Right,
+            down: false,
+        });
+        let releases = held.releases();
+        assert_eq!(releases.len(), 2);
+        assert!(matches!(
+            &releases[0],
+            ConsoleInputPacket::Key { code, down: false } if code == "CommandMod"
+        ));
+        assert!(matches!(
+            releases[1],
+            ConsoleInputPacket::PointerButton {
+                button: rivetlink_protocol::MouseButton::Left,
+                down: false,
+            }
+        ));
+        assert!(HeldInput::default().releases().is_empty());
     }
 
     #[cfg(target_os = "linux")]
