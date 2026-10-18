@@ -543,6 +543,9 @@ async fn stream_authenticated_desktop(
     let (share_tx, mut share_rx) = tokio::sync::mpsc::channel::<LanResponse>(8);
     let mut downloads = tokio::task::JoinSet::new();
     let mut held = HeldInput::default();
+    // A modifier stuck by an earlier viewer (before held input was released
+    // on disconnect) would otherwise survive until the worker restarts.
+    HeldInput::release_modifiers(&source).await;
 
     let result = loop {
         tokio::select! {
@@ -694,6 +697,27 @@ impl HeldInput {
             .collect()
     }
 
+    /// Modifiers released when a viewer starts. Releasing a key that is not
+    /// pressed is ignored by Mutter. `CommandMod` is `ControlLeft` on Linux.
+    const MODIFIERS: [&'static str; 8] = [
+        "ShiftLeft",
+        "ShiftRight",
+        "ControlLeft",
+        "ControlRight",
+        "AltLeft",
+        "AltRight",
+        "MetaLeft",
+        "MetaRight",
+    ];
+
+    async fn release_modifiers(source: &ConsoleWorkerPool) {
+        let held = Self {
+            keys: Self::MODIFIERS.iter().map(ToString::to_string).collect(),
+            buttons: [false; 3],
+        };
+        held.release(source).await;
+    }
+
     async fn release(self, source: &ConsoleWorkerPool) {
         let releases = self.releases();
         if releases.is_empty() {
@@ -701,7 +725,7 @@ impl HeldInput {
         }
         tracing::info!(
             count = releases.len(),
-            "releasing input the viewer left pressed"
+            "physical-console: releasing held keys and buttons"
         );
         let mut source = source.clone();
         for input in releases {
