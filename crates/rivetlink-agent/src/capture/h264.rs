@@ -20,7 +20,7 @@ use openh264::encoder::{
     BitRate, Encoder, EncoderConfig, FrameRate, FrameType, RateControlMode, UsageType, VuiConfig,
 };
 use openh264::formats::YUVSlices;
-use openh264::OpenH264API;
+use openh264::{OpenH264API, Timestamp};
 use tokio::sync::mpsc::{error::TrySendError, Sender};
 
 use rivetlink_sdk::lan::{StreamFrame, VideoFrame};
@@ -41,6 +41,9 @@ const RAISE_AFTER: Duration = Duration::from_secs(10);
 /// Ignore further congestion this soon after lowering the bitrate: frames that
 /// were already in flight would otherwise push it straight to the minimum.
 const LOWER_HOLDOFF: Duration = Duration::from_secs(1);
+/// At most this many forced keyframes per second, however often viewers ask:
+/// an IDR costs far more CPU and bandwidth than a delta.
+const MIN_KEYFRAME_GAP: Duration = Duration::from_millis(500);
 
 /// Byte length of one tightly packed I420 frame.
 pub(crate) const fn i420_len(w: usize, h: usize) -> usize {
@@ -63,6 +66,9 @@ pub(crate) struct H264Encoder {
     last_sent: Instant,
     last_rate_change: Instant,
     last_congestion: Instant,
+    last_forced_keyframe: Option<Instant>,
+    /// Origin of the presentation timestamps rate control paces against.
+    started: Instant,
 }
 
 impl H264Encoder {
@@ -90,6 +96,8 @@ impl H264Encoder {
             last_sent: Instant::now(),
             last_rate_change: Instant::now(),
             last_congestion: Instant::now(),
+            last_forced_keyframe: None,
+            started: Instant::now(),
         })
     }
 
@@ -103,11 +111,12 @@ impl H264Encoder {
             return false;
         }
         // Consumer behind: skip encoding instead of dropping an encoded frame,
-        // so the decoder never misses a reference. Send it once there is room.
+        // so the decoder never misses a reference (no keyframe needed). Send
+        // it once there is room, at a lower bitrate.
         if tx.capacity() == 0 {
             self.last = Some(data);
             self.pending = true;
-            self.control.report_congestion();
+            self.control.congested.store(true, Ordering::Release);
             return true;
         }
         self.adapt();
@@ -120,7 +129,10 @@ impl H264Encoder {
                 return true;
             },
             Err(e) => {
-                tracing::debug!(error = %e, "h264: encode failed, skipping frame");
+                // Keep the frame so the next tick retries it, as a keyframe.
+                tracing::debug!(error = %e, "h264: encode failed, retrying");
+                self.last = Some(data);
+                self.pending = true;
                 self.control.request_keyframe();
                 return true;
             },
@@ -169,8 +181,12 @@ impl H264Encoder {
         {
             self.set_bitrate((self.bitrate / 4 * 5).min(MAX_BPS));
         }
-        if self.control.keyframe.swap(false, Ordering::AcqRel) {
+        let may_force = self
+            .last_forced_keyframe
+            .is_none_or(|at| at.elapsed() >= MIN_KEYFRAME_GAP);
+        if may_force && self.control.keyframe.swap(false, Ordering::AcqRel) {
             self.encoder.force_intra_frame();
+            self.last_forced_keyframe = Some(Instant::now());
         }
     }
 
@@ -197,9 +213,10 @@ impl H264Encoder {
         let (y, uv) = data.split_at(w * h);
         let (u, v) = uv.split_at((w / 2) * (h / 2));
         let yuv = YUVSlices::new((y, u, v), (w, h), (w, w / 2, w / 2));
+        let millis = u64::try_from(self.started.elapsed().as_millis()).unwrap_or(0);
         let bitstream = self
             .encoder
-            .encode(&yuv)
+            .encode_at(&yuv, Timestamp::from_millis(millis))
             .map_err(|e| AgentError::Lan(format!("h264 encode: {e}")))?;
         let keyframe = match bitstream.frame_type() {
             FrameType::IDR | FrameType::I => true,
@@ -294,13 +311,42 @@ mod tests {
         assert!(matches!(rx.try_recv().unwrap(), StreamFrame::Video(v) if v.keyframe));
         assert!(rx.try_recv().is_err());
 
-        // Room again: the held frame goes out on the next tick, as a keyframe
-        // (congestion asked for one) at a lower bitrate.
-        enc.last_rate_change -= LOWER_HOLDOFF;
+        // Room again: the held frame goes out on the next tick. Nothing was
+        // lost, so it is a cheap delta (the bitrate is still in hold-off).
         assert!(enc.heartbeat(&tx));
         assert!(!enc.pending);
-        assert!(matches!(rx.try_recv().unwrap(), StreamFrame::Video(v) if v.keyframe));
+        assert!(matches!(rx.try_recv().unwrap(), StreamFrame::Video(v) if !v.keyframe));
+        assert_eq!(enc.bitrate, MAX_BPS);
+
+        // Congested again after the hold-off: the bitrate steps down.
+        enc.last_rate_change -= LOWER_HOLDOFF;
+        assert!(enc.push(frame(20), &tx));
+        assert!(enc.push(frame(30), &tx));
+        rx.try_recv().unwrap();
+        assert!(enc.heartbeat(&tx));
+        assert!(rx.try_recv().is_ok());
         assert!(enc.bitrate < MAX_BPS);
+    }
+
+    #[test]
+    fn keyframe_requests_are_rate_limited() {
+        let control = Arc::new(VideoControl::default());
+        let mut enc = H264Encoder::new(W, H, 30, Arc::clone(&control)).unwrap();
+        let (tx, mut rx) = tokio::sync::mpsc::channel(4);
+        let mut keyframes = 0;
+        for i in 0..6 {
+            control.request_keyframe();
+            assert!(enc.push(frame(i * 10), &tx));
+            if matches!(rx.try_recv().unwrap(), StreamFrame::Video(v) if v.keyframe) {
+                keyframes += 1;
+            }
+        }
+        // Only the first frame (the stream's IDR); the rest wait out the gap.
+        assert_eq!(keyframes, 1);
+        // Once the gap has passed, the still-pending request is honoured.
+        enc.last_forced_keyframe = Some(Instant::now() - MIN_KEYFRAME_GAP);
+        assert!(enc.push(frame(60), &tx));
+        assert!(matches!(rx.try_recv().unwrap(), StreamFrame::Video(v) if v.keyframe));
     }
 
     #[test]

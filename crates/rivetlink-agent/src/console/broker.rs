@@ -308,6 +308,8 @@ pub struct ConsoleWorkerClient {
     desktop_frames: broadcast::Sender<StreamFrame>,
     desktop_ended: broadcast::Sender<WorkerErrorCode>,
     desktop_stream_active: Arc<std::sync::atomic::AtomicBool>,
+    /// A keyframe request is being written; further ones coalesce into it.
+    keyframe_in_flight: Arc<std::sync::atomic::AtomicBool>,
     clipboard_changes: broadcast::Sender<String>,
     closed: watch::Receiver<bool>,
     state: HostConsoleState,
@@ -328,6 +330,8 @@ pub struct ConsoleDesktopStream {
     awaiting_keyframe: bool,
     keyframe_requested: bool,
     lagged: bool,
+    /// Last keyframe request on the viewer's behalf (rate limit).
+    last_viewer_keyframe: Option<std::time::Instant>,
 }
 
 impl ConsoleWorkerClient {
@@ -391,6 +395,7 @@ impl ConsoleWorkerClient {
             desktop_frames,
             desktop_ended,
             desktop_stream_active: active,
+            keyframe_in_flight: Arc::new(std::sync::atomic::AtomicBool::new(false)),
             clipboard_changes,
             closed,
             state,
@@ -471,6 +476,7 @@ impl ConsoleWorkerClient {
                 awaiting_keyframe: true,
                 keyframe_requested: false,
                 lagged: false,
+                last_viewer_keyframe: None,
             }),
             Ok(WorkerResponse::Error { code }) => {
                 self.desktop_stream_active
@@ -494,9 +500,15 @@ impl ConsoleWorkerClient {
 
     /// Ask the worker's H.264 stream for a keyframe. Fire-and-forget on its
     /// own task: the worker sends no reply, and a write cancelled halfway (the
-    /// caller sits in a `select!`) would corrupt the IPC framing.
+    /// caller sits in a `select!`) would corrupt the IPC framing. Requests
+    /// made while one is still being written coalesce into it, so a flood
+    /// cannot pile up tasks or delay input on the shared writer.
     fn request_keyframe(&self, congested: bool) {
+        if self.keyframe_in_flight.swap(true, Ordering::AcqRel) {
+            return;
+        }
         let writer = Arc::clone(&self.writer);
+        let in_flight = Arc::clone(&self.keyframe_in_flight);
         tokio::spawn(async move {
             let mut writer = writer.lock().await;
             if let Err(error) =
@@ -504,6 +516,7 @@ impl ConsoleWorkerClient {
             {
                 tracing::debug!(error = %error, "console worker keyframe request failed");
             }
+            in_flight.store(false, Ordering::Release);
         });
     }
 
@@ -647,8 +660,16 @@ impl ConsoleDesktopStream {
                     Ok(frame) => return Ok(frame),
                     Err(broadcast::error::RecvError::Lagged(_)) => {
                         self.awaiting_keyframe = true;
-                        self.keyframe_requested = false;
-                        self.lagged = true;
+                        if self.video {
+                            // Lag is the console path's congestion signal.
+                            self.worker.request_keyframe(true);
+                            self.keyframe_requested = true;
+                        } else {
+                            // Not known to be video yet: ask on the first
+                            // delta, never a worker that streams tiles.
+                            self.keyframe_requested = false;
+                            self.lagged = true;
+                        }
                     },
                     Err(broadcast::error::RecvError::Closed) => return Err(AgentError::Relay("normal desktop stream closed".to_string())),
                 },
@@ -662,11 +683,19 @@ impl ConsoleDesktopStream {
     }
 
     /// The viewer could not decode a frame: get a keyframe. Ignored for tile
-    /// streams, whose (possibly older) worker would not know the request.
-    pub fn request_keyframe(&self) {
-        if self.video {
-            self.worker.request_keyframe(false);
+    /// streams, whose (possibly older) worker would not know the request, and
+    /// at most twice a second.
+    pub fn request_keyframe(&mut self) {
+        const MIN_GAP: Duration = Duration::from_millis(500);
+        if !self.video
+            || self
+                .last_viewer_keyframe
+                .is_some_and(|at| at.elapsed() < MIN_GAP)
+        {
+            return;
         }
+        self.last_viewer_keyframe = Some(std::time::Instant::now());
+        self.worker.request_keyframe(false);
     }
 
     pub async fn stop(self) -> AgentResult<()> {
