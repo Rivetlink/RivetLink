@@ -10,11 +10,12 @@ decides who connects**, never the server.
 >
 > | Host platform | Live view | Remote input |
 > | ------------- | --------- | ------------ |
-> | Linux (GNOME/Wayland, X11, GDM/LightDM console) | ✅ tile-delta JPEG stream | ✅ Mutter RemoteDesktop / XTest |
+> | Linux (GNOME/Wayland, X11, GDM/LightDM console) | ✅ H.264 (OpenH264) to WebCodecs viewers, tile-delta JPEG otherwise | ✅ Mutter RemoteDesktop / XTest |
 > | macOS | ✅ ScreenCaptureKit | ❌ not yet (CGEvent backend missing) |
 > | Windows | ❌ viewer only | ❌ |
 >
-> Not yet implemented: a real video codec, WebRTC/NAT traversal (the bundled
+> Not yet implemented: hardware video encoding (H.264 is software-encoded,
+> Linux hosts only), WebRTC/NAT traversal (the bundled
 > coturn is unused), and wiring the ML-KEM/ML-DSA primitives in
 > `rivetlink-crypto` into the session handshake (today it is X25519 + Ed25519).
 
