@@ -27,7 +27,7 @@ use zbus::blocking::{Connection, Proxy};
 use zbus::zvariant::{OwnedObjectPath, OwnedValue, Value};
 
 use rivetlink_protocol::HostConsoleState;
-use rivetlink_sdk::lan::{DisplayInfo, FrameDelta};
+use rivetlink_sdk::lan::{DisplayInfo, StreamFrame};
 
 use crate::error::{AgentError, AgentResult};
 
@@ -74,6 +74,14 @@ fn fit_output(src_w: u32, src_h: u32) -> (usize, usize) {
     }
     let even = |v: u32| (v & !1).max(2) as usize;
     (even(w), even(h))
+}
+
+/// GStreamer pads each I420 plane row to 4 bytes. A width that is a multiple of
+/// 8 keeps the planes tightly packed (chroma rows of `w / 2` bytes), so frames
+/// are exactly [`super::h264::i420_len`] bytes; otherwise the fixed-size reader
+/// would lose sync with the pipe.
+fn i420_width(w: usize) -> usize {
+    (w & !7).max(8)
 }
 
 // ---- Public API ------------------------------------------------------------
@@ -208,14 +216,22 @@ pub fn capture_console_png(timeout: Duration, state: HostConsoleState) -> AgentR
     }
 }
 
-/// Capture `display` (a monitor index, `None` = first/primary) and push delta
-/// frames to `tx` until the consumer drops or capture ends. Blocking.
-#[allow(clippy::needless_pass_by_value)]
+/// The per-stream encoder: tile deltas from BGRx, or H.264 from I420.
+enum StreamEncoder {
+    Tiles(super::screencast::TileEncoder),
+    H264(Box<super::h264::H264Encoder>),
+}
+
+/// Capture `display` (a monitor index, `None` = first/primary) and push frames
+/// to `tx` until the consumer drops or capture ends. Blocking. `video` selects
+/// H.264; if the encoder can't start, the stream falls back to tile deltas.
+#[allow(clippy::needless_pass_by_value, clippy::too_many_lines)]
 pub fn stream(
     fps: u16,
     quality: u8,
     display: Option<u32>,
-    tx: Sender<FrameDelta>,
+    video: Option<Arc<super::screencast::VideoControl>>,
+    tx: Sender<StreamFrame>,
 ) -> AgentResult<()> {
     let mons = monitors()?;
     if mons.is_empty() {
@@ -228,10 +244,25 @@ pub fn stream(
     let connector = mons[idx].connector.clone();
     // Output keeps the monitor's aspect ratio (capped at MAX_W×MAX_H) so an
     // ultrawide host doesn't get letterboxed into 16:9 and look low-res.
-    let (out_w, out_h) = fit_output(mons[idx].width, mons[idx].height);
+    let (fit_w, out_h) = fit_output(mons[idx].width, mons[idx].height);
+    let h264_w = i420_width(fit_w);
+    let mut enc =
+        match video.map(|control| super::h264::H264Encoder::new(h264_w, out_h, fps, control)) {
+            Some(Ok(h264)) => StreamEncoder::H264(Box::new(h264)),
+            Some(Err(e)) => {
+                tracing::warn!(error = %e, "screencast(linux): H.264 unavailable, streaming tiles");
+                StreamEncoder::Tiles(super::screencast::TileEncoder::new())
+            },
+            None => StreamEncoder::Tiles(super::screencast::TileEncoder::new()),
+        };
+    let (format, out_w, frame_bytes) = match enc {
+        StreamEncoder::H264(_) => ("I420", h264_w, super::h264::i420_len(h264_w, out_h)),
+        StreamEncoder::Tiles(_) => ("BGRx", fit_w, fit_w * out_h * 4),
+    };
     tracing::info!(
         connector = %connector,
         fps,
+        format,
         src = format!("{}x{}", mons[idx].width, mons[idx].height),
         out = format!("{out_w}x{out_h}"),
         "screencast(linux): starting Mutter ScreenCast"
@@ -244,8 +275,8 @@ pub fn stream(
         "screencast(linux): got PipeWire node"
     );
 
-    // 2. gst-launch pulls that node and writes fixed-size BGRx frames to stdout.
-    let mut child = spawn_gst(session.node_id, out_w, out_h)?;
+    // 2. gst-launch pulls that node and writes fixed-size raw frames to stdout.
+    let mut child = spawn_gst(session.node_id, out_w, out_h, format)?;
     let mut stdout = child
         .stdout
         .take()
@@ -255,7 +286,6 @@ pub fn stream(
     // faster than we encode, and screen capture is damage-driven — bursts then
     // quiet). The main loop ticks at the target rate, encoding the latest frame
     // or sending a heartbeat when the screen is idle.
-    let frame_bytes = out_w * out_h * 4;
     let latest: Arc<Mutex<Option<Vec<u8>>>> = Arc::new(Mutex::new(None));
     let alive = Arc::new(AtomicBool::new(true));
     let saw_frame = Arc::new(AtomicBool::new(false));
@@ -277,7 +307,6 @@ pub fn stream(
     });
 
     let interval = Duration::from_millis((1000 / u64::from(fps).max(1)).max(1));
-    let mut enc = super::screencast::TileEncoder::new();
     loop {
         if tx.is_closed() {
             break; // viewer disconnected
@@ -287,14 +316,14 @@ pub fn stream(
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner)
             .take();
-        let keep_going = match frame {
-            Some(buf) => enc.push(out_w, out_h, buf, quality, &tx),
-            None => {
-                if !alive.load(Ordering::Relaxed) {
-                    break; // capture ended (gst gone)
-                }
-                enc.heartbeat(&tx)
-            },
+        if frame.is_none() && !alive.load(Ordering::Relaxed) {
+            break; // capture ended (gst gone)
+        }
+        let keep_going = match (&mut enc, frame) {
+            (StreamEncoder::Tiles(tiles), Some(buf)) => tiles.push(out_w, out_h, buf, quality, &tx),
+            (StreamEncoder::Tiles(tiles), None) => tiles.heartbeat(&tx),
+            (StreamEncoder::H264(h264), Some(buf)) => h264.push(buf, &tx),
+            (StreamEncoder::H264(h264), None) => h264.heartbeat(&tx),
         };
         if !keep_going {
             break; // consumer gone
@@ -392,15 +421,22 @@ impl Drop for MutterSession {
 
 // ---- GStreamer subprocess --------------------------------------------------
 
-/// Spawn `gst-launch-1.0` pulling `node` into fixed-size BGRx frames on stdout.
-/// `-q` keeps gst's own chatter off stdout so only raw frame bytes flow.
+/// Spawn `gst-launch-1.0` pulling `node` into fixed-size raw frames on stdout,
+/// in `format` (`BGRx` for tiles, `I420` for H.264). `-q` keeps gst's own
+/// chatter off stdout so only raw frame bytes flow.
 ///
 /// No `videorate`: it withholds the first buffer until a second arrives (to time
 /// it), so on a static screen the client would never see the initial frame. We
 /// let `pipewiresrc` deliver at the monitor's damage-driven rate and throttle in
 /// [`stream`] instead.
-fn spawn_gst(node: u32, out_w: usize, out_h: usize) -> AgentResult<Child> {
-    let out_caps = format!("video/x-raw,format=BGRx,width={out_w},height={out_h}");
+fn spawn_gst(node: u32, out_w: usize, out_h: usize, format: &str) -> AgentResult<Child> {
+    // BT.709 for I420, matching the VUI the H.264 encoder writes.
+    let colorimetry = if format == "I420" {
+        ",colorimetry=bt709"
+    } else {
+        ""
+    };
+    let out_caps = format!("video/x-raw,format={format},width={out_w},height={out_h}{colorimetry}");
     let mut cmd = Command::new("gst-launch-1.0");
     cmd.args([
         "-q",
@@ -683,6 +719,16 @@ mod tests {
         // Dimensions are always even.
         let (w, h) = fit_output(3441, 1441);
         assert_eq!((w % 2, h % 2), (0, 0));
+    }
+
+    #[test]
+    fn i420_width_keeps_gstreamer_planes_unpadded() {
+        assert_eq!(i420_width(1920), 1920);
+        assert_eq!(i420_width(1366), 1360);
+        assert_eq!(i420_width(802), 800);
+        for w in [2, 1366, 1918, 3440] {
+            assert_eq!(i420_width(w) % 8, 0);
+        }
     }
 
     #[test]

@@ -50,7 +50,14 @@ pub const SERVICE_TYPE: &str = "_rivetlink._tcp.local.";
 /// v4 adds the physical-console request/response. It is deliberately a
 /// one-shot operation: every capture/input transaction follows the same
 /// authenticated direct handshake and sealed transport as the rest of LAN.
-pub const PROTOCOL_VERSION: u16 = 4;
+/// v5 adds video-codec negotiation: a client lists the decoders it has in
+/// `StartStream.codecs`, and a host that can encode one of them streams
+/// [`LanResponse::Video`] instead of tile deltas. Older peers keep tiles.
+pub const PROTOCOL_VERSION: u16 = 5;
+
+/// Codec name for H.264 (Annex-B byte stream, no B-frames) in
+/// `StartStream.codecs`.
+pub const CODEC_H264: &str = "h264";
 
 /// A direct-LAN peer must answer a signed key exchange promptly. Without a
 /// bound, a half-open or incompatible peer could leave a physical-console UI
@@ -424,6 +431,11 @@ pub enum LanRequest {
         /// announced key.
         #[serde(default)]
         identity_sig: Option<String>,
+        /// Video codecs the client can decode (e.g. [`CODEC_H264`]). Empty
+        /// from older clients, or when the client has no decoder: the host
+        /// then streams tile deltas.
+        #[serde(default, skip_serializing_if = "Vec::is_empty")]
+        codecs: Vec<String>,
     },
     /// Ask the host which displays it can share. The host replies with
     /// [`LanResponse::Displays`] (empty on Linux, where the portal owns
@@ -473,6 +485,10 @@ pub enum LanRequest {
     /// Download one file from the host's shared folder. The host answers with
     /// [`LanResponse::FileChunk`]s for `id` until `eof`.
     FileDownload { id: u32, path: String },
+    /// Ask for a fresh video keyframe, e.g. after a decode error. Send only
+    /// once the host streamed [`LanResponse::Video`]; older hosts do not know
+    /// this request.
+    RequestKeyframe,
 }
 
 /// A mouse button, for [`LanRequest::PointerButton`].
@@ -514,6 +530,24 @@ pub struct FrameDelta {
     pub tiles: Vec<TilePatch>,
 }
 
+/// One encoded video frame: an H.264 access unit (Annex-B, start codes
+/// included). A `keyframe` is an IDR frame with SPS/PPS, where a decoder can
+/// (re)start.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct VideoFrame {
+    pub w: u32,
+    pub h: u32,
+    pub keyframe: bool,
+    pub data_b64: String,
+}
+
+/// A live-stream frame in either encoding, as handed to a stream consumer.
+#[derive(Debug, Clone)]
+pub enum StreamFrame {
+    Tiles(FrameDelta),
+    Video(VideoFrame),
+}
+
 /// A host response.
 #[derive(Debug, Serialize, Deserialize)]
 #[serde(tag = "ok")]
@@ -522,6 +556,9 @@ pub enum LanResponse {
     Screenshot { png_b64: String },
     /// One live frame as changed tiles (dirty-rectangle delta encoding).
     Frame(FrameDelta),
+    /// One live frame as encoded video; sent only to a client that listed the
+    /// codec in `StartStream.codecs`.
+    Video(VideoFrame),
     /// The displays the host can share (reply to [`LanRequest::ListDisplays`]).
     /// `features` lists optional capabilities this client may use on this host
     /// (see [`crate::share`]); older hosts omit it.
@@ -818,8 +855,11 @@ pub async fn list_displays_and_features(
     }
 }
 
-/// Start a live screen stream and invoke `on_frame` with each delta frame.
+/// Start a live screen stream and invoke `on_frame` with each frame.
 ///
+/// `codecs` lists the video decoders the caller has (e.g. [`CODEC_H264`]); a
+/// host that can encode one streams [`StreamFrame::Video`], otherwise tile
+/// deltas arrive as [`StreamFrame::Tiles`].
 /// `display` selects the initial screen (`None` = host primary). Pushing a
 /// display id onto `switch_rx` switches the capture mid-stream (macOS only;
 /// the host ignores it on Linux). Returns when `on_frame` returns `false`
@@ -837,6 +877,7 @@ pub async fn stream_frames<F, D, E>(
     display: Option<u32>,
     name: Option<String>,
     identity: Option<&Identity>,
+    codecs: Vec<String>,
     mut switch_rx: tokio::sync::mpsc::Receiver<u32>,
     mut input_rx: tokio::sync::mpsc::Receiver<LanRequest>,
     mut on_frame: F,
@@ -844,7 +885,7 @@ pub async fn stream_frames<F, D, E>(
     mut on_share: E,
 ) -> SdkResult<()>
 where
-    F: FnMut(&FrameDelta) -> bool,
+    F: FnMut(StreamFrame) -> bool,
     D: FnMut(Vec<DisplayInfo>),
     E: FnMut(LanResponse),
 {
@@ -875,6 +916,7 @@ where
             name,
             identity_key,
             identity_sig,
+            codecs,
         },
     )
     .await?;
@@ -901,17 +943,9 @@ where
     let _writer_guard = AbortOnDrop(writer.abort_handle());
 
     loop {
-        match recv_response(&mut rd, &channel).await? {
-            LanResponse::Frame(delta) => {
-                if first {
-                    tracing::info!(w = delta.w, h = delta.h, "LAN stream: first frame received");
-                    first = false;
-                }
-                if !on_frame(&delta) {
-                    tracing::info!("LAN stream: stopped by viewer");
-                    return Ok(());
-                }
-            },
+        let frame = match recv_response(&mut rd, &channel).await? {
+            LanResponse::Frame(delta) => StreamFrame::Tiles(delta),
+            LanResponse::Video(video) => StreamFrame::Video(video),
             LanResponse::Error { message } => {
                 tracing::warn!(%message, "LAN stream: host sent error");
                 return Err(SdkError::Lan(message));
@@ -919,15 +953,30 @@ where
             // The host pushes a fresh display list mid-stream when it grants or
             // revokes "share all screens" — surface it so the viewer can show or
             // hide its screen picker live.
-            LanResponse::Displays { displays, .. } => on_displays(displays),
+            LanResponse::Displays { displays, .. } => {
+                on_displays(displays);
+                continue;
+            },
             // Clipboard and file-transfer traffic (only after EnableSharing).
             share @ (LanResponse::SharingEnabled { .. }
             | LanResponse::ClipboardText { .. }
             | LanResponse::FileUploaded { .. }
             | LanResponse::SharedFiles { .. }
             | LanResponse::FileChunk { .. }
-            | LanResponse::FileError { .. }) => on_share(share),
-            LanResponse::Screenshot { .. } | LanResponse::ConsoleCapture { .. } => {},
+            | LanResponse::FileError { .. }) => {
+                on_share(share);
+                continue;
+            },
+            LanResponse::Screenshot { .. } | LanResponse::ConsoleCapture { .. } => continue,
+        };
+        if first {
+            let video = matches!(frame, StreamFrame::Video(_));
+            tracing::info!(video, "LAN stream: first frame received");
+            first = false;
+        }
+        if !on_frame(frame) {
+            tracing::info!("LAN stream: stopped by viewer");
+            return Ok(());
         }
     }
 }

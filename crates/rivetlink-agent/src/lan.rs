@@ -83,16 +83,25 @@ fn arm_dead_peer_detection(stream: &TcpStream) {
 async fn send_frame<W: AsyncWrite + Unpin>(
     writer: &mut W,
     channel: &SealedChannel,
-    delta: lan::FrameDelta,
+    frame: lan::StreamFrame,
 ) -> bool {
+    let response = match frame {
+        lan::StreamFrame::Tiles(delta) => LanResponse::Frame(delta),
+        lan::StreamFrame::Video(video) => LanResponse::Video(video),
+    };
     matches!(
         tokio::time::timeout(
             FRAME_SEND_TIMEOUT,
-            lan::send_response(writer, channel, &LanResponse::Frame(delta)),
+            lan::send_response(writer, channel, &response),
         )
         .await,
         Ok(Ok(()))
     )
+}
+
+/// Whether a client's `StartStream.codecs` lets this host stream H.264.
+fn wants_h264(codecs: &[String]) -> bool {
+    codecs.iter().any(|c| c == lan::CODEC_H264)
 }
 
 /// A change in LAN host session state, for an embedding app to drive its UI.
@@ -333,7 +342,7 @@ async fn serve_physical_console_client(
                     .map_err(|error| AgentError::Lan(error.to_string()))?;
                 continue;
             },
-            LanRequest::StartStream { fps, .. } => {
+            LanRequest::StartStream { fps, codecs, .. } => {
                 return stream_authenticated_desktop(
                     stream,
                     Arc::new(channel),
@@ -341,6 +350,7 @@ async fn serve_physical_console_client(
                     trusted,
                     source,
                     fps,
+                    wants_h264(&codecs),
                 )
                 .await;
             },
@@ -474,7 +484,7 @@ async fn serve_console_capture_request(
 // One select loop owns the socket's write half: frames, input, clipboard and
 // file traffic all funnel through it, so splitting it would add shared-writer
 // plumbing without making the authorization checks easier to follow.
-#[allow(clippy::too_many_lines)]
+#[allow(clippy::too_many_lines, clippy::too_many_arguments)]
 #[cfg(target_os = "linux")]
 async fn stream_authenticated_desktop(
     stream: TcpStream,
@@ -483,6 +493,7 @@ async fn stream_authenticated_desktop(
     trusted: Arc<TrustedClients>,
     source: ConsoleWorkerPool,
     fps: u16,
+    h264: bool,
 ) -> AgentResult<()> {
     if !matches!(
         source.console_state().await,
@@ -499,7 +510,7 @@ async fn stream_authenticated_desktop(
         .await;
         return Ok(());
     }
-    let mut desktop = match source.start_desktop_stream(fps.clamp(1, 30)).await {
+    let mut desktop = match source.start_desktop_stream(fps.clamp(1, 30), h264).await {
         Ok(stream) => stream,
         Err(error) => {
             tracing::warn!(client = %client, error = %error, "normal desktop engine could not start");
@@ -520,6 +531,7 @@ async fn stream_authenticated_desktop(
         backend = "NormalDesktopEngine",
         state = "DesktopReady",
         fps = fps.clamp(1, 30),
+        h264,
         "physical-console handoff: normal desktop engine started"
     );
 
@@ -550,8 +562,8 @@ async fn stream_authenticated_desktop(
     let result = loop {
         tokio::select! {
             frame = desktop.next() => match frame {
-                Ok(delta) => {
-                    if !send_frame(&mut writer, &channel, delta).await {
+                Ok(frame) => {
+                    if !send_frame(&mut writer, &channel, frame).await {
                         tracing::info!(client = %client, "physical-console viewer stopped receiving frames");
                         break Ok(());
                     }
@@ -584,6 +596,7 @@ async fn stream_authenticated_desktop(
                 }
             },
             request = control_rx.recv() => match request {
+                Some(LanRequest::RequestKeyframe) => desktop.request_keyframe(),
                 Some(request) if is_share_request(&request) => {
                     let live = TrustedClients::load_or_empty(trusted.path())?;
                     let response = if live.may_control_unattended_console(&client) {
@@ -1202,6 +1215,7 @@ async fn serve_loop(
                 name,
                 identity_key,
                 identity_sig,
+                codecs,
             } => {
                 // Honour the requested screen only when sharing all screens is on;
                 // otherwise pin to the primary (`None`).
@@ -1255,8 +1269,11 @@ async fn serve_loop(
                         .await;
                 }
                 // The stream runs until the client disconnects or the host kicks.
-                let result =
-                    stream_screen(stream, channel, fps, display, kick, share_all, control).await;
+                let h264 = wants_h264(&codecs);
+                let result = stream_screen(
+                    stream, channel, fps, display, h264, kick, share_all, control,
+                )
+                .await;
                 if let Some(ev) = &events {
                     let _ = ev.send(HostEvent::ClientDisconnected).await;
                 }
@@ -1268,6 +1285,7 @@ async fn serve_loop(
             | LanRequest::PointerButton { .. }
             | LanRequest::Scroll { .. }
             | LanRequest::Key { .. }
+            | LanRequest::RequestKeyframe
             | LanRequest::ConsoleCapture { .. } => {},
             // This host never advertises sharing features, so a conforming
             // client does not send these; ignore them.
@@ -1407,14 +1425,16 @@ async fn stream_screen(
     channel: Arc<SealedChannel>,
     fps: u16,
     mut display: Option<u32>,
+    h264: bool,
     mut kick: Option<watch::Receiver<u64>>,
     mut share_all: Option<watch::Receiver<bool>>,
     control: Option<watch::Receiver<bool>>,
 ) -> AgentResult<()> {
-    use rivetlink_sdk::lan::FrameDelta;
+    use crate::capture::screencast::VideoControl;
+    use rivetlink_sdk::lan::StreamFrame;
 
     let scr = display; // reserved token in tracing fields — log a copy
-    tracing::info!(fps, screen = ?scr, "LAN stream: starting");
+    tracing::info!(fps, screen = ?scr, h264, "LAN stream: starting");
     let (mut rd, mut wr) = stream.into_split();
 
     // Read client control messages in a side task and forward them over a
@@ -1445,19 +1465,23 @@ async fn stream_screen(
     'session: loop {
         // Small bounded channel: the capture thread drops frames the network
         // can't keep up with, so we stream the freshest frame, not stale ones.
-        let (tx, mut rx) = tokio::sync::mpsc::channel::<FrameDelta>(2);
+        let (tx, mut rx) = tokio::sync::mpsc::channel::<StreamFrame>(2);
         let cap_display = display;
+        // A full queue makes the H.264 encoder skip frames and lower its
+        // bitrate; the control also carries the client's keyframe requests.
+        let video = h264.then(|| Arc::new(VideoControl::default()));
+        let cap_video = video.clone();
         let capture = tokio::task::spawn_blocking(move || {
             // 720p + moderate JPEG quality keeps the keyframe small enough to
             // stay usable over a weak Wi-Fi link; deltas after that are tiny.
-            crate::capture::screencast::stream_tiles_blocking(fps, 60, cap_display, tx)
+            crate::capture::screencast::stream_blocking(fps, 60, cap_display, cap_video, tx)
         });
 
         let switch_to: u32 = loop {
             tokio::select! {
                 frame = rx.recv() => match frame {
-                    Some(delta) => {
-                        if !send_frame(&mut wr, &channel, delta).await {
+                    Some(frame) => {
+                        if !send_frame(&mut wr, &channel, frame).await {
                             tracing::info!("LAN stream: client disconnected or stopped reading");
                             break 'session;
                         }
@@ -1520,6 +1544,11 @@ async fn stream_screen(
                             let _ = req; // no host input backend on this platform
                         }
                     },
+                    Some(LanRequest::RequestKeyframe) => {
+                        if let Some(video) = &video {
+                            video.request_keyframe();
+                        }
+                    },
                     // Ignore a stray Screenshot/StartStream sent mid-stream.
                     Some(_) => {},
                     None => {
@@ -1578,6 +1607,7 @@ async fn stream_screen(
     channel: Arc<SealedChannel>,
     _fps: u16,
     _display: Option<u32>,
+    _h264: bool,
     _kick: Option<watch::Receiver<u64>>,
     _share_all: Option<watch::Receiver<bool>>,
     _control: Option<watch::Receiver<bool>>,
@@ -1677,7 +1707,17 @@ mod tests {
             name: None,
             identity_key: None,
             identity_sig: None,
+            codecs: Vec::new(),
         })
         .is_none());
+        assert!(desktop_input(LanRequest::RequestKeyframe).is_none());
+    }
+
+    #[test]
+    fn only_a_client_listing_h264_gets_video() {
+        assert!(wants_h264(&[lan::CODEC_H264.to_string()]));
+        assert!(wants_h264(&["vp9".to_string(), "h264".to_string()]));
+        assert!(!wants_h264(&[]));
+        assert!(!wants_h264(&["H264 ".to_string()]));
     }
 }

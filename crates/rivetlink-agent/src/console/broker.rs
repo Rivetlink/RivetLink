@@ -23,7 +23,7 @@ use super::worker::{
 use crate::error::{AgentError, AgentResult};
 use crate::session::{ConsentPolicy, ConsoleInputSink, ConsoleStateProvider, ScreenshotCapturer};
 use rivetlink_protocol::{ConsoleInputPacket, HostConsoleState, MouseButton};
-use rivetlink_sdk::lan::{FrameDelta, PtrButton};
+use rivetlink_sdk::lan::{PtrButton, StreamFrame};
 
 /// Upper bound for a base64 PNG response (~9 MiB decoded), matching the
 /// unattended host's configured maximum without trusting worker input blindly.
@@ -288,8 +288,12 @@ impl ConsoleWorkerPool {
 
     /// Open the normal high-performance desktop engine only after the active
     /// graphical worker has reported `DesktopReady`.
-    pub async fn start_desktop_stream(&self, fps: u16) -> AgentResult<ConsoleDesktopStream> {
-        self.current().await?.start_desktop_stream(fps).await
+    pub async fn start_desktop_stream(
+        &self,
+        fps: u16,
+        h264: bool,
+    ) -> AgentResult<ConsoleDesktopStream> {
+        self.current().await?.start_desktop_stream(fps, h264).await
     }
 }
 
@@ -301,7 +305,7 @@ pub struct ConsoleWorkerClient {
     writer: Arc<Mutex<OwnedWriteHalf>>,
     responses: Arc<Mutex<mpsc::Receiver<WorkerResponse>>>,
     request_lock: Arc<Mutex<()>>,
-    desktop_frames: broadcast::Sender<FrameDelta>,
+    desktop_frames: broadcast::Sender<StreamFrame>,
     desktop_ended: broadcast::Sender<WorkerErrorCode>,
     desktop_stream_active: Arc<std::sync::atomic::AtomicBool>,
     clipboard_changes: broadcast::Sender<String>,
@@ -314,8 +318,16 @@ pub struct ConsoleWorkerClient {
 #[derive(Debug)]
 pub struct ConsoleDesktopStream {
     worker: ConsoleWorkerClient,
-    frames: broadcast::Receiver<FrameDelta>,
+    frames: broadcast::Receiver<StreamFrame>,
     ended: broadcast::Receiver<WorkerErrorCode>,
+    /// The worker streams H.264 (it sent a video frame), so it understands
+    /// keyframe requests.
+    video: bool,
+    /// Video deltas are useless until the next keyframe: at the start, and
+    /// after frames were lost to lag.
+    awaiting_keyframe: bool,
+    keyframe_requested: bool,
+    lagged: bool,
 }
 
 impl ConsoleWorkerClient {
@@ -345,7 +357,10 @@ impl ConsoleWorkerClient {
                     read_packet_with_limit(&mut reader, MAX_WORKER_RESPONSE).await;
                 match response {
                     Ok(WorkerResponse::DesktopFrame { delta }) => {
-                        let _ = reader_frames.send(delta);
+                        let _ = reader_frames.send(StreamFrame::Tiles(delta));
+                    },
+                    Ok(WorkerResponse::DesktopVideo { frame }) => {
+                        let _ = reader_frames.send(StreamFrame::Video(frame));
                     },
                     Ok(WorkerResponse::ClipboardChanged { text }) => {
                         let _ = reader_clipboard.send(text);
@@ -419,10 +434,15 @@ impl ConsoleWorkerClient {
         }
     }
 
-    /// Start the existing normal Mutter/PipeWire tile-delta engine in the
-    /// authenticated desktop worker. The socket remains local; only the
-    /// broker's already-authenticated network session receives these frames.
-    pub async fn start_desktop_stream(&self, fps: u16) -> AgentResult<ConsoleDesktopStream> {
+    /// Start the existing normal Mutter/PipeWire engine in the authenticated
+    /// desktop worker, as H.264 when `h264` (an older worker may still send
+    /// tiles). The socket remains local; only the broker's already-
+    /// authenticated network session receives these frames.
+    pub async fn start_desktop_stream(
+        &self,
+        fps: u16,
+        h264: bool,
+    ) -> AgentResult<ConsoleDesktopStream> {
         if self.state != HostConsoleState::DesktopReady {
             return Err(AgentError::Relay(
                 "normal desktop stream is unavailable before an authenticated desktop is ready"
@@ -440,13 +460,17 @@ impl ConsoleWorkerClient {
         let frames = self.desktop_frames.subscribe();
         let ended = self.desktop_ended.subscribe();
         match self
-            .request(WorkerRequest::StartDesktopStream { fps })
+            .request(WorkerRequest::StartDesktopStream { fps, h264 })
             .await
         {
             Ok(WorkerResponse::DesktopStreamStarted) => Ok(ConsoleDesktopStream {
                 worker: self.clone(),
                 frames,
                 ended,
+                video: false,
+                awaiting_keyframe: true,
+                keyframe_requested: false,
+                lagged: false,
             }),
             Ok(WorkerResponse::Error { code }) => {
                 self.desktop_stream_active
@@ -466,6 +490,21 @@ impl ConsoleWorkerClient {
                 Err(error)
             },
         }
+    }
+
+    /// Ask the worker's H.264 stream for a keyframe. Fire-and-forget on its
+    /// own task: the worker sends no reply, and a write cancelled halfway (the
+    /// caller sits in a `select!`) would corrupt the IPC framing.
+    fn request_keyframe(&self, congested: bool) {
+        let writer = Arc::clone(&self.writer);
+        tokio::spawn(async move {
+            let mut writer = writer.lock().await;
+            if let Err(error) =
+                write_packet(&mut *writer, &WorkerRequest::RequestKeyframe { congested }).await
+            {
+                tracing::debug!(error = %error, "console worker keyframe request failed");
+            }
+        });
     }
 
     async fn stop_desktop_stream(&self) -> AgentResult<()> {
@@ -582,13 +621,35 @@ impl ConsoleDesktopStream {
     }
 
     /// Return the freshest encoded desktop frame, or a non-sensitive terminal
-    /// error when the worker/session disappears.
-    pub async fn next(&mut self) -> AgentResult<FrameDelta> {
+    /// error when the worker/session disappears. Cancellation-safe.
+    ///
+    /// Tile frames may be dropped under lag (the next keyframe heals them).
+    /// Video frames may not: after a lag every delta is held back until the
+    /// worker, asked once, sends a keyframe.
+    pub async fn next(&mut self) -> AgentResult<StreamFrame> {
         loop {
             tokio::select! {
                 frame = self.frames.recv() => match frame {
+                    Ok(StreamFrame::Video(video)) => {
+                        self.video = true;
+                        if video.keyframe {
+                            self.awaiting_keyframe = false;
+                            self.keyframe_requested = false;
+                        } else if self.awaiting_keyframe {
+                            if !self.keyframe_requested {
+                                self.worker.request_keyframe(std::mem::take(&mut self.lagged));
+                                self.keyframe_requested = true;
+                            }
+                            continue;
+                        }
+                        return Ok(StreamFrame::Video(video));
+                    },
                     Ok(frame) => return Ok(frame),
-                    Err(broadcast::error::RecvError::Lagged(_)) => continue,
+                    Err(broadcast::error::RecvError::Lagged(_)) => {
+                        self.awaiting_keyframe = true;
+                        self.keyframe_requested = false;
+                        self.lagged = true;
+                    },
                     Err(broadcast::error::RecvError::Closed) => return Err(AgentError::Relay("normal desktop stream closed".to_string())),
                 },
                 ended = self.ended.recv() => match ended {
@@ -597,6 +658,14 @@ impl ConsoleDesktopStream {
                     Err(broadcast::error::RecvError::Closed) => return Err(AgentError::Relay("normal desktop stream closed".to_string())),
                 },
             }
+        }
+    }
+
+    /// The viewer could not decode a frame: get a keyframe. Ignored for tile
+    /// streams, whose (possibly older) worker would not know the request.
+    pub fn request_keyframe(&self) {
+        if self.video {
+            self.worker.request_keyframe(false);
         }
     }
 
@@ -771,5 +840,85 @@ mod tests {
         .await
         .unwrap();
         worker.await.unwrap();
+    }
+
+    fn video(keyframe: bool) -> WorkerResponse {
+        WorkerResponse::DesktopVideo {
+            frame: rivetlink_sdk::lan::VideoFrame {
+                w: 2,
+                h: 2,
+                keyframe,
+                data_b64: String::new(),
+            },
+        }
+    }
+
+    async fn next_request(stream: &mut UnixStream) -> WorkerRequest {
+        tokio::time::timeout(
+            Duration::from_secs(1),
+            read_packet_with_limit(stream, MAX_WORKER_RESPONSE),
+        )
+        .await
+        .unwrap()
+        .unwrap()
+    }
+
+    async fn next_frame(stream: &mut ConsoleDesktopStream) -> StreamFrame {
+        tokio::time::timeout(Duration::from_secs(1), stream.next())
+            .await
+            .unwrap()
+            .unwrap()
+    }
+
+    // A video delta is useless without the frame before it: the broker must
+    // hold deltas back until a keyframe, and ask the worker for one (marked
+    // congested when frames were lost to lag) instead of forwarding garbage.
+    #[tokio::test]
+    async fn video_deltas_wait_for_a_keyframe_after_start_and_after_lag() {
+        let (mut worker, broker_stream) = UnixStream::pair().unwrap();
+        write_packet(
+            &mut worker,
+            &WorkerResponse::Ready {
+                state: HostConsoleState::DesktopReady,
+            },
+        )
+        .await
+        .unwrap();
+        let client = ConsoleWorkerClient::from_stream(broker_stream)
+            .await
+            .unwrap();
+        let start = tokio::spawn(async move { client.start_desktop_stream(30, true).await });
+        assert!(matches!(
+            next_request(&mut worker).await,
+            WorkerRequest::StartDesktopStream { h264: true, .. }
+        ));
+        write_packet(&mut worker, &WorkerResponse::DesktopStreamStarted)
+            .await
+            .unwrap();
+        let mut stream = start.await.unwrap().unwrap();
+
+        // A delta before any keyframe is held back and triggers one request.
+        write_packet(&mut worker, &video(false)).await.unwrap();
+        write_packet(&mut worker, &video(false)).await.unwrap();
+        write_packet(&mut worker, &video(true)).await.unwrap();
+        assert!(matches!(next_frame(&mut stream).await, StreamFrame::Video(v) if v.keyframe));
+        assert!(matches!(
+            next_request(&mut worker).await,
+            WorkerRequest::RequestKeyframe { congested: false }
+        ));
+
+        // Overflow the fan-out queue: the broker lags, then waits again.
+        for _ in 0..8 {
+            write_packet(&mut worker, &video(false)).await.unwrap();
+        }
+        tokio::time::sleep(Duration::from_millis(100)).await;
+        write_packet(&mut worker, &video(true)).await.unwrap();
+        write_packet(&mut worker, &video(false)).await.unwrap();
+        assert!(matches!(next_frame(&mut stream).await, StreamFrame::Video(v) if v.keyframe));
+        assert!(matches!(next_frame(&mut stream).await, StreamFrame::Video(v) if !v.keyframe));
+        assert!(matches!(
+            next_request(&mut worker).await,
+            WorkerRequest::RequestKeyframe { congested: true }
+        ));
     }
 }
