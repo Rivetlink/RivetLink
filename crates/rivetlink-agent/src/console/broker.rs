@@ -131,6 +131,8 @@ impl ConsoleBrokerListener {
         ConsoleWorkerPool {
             receiver: Arc::new(Mutex::new(rx)),
             generation,
+            desktop_owner: Arc::new(watch::channel(0).0),
+            desktop_claim: Arc::new(Mutex::new(())),
         }
     }
 }
@@ -255,6 +257,34 @@ fn parse_greeter_session_uid(line: &str) -> Option<u32> {
 pub struct ConsoleWorkerPool {
     receiver: Arc<Mutex<watch::Receiver<Option<ConsoleWorkerClient>>>>,
     generation: Arc<AtomicU64>,
+    /// Bumped by every viewer that claims the desktop stream. The viewer
+    /// holding it watches for a newer claim and then ends its session.
+    desktop_owner: Arc<watch::Sender<u64>>,
+    /// Held for a whole claim, so check, takeover and start are one step and
+    /// a view-only device cannot slip in while a controller takes over.
+    desktop_claim: Arc<Mutex<()>>,
+}
+
+/// How long a viewer taking over waits for the previous one to stop.
+const TAKEOVER_WAIT: Duration = Duration::from_secs(5);
+
+/// A viewer's claim on the desktop stream, see
+/// [`ConsoleWorkerPool::claim_desktop_stream`].
+#[derive(Debug)]
+pub struct DesktopClaim {
+    id: u64,
+    owner: watch::Receiver<u64>,
+}
+
+impl DesktopClaim {
+    /// Resolves once another viewer has claimed the desktop stream.
+    pub async fn taken_over(&mut self) {
+        let id = self.id;
+        if self.owner.wait_for(|owner| *owner != id).await.is_err() {
+            // The pool is gone, so nobody can take over any more.
+            std::future::pending::<()>().await;
+        }
+    }
 }
 
 #[async_trait::async_trait]
@@ -286,14 +316,46 @@ impl ConsoleWorkerPool {
             .ok_or_else(|| AgentError::Relay("no active graphical console worker".to_string()))
     }
 
-    /// Open the normal high-performance desktop engine only after the active
-    /// graphical worker has reported `DesktopReady`.
-    pub async fn start_desktop_stream(
+    /// Open the normal high-performance desktop engine for a new viewer, only
+    /// after the active graphical worker has reported `DesktopReady`. When another viewer has it
+    /// and `take_over` is set, that viewer's [`DesktopClaim::taken_over`]
+    /// fires so its session stops the stream, which this waits for (bounded
+    /// by [`TAKEOVER_WAIT`]). Without `take_over` a busy stream is refused.
+    pub async fn claim_desktop_stream(
         &self,
         fps: u16,
         h264: bool,
-    ) -> AgentResult<ConsoleDesktopStream> {
-        self.current().await?.start_desktop_stream(fps, h264).await
+        take_over: bool,
+    ) -> AgentResult<(ConsoleDesktopStream, DesktopClaim)> {
+        let _claiming = self.desktop_claim.lock().await;
+        if !take_over && self.current().await?.desktop_stream_active() {
+            return Err(AgentError::Relay(
+                "normal desktop stream is already active".to_string(),
+            ));
+        }
+        let mut id = 0;
+        self.desktop_owner.send_modify(|owner| {
+            *owner += 1;
+            id = *owner;
+        });
+        let claim = DesktopClaim {
+            id,
+            owner: self.desktop_owner.subscribe(),
+        };
+        let deadline = tokio::time::Instant::now() + TAKEOVER_WAIT;
+        loop {
+            let worker = self.current().await?;
+            if !worker.desktop_stream_active() {
+                let stream = worker.start_desktop_stream(fps, h264).await?;
+                return Ok((stream, claim));
+            }
+            if tokio::time::Instant::now() >= deadline {
+                return Err(AgentError::Relay(
+                    "the previous viewer did not release the desktop stream".to_string(),
+                ));
+            }
+            tokio::time::sleep(Duration::from_millis(50)).await;
+        }
     }
 }
 
@@ -518,6 +580,11 @@ impl ConsoleWorkerClient {
             }
             in_flight.store(false, Ordering::Release);
         });
+    }
+
+    fn desktop_stream_active(&self) -> bool {
+        self.desktop_stream_active
+            .load(std::sync::atomic::Ordering::Acquire)
     }
 
     async fn stop_desktop_stream(&self) -> AgentResult<()> {
@@ -949,5 +1016,96 @@ mod tests {
             next_request(&mut worker).await,
             WorkerRequest::RequestKeyframe { congested: true }
         ));
+    }
+
+    // The owner's Windows PC must be able to take the desktop over from their
+    // MacBook: the first viewer is told to stop, and the second one starts
+    // only after the worker has released the first stream.
+    #[tokio::test]
+    async fn a_controlling_viewer_takes_the_desktop_stream_over() {
+        let (mut worker, broker_stream) = UnixStream::pair().unwrap();
+        write_packet(
+            &mut worker,
+            &WorkerResponse::Ready {
+                state: HostConsoleState::DesktopReady,
+            },
+        )
+        .await
+        .unwrap();
+        let client = ConsoleWorkerClient::from_stream(broker_stream)
+            .await
+            .unwrap();
+        let pool = ConsoleWorkerPool {
+            receiver: Arc::new(Mutex::new(watch::channel(Some(client)).1)),
+            generation: Arc::new(AtomicU64::new(0)),
+            desktop_owner: Arc::new(watch::channel(0).0),
+            desktop_claim: Arc::new(Mutex::new(())),
+        };
+        // Like the real worker: one stream at a time, and a stop is answered
+        // only when the test opens `stop_gate`.
+        let stop_gate = Arc::new(tokio::sync::Notify::new());
+        let fake_worker = tokio::spawn({
+            let stop_gate = Arc::clone(&stop_gate);
+            async move {
+                let mut streaming = false;
+                while let Ok(request) =
+                    read_packet_with_limit::<_, WorkerRequest>(&mut worker, MAX_WORKER_RESPONSE)
+                        .await
+                {
+                    let response = match request {
+                        WorkerRequest::StartDesktopStream { .. } if streaming => {
+                            WorkerResponse::Error {
+                                code: WorkerErrorCode::InvalidRequest,
+                            }
+                        },
+                        WorkerRequest::StartDesktopStream { .. } => {
+                            streaming = true;
+                            WorkerResponse::DesktopStreamStarted
+                        },
+                        WorkerRequest::StopDesktopStream => {
+                            stop_gate.notified().await;
+                            streaming = false;
+                            WorkerResponse::DesktopStreamStopped
+                        },
+                        _ => continue,
+                    };
+                    write_packet(&mut worker, &response).await.unwrap();
+                }
+            }
+        });
+
+        let (first, mut first_claim) = pool.claim_desktop_stream(30, true, true).await.unwrap();
+        // A view-only device cannot push the first viewer off.
+        assert!(pool.claim_desktop_stream(30, true, false).await.is_err());
+
+        let second = tokio::spawn({
+            let pool = pool.clone();
+            async move { pool.claim_desktop_stream(30, true, true).await }
+        });
+        tokio::time::timeout(Duration::from_secs(1), first_claim.taken_over())
+            .await
+            .unwrap();
+        let stopping = tokio::spawn(first.stop());
+        // The worker has not confirmed the stop yet: the stream stays taken.
+        tokio::time::sleep(Duration::from_millis(200)).await;
+        assert!(
+            !second.is_finished(),
+            "started before the first stream stopped"
+        );
+        stop_gate.notify_one();
+        stopping.await.unwrap().unwrap();
+        let (second, mut second_claim) = tokio::time::timeout(Duration::from_secs(1), second)
+            .await
+            .unwrap()
+            .unwrap()
+            .unwrap();
+        assert!(
+            tokio::time::timeout(Duration::from_millis(100), second_claim.taken_over())
+                .await
+                .is_err()
+        );
+        stop_gate.notify_one();
+        second.stop().await.unwrap();
+        fake_worker.abort();
     }
 }
