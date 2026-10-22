@@ -21,6 +21,10 @@ pub mod portal;
 #[cfg(target_os = "linux")]
 pub mod mutter;
 
+// H.264 encoding (OpenH264) for the Mutter capture, Linux only.
+#[cfg(target_os = "linux")]
+pub(crate) mod h264;
+
 // Native local X11 capture for an authenticated GDM/desktop session that is
 // actually running under Xorg.  It deliberately uses the session cookie and
 // has no disk-backed screenshot path.

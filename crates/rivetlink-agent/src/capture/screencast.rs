@@ -12,6 +12,8 @@
 //! backends via [`TileEncoder`]: each backend just decodes its native frame to a
 //! tightly-packed BGRA/BGRx buffer and pushes it in.
 
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use base64::engine::general_purpose::STANDARD as B64;
@@ -19,7 +21,7 @@ use base64::Engine;
 use jpeg_encoder::{ColorType, Encoder};
 use tokio::sync::mpsc::{error::TrySendError, Sender};
 
-use rivetlink_sdk::lan::{DisplayInfo, FrameDelta, TilePatch};
+use rivetlink_sdk::lan::{DisplayInfo, FrameDelta, StreamFrame, TilePatch};
 
 use crate::error::AgentResult;
 
@@ -54,30 +56,58 @@ pub fn list_displays() -> Vec<DisplayInfo> {
     }
 }
 
-/// Capture `display` continuously and push delta frames to `tx` until the
-/// receiver is dropped (client disconnected) or the stream ends. Blocking — run
-/// on a dedicated thread. `display` selects the screen (`None` = primary).
+/// Feedback from the network side to a running video encoder. Shared between
+/// the capture thread and whoever sends its frames.
+#[derive(Debug, Default)]
+pub struct VideoControl {
+    pub(crate) keyframe: AtomicBool,
+    pub(crate) congested: AtomicBool,
+}
+
+impl VideoControl {
+    /// The next frame must be a keyframe (a viewer lost or failed a frame).
+    pub fn request_keyframe(&self) {
+        self.keyframe.store(true, Ordering::Release);
+    }
+
+    /// Frames were lost because the link could not keep up: send a keyframe
+    /// and lower the bitrate.
+    pub fn report_congestion(&self) {
+        self.congested.store(true, Ordering::Release);
+        self.keyframe.store(true, Ordering::Release);
+    }
+}
+
+/// Capture `display` continuously and push frames to `tx` until the receiver
+/// is dropped (client disconnected) or the stream ends. Blocking — run on a
+/// dedicated thread. `display` selects the screen (`None` = primary).
+///
+/// `video` asks for H.264 instead of tile deltas (Linux hosts only; macOS
+/// ignores it and streams tiles). The control carries keyframe requests and
+/// congestion reports back to the encoder.
 ///
 /// `tx` is taken by value: dropping it on return closes the channel, signalling
 /// the consumer that the stream ended.
 #[allow(clippy::needless_pass_by_value)]
-pub fn stream_tiles_blocking(
+pub fn stream_blocking(
     fps: u16,
     quality: u8,
     display: Option<u32>,
-    tx: Sender<FrameDelta>,
+    video: Option<Arc<VideoControl>>,
+    tx: Sender<StreamFrame>,
 ) -> AgentResult<()> {
     #[cfg(target_os = "macos")]
     {
+        let _ = video;
         macos::stream(fps, quality, display, &tx)
     }
     #[cfg(target_os = "linux")]
     {
-        crate::capture::mutter::stream(fps, quality, display, tx)
+        crate::capture::mutter::stream(fps, quality, display, video, tx)
     }
     #[cfg(not(any(target_os = "macos", target_os = "linux")))]
     {
-        let _ = (fps, quality, display, tx);
+        let _ = (fps, quality, display, video, tx);
         Err(crate::error::AgentError::Lan(
             "live capture not supported on this platform".to_string(),
         ))
@@ -121,7 +151,7 @@ impl TileEncoder {
         h: usize,
         data: Vec<u8>,
         quality: u8,
-        tx: &Sender<FrameDelta>,
+        tx: &Sender<StreamFrame>,
     ) -> bool {
         if w == 0 || h == 0 || data.len() < w * h * 4 {
             return true; // skip a malformed frame, keep going
@@ -185,7 +215,7 @@ impl TileEncoder {
         // commit `prev` once a frame is queued: a dropped frame re-diffs against
         // the last *sent* state, so accumulated changes get resent instead of
         // silently desyncing the client.
-        match tx.try_send(delta) {
+        match tx.try_send(StreamFrame::Tiles(delta)) {
             Ok(()) => {
                 self.last_sent = Instant::now();
                 self.prev = Some((w, h, data));
@@ -209,7 +239,7 @@ impl TileEncoder {
     /// damage-driven, so a static screen produces no frames; the macOS scap loop
     /// blocks on `get_next_frame` and drives heartbeats from the capturer itself.
     #[cfg(target_os = "linux")]
-    pub(crate) fn heartbeat(&mut self, tx: &Sender<FrameDelta>) -> bool {
+    pub(crate) fn heartbeat(&mut self, tx: &Sender<StreamFrame>) -> bool {
         let Some((w, h, _)) = self.prev.as_ref() else {
             return true; // nothing to anchor a heartbeat to yet
         };
@@ -223,7 +253,7 @@ impl TileEncoder {
             keyframe: false,
             tiles: Vec::new(),
         };
-        match tx.try_send(delta) {
+        match tx.try_send(StreamFrame::Tiles(delta)) {
             Ok(()) => {
                 self.last_sent = Instant::now();
                 true
@@ -270,7 +300,7 @@ mod macos {
     use scap::frame::{Frame, FrameType};
     use tokio::sync::mpsc::Sender;
 
-    use rivetlink_sdk::lan::{DisplayInfo, FrameDelta};
+    use rivetlink_sdk::lan::{DisplayInfo, StreamFrame};
 
     use crate::error::{AgentError, AgentResult};
 
@@ -292,7 +322,7 @@ mod macos {
         fps: u16,
         quality: u8,
         display: Option<u32>,
-        tx: &Sender<FrameDelta>,
+        tx: &Sender<StreamFrame>,
     ) -> AgentResult<()> {
         let mut capturer = build_capturer(fps, display)?;
         capturer.start_capture();

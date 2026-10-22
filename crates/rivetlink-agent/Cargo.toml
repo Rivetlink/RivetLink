@@ -68,3 +68,6 @@ zbus = { version = "4", default-features = false, features = ["tokio"] }
 # worker.  This talks only to the Unix socket selected by DISPLAY and uses the
 # session's MIT-MAGIC-COOKIE; it never opens or listens on an X11 TCP socket.
 x11rb = { version = "0.13", features = ["xtest"] }
+# H.264 live-stream encoding. Compiled from bundled source (BSD-2-Clause), so it
+# needs no system codec package or GStreamer development headers.
+openh264 = "0.9"

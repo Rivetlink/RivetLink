@@ -7,7 +7,7 @@
 
 use base64::Engine;
 use rivetlink_protocol::HostConsoleState;
-use rivetlink_sdk::lan::{FrameDelta, PtrButton};
+use rivetlink_sdk::lan::{FrameDelta, PtrButton, StreamFrame, VideoFrame};
 use serde::{Deserialize, Serialize};
 use std::path::{Path, PathBuf};
 use std::time::Duration;
@@ -60,6 +60,17 @@ pub enum WorkerRequest {
     /// login worker remains a bounded PNG capture/input path.
     StartDesktopStream {
         fps: u16,
+        /// Encode H.264 instead of tile deltas. Older workers ignore it and
+        /// stream tiles, so the broker must accept either.
+        #[serde(default)]
+        h264: bool,
+    },
+    /// Make the running H.264 stream send a keyframe; `congested` also lowers
+    /// its bitrate. Sent only after the worker streamed video. Fire-and-forget:
+    /// the worker sends no response, so it can never be mistaken for the
+    /// answer to a concurrent request.
+    RequestKeyframe {
+        congested: bool,
     },
     /// Stop the desktop stream and release its Mutter/PipeWire resources.
     StopDesktopStream,
@@ -110,6 +121,11 @@ pub enum WorkerResponse {
     /// already-authorized LAN or relay client.
     DesktopFrame {
         delta: FrameDelta,
+    },
+    /// An H.264 frame from the normal desktop engine, same privacy rules as
+    /// [`WorkerResponse::DesktopFrame`].
+    DesktopVideo {
+        frame: VideoFrame,
     },
     DesktopStreamStopped,
     DesktopStreamEnded {
@@ -266,6 +282,7 @@ async fn serve_with_session(stream: UnixStream, session: GraphicalSession) -> Ag
     let mut clipboard_forwarder: Option<tokio::task::JoinHandle<()>> = None;
     let mut shared: Option<SharedFolder> = None;
     let mut desktop_stream: Option<tokio::task::JoinHandle<()>> = None;
+    let mut video_control: Option<std::sync::Arc<crate::capture::screencast::VideoControl>> = None;
     let desktop_stream_active = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
 
     loop {
@@ -273,7 +290,7 @@ async fn serve_with_session(stream: UnixStream, session: GraphicalSession) -> Ag
         let response = match request {
             WorkerRequest::Ping => WorkerResponse::Pong,
             WorkerRequest::Capture { timeout_ms } => capture(timeout_ms, &session).await,
-            WorkerRequest::StartDesktopStream { fps } => {
+            WorkerRequest::StartDesktopStream { fps, h264 } => {
                 if !supports_normal_desktop_stream(&session) {
                     WorkerResponse::Error {
                         code: WorkerErrorCode::ScreenCastUnavailable,
@@ -293,22 +310,26 @@ async fn serve_with_session(stream: UnixStream, session: GraphicalSession) -> Ag
                     let (frames_tx, mut frames_rx) = tokio::sync::mpsc::channel(2);
                     let active = std::sync::Arc::clone(&desktop_stream_active);
                     let stream_writer = std::sync::Arc::clone(&writer);
+                    video_control = h264.then(std::sync::Arc::default);
+                    let control = video_control.clone();
                     let handle = tokio::spawn(async move {
                         let capture = tokio::task::spawn_blocking(move || {
-                            crate::capture::screencast::stream_tiles_blocking(
+                            crate::capture::screencast::stream_blocking(
                                 fps.clamp(1, 30),
                                 60,
                                 None,
+                                control,
                                 frames_tx,
                             )
                         });
-                        while let Some(delta) = frames_rx.recv().await {
-                            if write_worker_response(
-                                &stream_writer,
-                                &WorkerResponse::DesktopFrame { delta },
-                            )
-                            .await
-                            .is_err()
+                        while let Some(frame) = frames_rx.recv().await {
+                            let response = match frame {
+                                StreamFrame::Tiles(delta) => WorkerResponse::DesktopFrame { delta },
+                                StreamFrame::Video(frame) => WorkerResponse::DesktopVideo { frame },
+                            };
+                            if write_worker_response(&stream_writer, &response)
+                                .await
+                                .is_err()
                             {
                                 break;
                             }
@@ -341,7 +362,18 @@ async fn serve_with_session(stream: UnixStream, session: GraphicalSession) -> Ag
                     handle.abort();
                 }
                 desktop_stream_active.store(false, std::sync::atomic::Ordering::Release);
+                video_control = None;
                 WorkerResponse::DesktopStreamStopped
+            },
+            WorkerRequest::RequestKeyframe { congested } => {
+                if let Some(control) = &video_control {
+                    if congested {
+                        control.report_congestion();
+                    } else {
+                        control.request_keyframe();
+                    }
+                }
+                continue;
             },
             WorkerRequest::Input { event } => apply_input(&session, &mut input, event),
             WorkerRequest::ClipboardEnable => {
