@@ -41,6 +41,8 @@ use crate::trusted::TrustedClients;
 
 #[cfg(target_os = "linux")]
 const LOGIN_SCREEN_AVAILABLE_MESSAGE: &str = "physical-console login screen is available";
+#[cfg(target_os = "linux")]
+const TAKEN_OVER_MESSAGE: &str = "another device took over this desktop";
 const MAX_LAN_SESSIONS: usize = 32;
 #[cfg(target_os = "linux")]
 const MAX_PHYSICAL_CONSOLE_SESSIONS: usize = 16;
@@ -510,8 +512,15 @@ async fn stream_authenticated_desktop(
         .await;
         return Ok(());
     }
-    let mut desktop = match source.start_desktop_stream(fps.clamp(1, 30), h264).await {
-        Ok(stream) => stream,
+    // A device that may control the console takes the stream over from a
+    // viewer already on it; a view-only device cannot push that viewer off.
+    let take_over = TrustedClients::load_or_empty(trusted.path())
+        .is_ok_and(|live| live.may_control_unattended_console(&client));
+    let (mut desktop, mut claim) = match source
+        .claim_desktop_stream(fps.clamp(1, 30), h264, take_over)
+        .await
+    {
+        Ok(claimed) => claimed,
         Err(error) => {
             tracing::warn!(client = %client, error = %error, "normal desktop engine could not start");
             let mut stream = stream;
@@ -559,11 +568,24 @@ async fn stream_authenticated_desktop(
     // on disconnect) would otherwise survive until the worker restarts.
     HeldInput::release_modifiers(&source).await;
 
+    // Set when another device took over and the socket is still intact, so
+    // this viewer can be told why it was dropped once the stream is released.
+    let mut tell_taken_over = false;
     let result = loop {
         tokio::select! {
+            () = claim.taken_over() => {
+                tell_taken_over = true;
+                break Ok(());
+            },
             frame = desktop.next() => match frame {
                 Ok(frame) => {
-                    if !send_frame(&mut writer, &channel, frame).await {
+                    // A stalled viewer (asleep, off Wi-Fi) must not keep the
+                    // device taking over waiting for the frame send timeout.
+                    let sent = tokio::select! {
+                        sent = send_frame(&mut writer, &channel, frame) => sent,
+                        () = claim.taken_over() => break Ok(()),
+                    };
+                    if !sent {
                         tracing::info!(client = %client, "physical-console viewer stopped receiving frames");
                         break Ok(());
                     }
@@ -598,7 +620,11 @@ async fn stream_authenticated_desktop(
             request = control_rx.recv() => match request {
                 Some(LanRequest::RequestKeyframe) => desktop.request_keyframe(),
                 Some(request) if is_share_request(&request) => {
-                    let live = TrustedClients::load_or_empty(trusted.path())?;
+                    // Not `?`: the stream must still be stopped below.
+                    let live = match TrustedClients::load_or_empty(trusted.path()) {
+                        Ok(live) => live,
+                        Err(error) => break Err(error),
+                    };
                     let response = if live.may_control_unattended_console(&client) {
                         handle_share_request(
                             request,
@@ -621,7 +647,10 @@ async fn stream_authenticated_desktop(
                 },
                 Some(request) => {
                     if let Some(input) = desktop_input(request) {
-                        let live = TrustedClients::load_or_empty(trusted.path())?;
+                        let live = match TrustedClients::load_or_empty(trusted.path()) {
+                            Ok(live) => live,
+                            Err(error) => break Err(error),
+                        };
                         if !live.may_control_unattended_console(&client) {
                             let _ = lan::send_response(&mut writer, &channel, &LanResponse::Error {
                                 message: "this trusted device is not authorized for remote input".to_string(),
@@ -649,6 +678,20 @@ async fn stream_authenticated_desktop(
     held.release(&source).await;
     let _ = desktop.stop().await;
     tracing::info!(client = %client, "physical-console handoff: normal desktop engine stopped");
+    if tell_taken_over {
+        tracing::info!(client = %client, "physical-console viewer taken over by another device");
+        let _ = tokio::time::timeout(
+            Duration::from_secs(1),
+            lan::send_response(
+                &mut writer,
+                &channel,
+                &LanResponse::Error {
+                    message: TAKEN_OVER_MESSAGE.to_string(),
+                },
+            ),
+        )
+        .await;
+    }
     result
 }
 
