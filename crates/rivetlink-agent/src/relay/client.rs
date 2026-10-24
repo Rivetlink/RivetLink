@@ -10,8 +10,11 @@ use base64::Engine;
 use ed25519_dalek::{Signer, SigningKey};
 use futures_util::{SinkExt, StreamExt};
 use serde::{Deserialize, Serialize};
+use std::collections::BTreeMap;
 use std::time::Duration;
+use tokio::io::{AsyncReadExt, AsyncWriteExt, DuplexStream};
 use tokio::net::TcpStream;
+use tokio::sync::mpsc;
 use tokio_tungstenite::{tungstenite::Message, MaybeTlsStream, WebSocketStream};
 use uuid::Uuid;
 
@@ -315,16 +318,135 @@ impl RelayClient {
             }
         }
     }
+
+    /// Like [`Self::run_host`], but also serves relay tunnels (protocol v3).
+    ///
+    /// Each accepted tunnel becomes a local byte stream handed to `serve`,
+    /// which runs the direct-LAN protocol on it; the relay only carries the
+    /// frames. Legacy packets still go to `handler`. Returning (relay gone or
+    /// error) drops every running tunnel.
+    #[allow(clippy::cognitive_complexity, clippy::too_many_lines)]
+    pub async fn run_host_tunnels<H, F, Fut>(
+        self,
+        handler: &mut H,
+        max_tunnels: usize,
+        serve: F,
+    ) -> AgentResult<()>
+    where
+        H: HostHandler,
+        F: Fn(DuplexStream) -> Fut,
+        Fut: std::future::Future<Output = ()> + Send + 'static,
+    {
+        use rivetlink_core::{SessionId, SessionRole};
+        use rivetlink_protocol::{SignalPacket, RELAY_TUNNEL_VERSION};
+
+        let mut interval = tokio::time::interval(self.heartbeat_interval);
+        interval.tick().await; // discard immediate tick
+        let (out_tx, mut out_rx) = mpsc::channel::<Message>(256);
+        let mut inbound: BTreeMap<Uuid, mpsc::Sender<Vec<u8>>> = BTreeMap::new();
+        let mut tunnels = tokio::task::JoinSet::new();
+
+        // Writing runs on its own task. The read loop below may wait on a
+        // slow tunnel, and that tunnel may itself wait for the link to drain
+        // its output; one task doing both would deadlock.
+        let (mut sink, mut incoming) = self.stream.split();
+        let mut writer = tokio::task::JoinSet::new();
+        writer.spawn(async move {
+            while let Some(message) = out_rx.recv().await {
+                if sink.send(message).await.is_err() {
+                    return;
+                }
+            }
+        });
+
+        loop {
+            let reply: Vec<String> = tokio::select! {
+                msg = incoming.next() => match msg {
+                    Some(Ok(Message::Binary(frame))) => {
+                        let Some((sid, payload)) = split_tunnel_frame(&frame) else { continue };
+                        let Some(tx) = inbound.get(&sid) else { continue };
+                        // Waiting here slows the whole relay link down to the
+                        // slowest tunnel; one that stays stuck is dropped.
+                        if tx.send_timeout(payload.to_vec(), TUNNEL_SEND_TIMEOUT).await.is_err() {
+                            tracing::warn!(session = %sid, "relay tunnel stuck; closing it");
+                            inbound.remove(&sid);
+                        }
+                        continue;
+                    },
+                    Some(Ok(Message::Text(text))) => {
+                        match serde_json::from_str::<SignalPacket>(&text) {
+                            Ok(SignalPacket::SessionRequest {
+                                protocol_version: RELAY_TUNNEL_VERSION,
+                                session_id: Some(sid),
+                                ..
+                            }) => {
+                                // Counts running tasks: a tunnel dropped from
+                                // `inbound` still runs until it notices.
+                                let packet = if tunnels.len() >= max_tunnels {
+                                    SignalPacket::SessionRejected { session_id: sid, reason: "host busy".to_string() }
+                                } else {
+                                    let (host_end, pump_end) = tokio::io::duplex(TUNNEL_BUFFER);
+                                    let (tx, rx) = mpsc::channel(64);
+                                    inbound.insert(sid.0, tx);
+                                    let session = serve(host_end);
+                                    let pump = tunnel_pump(pump_end, sid.0, rx, out_tx.clone());
+                                    tunnels.spawn(async move {
+                                        tokio::join!(session, pump);
+                                        sid.0
+                                    });
+                                    tracing::info!(session = %sid, "relay tunnel accepted");
+                                    SignalPacket::SessionAccepted { session_id: sid, role: SessionRole::Controller }
+                                };
+                                vec![serde_json::to_string(&packet)?]
+                            },
+                            Ok(SignalPacket::SessionClosed { session_id: SessionId(sid) })
+                                if inbound.contains_key(&sid) =>
+                            {
+                                // Closing the inbound side ends the session task.
+                                inbound.remove(&sid);
+                                continue;
+                            },
+                            Ok(packet) => handler.handle(packet).await?,
+                            Err(_) => {
+                                tracing::trace!("ignored non-signal frame");
+                                continue;
+                            },
+                        }
+                    },
+                    Some(Ok(Message::Close(_))) | None => {
+                        tracing::info!("relay closed connection");
+                        return Ok(());
+                    },
+                    Some(Ok(_)) => continue,
+                    Some(Err(e)) => return Err(AgentError::WebSocket(e.to_string())),
+                },
+                _ = writer.join_next() => {
+                    return Err(AgentError::WebSocket("relay link write failed".to_string()));
+                },
+                Some(ended) = tunnels.join_next(), if !tunnels.is_empty() => {
+                    if let Ok(sid) = ended {
+                        inbound.remove(&sid);
+                        tracing::info!(session = %sid, "relay tunnel ended");
+                    }
+                    continue;
+                },
+                _ = interval.tick() => vec![serde_json::json!({"type": "HEARTBEAT"}).to_string()],
+            };
+            for frame in reply {
+                if out_tx.send(Message::Text(frame)).await.is_err() {
+                    return Err(AgentError::WebSocket("relay link closed".to_string()));
+                }
+            }
+        }
+    }
 }
 
 fn ensure_secure_relay_url(url: &str) -> AgentResult<()> {
-    if url.starts_with("wss://") {
-        Ok(())
-    } else {
-        Err(AgentError::Config(
+    rivetlink_sdk::relay_tunnel::require_secure_ws(url).map_err(|_| {
+        AgentError::Config(
             "relay_url must use wss://; plaintext relay WebSockets are unsafe".to_string(),
-        ))
-    }
+        )
+    })
 }
 
 fn device_challenge_binding(device_id: Uuid, nonce: &[u8; 32]) -> Vec<u8> {
@@ -335,6 +457,63 @@ fn device_challenge_binding(device_id: Uuid, nonce: &[u8; 32]) -> Vec<u8> {
     binding.extend_from_slice(device_id.as_bytes());
     binding.extend_from_slice(nonce);
     binding
+}
+
+/// Bytes buffered between a tunnel's session task and the relay link.
+const TUNNEL_BUFFER: usize = 256 * 1024;
+/// How long one tunnel may hold up the relay link before it is dropped.
+const TUNNEL_SEND_TIMEOUT: Duration = Duration::from_secs(10);
+
+/// `[16-byte session id][payload]` → (session id, payload).
+fn split_tunnel_frame(frame: &[u8]) -> Option<(Uuid, &[u8])> {
+    if frame.len() <= 16 {
+        return None;
+    }
+    let (sid, payload) = frame.split_at(16);
+    Some((Uuid::from_slice(sid).ok()?, payload))
+}
+
+/// Move one tunnel's bytes between its local stream and the relay link.
+/// When the host side ends the session, the relay is told so.
+async fn tunnel_pump(
+    stream: DuplexStream,
+    session_id: Uuid,
+    mut inbound: mpsc::Receiver<Vec<u8>>,
+    out: mpsc::Sender<Message>,
+) {
+    let (mut reader, mut writer) = tokio::io::split(stream);
+    let upstream = async {
+        let mut buf = vec![0u8; rivetlink_protocol::MAX_TUNNEL_PAYLOAD];
+        loop {
+            match reader.read(&mut buf).await {
+                Ok(0) | Err(_) => return,
+                Ok(n) => {
+                    let frame = [session_id.as_bytes().as_slice(), &buf[..n]].concat();
+                    if out.send(Message::Binary(frame)).await.is_err() {
+                        return;
+                    }
+                },
+            }
+        }
+    };
+    let downstream = async {
+        while let Some(payload) = inbound.recv().await {
+            if writer.write_all(&payload).await.is_err() {
+                return;
+            }
+        }
+    };
+    tokio::select! {
+        () = upstream => {},
+        () = downstream => {},
+    }
+    // Whichever side ended it, the relay and the viewer must hear of it.
+    let closed = rivetlink_protocol::SignalPacket::SessionClosed {
+        session_id: rivetlink_core::SessionId(session_id),
+    };
+    if let Ok(text) = serde_json::to_string(&closed) {
+        let _ = out.send(Message::Text(text)).await;
+    }
 }
 
 /// Handles inbound signaling packets for a host, producing outbound frames.

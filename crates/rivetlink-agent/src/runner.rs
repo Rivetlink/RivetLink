@@ -629,7 +629,32 @@ async fn run_relay_physical_console(
                     .with_capturer(Box::new(source.clone()))
                     .with_console_input_sink(Box::new(source.clone()))
                     .with_console_state_provider(Box::new(source.clone()));
-                if let Err(error) = client.run_host(&mut host).await {
+                // Relay tunnels run the same authenticated direct-LAN session
+                // as the LAN listener: same trust check, console and desktop.
+                let tunnel_trust = std::sync::Arc::new(trusted.clone());
+                let serve = |stream| {
+                    let signing_key = signing_key.clone();
+                    let trusted = std::sync::Arc::clone(&tunnel_trust);
+                    let limits = cfg.unattended_console.clone();
+                    let source = source.clone();
+                    async move {
+                        if let Err(error) = crate::lan::serve_physical_console_client(
+                            stream,
+                            signing_key,
+                            trusted,
+                            limits,
+                            source,
+                        )
+                        .await
+                        {
+                            tracing::info!(error = %error, "physical-console relay tunnel closed");
+                        }
+                    }
+                };
+                if let Err(error) = client
+                    .run_host_tunnels(&mut host, crate::lan::MAX_PHYSICAL_CONSOLE_SESSIONS, serve)
+                    .await
+                {
                     tracing::warn!(error = %error, "physical-console relay session ended; reconnecting");
                 }
             },

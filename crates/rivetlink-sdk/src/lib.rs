@@ -17,6 +17,7 @@ pub mod error;
 pub mod identity;
 pub mod lan;
 pub mod pq_pins;
+pub mod relay_tunnel;
 pub mod rest;
 pub mod session;
 pub mod share;
@@ -33,4 +34,5 @@ pub use rest::Device;
 // Re-export the wire vocabulary integrators may need without depending on the
 // lower-level crates directly.
 pub use rivetlink_core::{ConnectionMode, DeviceId, SessionId, SessionRole};
+pub use rivetlink_crypto::sealed::SealedChannel;
 pub use rivetlink_protocol::{InputPacket, SignalPacket};

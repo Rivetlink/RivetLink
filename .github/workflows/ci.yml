@@ -94,3 +94,4 @@ jobs:
         with:
           key: integration
       - run: cargo test -p rivetlink-server --test integration --no-fail-fast
+      - run: cargo test -p rivetlink-agent --test relay_tunnel --no-fail-fast

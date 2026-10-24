@@ -38,6 +38,12 @@ socket2 = { version = "0.6", features = ["all"] }
 # Live-stream frames are JPEG tile-deltas on both host platforms, so this is general.
 jpeg-encoder = "0.6"
 
+[dev-dependencies]
+# End-to-end relay tunnel test (tests/relay_tunnel.rs) runs the real relay.
+rivetlink-server = { path = "../rivetlink-server" }
+sqlx = { workspace = true }
+axum = { workspace = true }
+
 [lints]
 workspace = true
 

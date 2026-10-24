@@ -14,6 +14,8 @@ use base64::engine::general_purpose::STANDARD as B64;
 use base64::Engine;
 use ed25519_dalek::SigningKey;
 use socket2::{SockRef, TcpKeepalive};
+#[cfg(target_os = "linux")]
+use tokio::io::AsyncRead;
 use tokio::io::AsyncWrite;
 use tokio::net::{TcpListener, TcpStream};
 use tokio::sync::mpsc::Sender;
@@ -45,7 +47,7 @@ const LOGIN_SCREEN_AVAILABLE_MESSAGE: &str = "physical-console login screen is a
 const TAKEN_OVER_MESSAGE: &str = "another device took over this desktop";
 const MAX_LAN_SESSIONS: usize = 32;
 #[cfg(target_os = "linux")]
-const MAX_PHYSICAL_CONSOLE_SESSIONS: usize = 16;
+pub(crate) const MAX_PHYSICAL_CONSOLE_SESSIONS: usize = 16;
 #[cfg(target_os = "linux")]
 const PHYSICAL_CONSOLE_HANDSHAKE_TIMEOUT: Duration = Duration::from_secs(10);
 
@@ -279,13 +281,16 @@ fn is_lan_health_probe_disconnect(error: &AgentError) -> bool {
 // the trust-before-input ordering that is security-critical here.
 #[allow(clippy::too_many_lines)]
 #[cfg(target_os = "linux")]
-async fn serve_physical_console_client(
-    mut stream: TcpStream,
+pub(crate) async fn serve_physical_console_client<S>(
+    mut stream: S,
     signing_key: SigningKey,
     trusted: Arc<TrustedClients>,
     limits: UnattendedConsoleConfig,
     source: ConsoleWorkerPool,
-) -> AgentResult<()> {
+) -> AgentResult<()>
+where
+    S: AsyncRead + AsyncWrite + Unpin + Send + 'static,
+{
     let identity = Identity::from_signing_key(signing_key);
     let (channel, client) = tokio::time::timeout(
         PHYSICAL_CONSOLE_HANDSHAKE_TIMEOUT,
@@ -393,8 +398,8 @@ async fn serve_physical_console_client(
 
 #[cfg(target_os = "linux")]
 #[allow(clippy::too_many_arguments)]
-async fn serve_console_capture_request(
-    stream: &mut TcpStream,
+async fn serve_console_capture_request<S: AsyncRead + AsyncWrite + Unpin>(
+    stream: &mut S,
     channel: &rivetlink_crypto::sealed::SealedChannel,
     client: &str,
     trusted: &Arc<TrustedClients>,
@@ -494,15 +499,18 @@ async fn serve_console_capture_request(
 // plumbing without making the authorization checks easier to follow.
 #[allow(clippy::too_many_lines, clippy::too_many_arguments)]
 #[cfg(target_os = "linux")]
-async fn stream_authenticated_desktop(
-    stream: TcpStream,
+async fn stream_authenticated_desktop<S>(
+    stream: S,
     channel: Arc<SealedChannel>,
     client: String,
     trusted: Arc<TrustedClients>,
     source: ConsoleWorkerPool,
     fps: u16,
     h264: bool,
-) -> AgentResult<()> {
+) -> AgentResult<()>
+where
+    S: AsyncRead + AsyncWrite + Unpin + Send + 'static,
+{
     if !matches!(
         source.console_state().await,
         Some((HostConsoleState::DesktopReady, _))
@@ -550,7 +558,7 @@ async fn stream_authenticated_desktop(
         "physical-console handoff: normal desktop engine started"
     );
 
-    let (mut reader, mut writer) = stream.into_split();
+    let (mut reader, mut writer) = tokio::io::split(stream);
     let (control_tx, mut control_rx) = tokio::sync::mpsc::channel::<LanRequest>(64);
     let reader_channel = Arc::clone(&channel);
     let reader_task = tokio::spawn(async move {
