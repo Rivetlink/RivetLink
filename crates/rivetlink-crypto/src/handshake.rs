@@ -12,10 +12,16 @@
 //!    (already-trusted) identity key
 //! 3. call [`LocalKeyExchange::into_channel`] with the peer's ephemeral key to
 //!    derive the shared [`SealedChannel`]
+//!
+//! A hybrid post-quantum exchange adds an ML-KEM-768 secret; see
+//! [`hybrid_secret`].
 
 use ed25519_dalek::{Signature, Signer, SigningKey, Verifier, VerifyingKey};
 use x25519_dalek::PublicKey as X25519Public;
 
+use zeroize::Zeroizing;
+
+use crate::pq_kem::PqSharedSecret;
 use crate::sealed::{ChannelRole, SealedChannel};
 use crate::session_keys::SessionKeyPair;
 use crate::{CryptoError, CryptoResult};
@@ -65,15 +71,26 @@ impl LocalKeyExchange {
 
     /// Consume this exchange and derive a directional [`SealedChannel`] using
     /// the peer's ephemeral public key and the final canonical transcript.
+    /// With `pq`, the channel key also depends on that ML-KEM secret, so it
+    /// stays secret unless both x25519 and ML-KEM are broken. The transcript
+    /// must then include the ML-KEM encapsulation key and ciphertext.
     pub fn into_channel(
         self,
         peer_ephemeral: &[u8; 32],
+        pq: Option<&PqSharedSecret>,
         transcript: &[u8],
         role: ChannelRole,
     ) -> CryptoResult<SealedChannel> {
         let peer_public = X25519Public::from(*peer_ephemeral);
         let shared = self.keypair.derive_shared_secret(&peer_public);
-        SealedChannel::from_handshake_secret(shared.as_bytes(), transcript, role)
+        match pq {
+            Some(pq) => SealedChannel::from_handshake_secret(
+                hybrid_secret(pq, shared.as_bytes()).as_slice(),
+                transcript,
+                role,
+            ),
+            None => SealedChannel::from_handshake_secret(shared.as_bytes(), transcript, role),
+        }
     }
 }
 
@@ -89,6 +106,18 @@ pub fn verify_peer(
     peer_identity
         .verify(&signature_message(binding, peer_ephemeral), &sig)
         .map_err(|_| CryptoError::InvalidSignature)
+}
+
+/// The hybrid input keying material: `ss_mlkem || ss_classical`, the
+/// concatenation combiner of the TLS hybrid design (X25519MLKEM768 order).
+/// [`SealedChannel::from_handshake_secret`] then runs HKDF over it with the
+/// transcript hash (which covers both public values and the ciphertext) as
+/// salt.
+pub fn hybrid_secret(pq: &PqSharedSecret, classical: &[u8; 32]) -> Zeroizing<[u8; 64]> {
+    let mut ikm = Zeroizing::new([0u8; 64]);
+    ikm[..32].copy_from_slice(pq.as_bytes());
+    ikm[32..].copy_from_slice(classical);
+    ikm
 }
 
 fn signature_message(binding: &[u8], ephemeral: &[u8; 32]) -> Vec<u8> {
@@ -143,14 +172,47 @@ mod tests {
         let host_eph = *host.ephemeral_public();
 
         let client_ch = client
-            .into_channel(&host_eph, transcript, ChannelRole::Initiator)
+            .into_channel(&host_eph, None, transcript, ChannelRole::Initiator)
             .unwrap();
         let host_ch = host
-            .into_channel(&client_eph, transcript, ChannelRole::Responder)
+            .into_channel(&client_eph, None, transcript, ChannelRole::Responder)
             .unwrap();
 
         let sealed = client_ch.seal(b"frame bytes").unwrap();
         assert_eq!(host_ch.open(&sealed).unwrap(), b"frame bytes");
+    }
+
+    // Both sides fold the same ML-KEM secret in; a peer with a different one
+    // (a tampered ciphertext decapsulates to an unrelated secret) cannot
+    // open anything.
+    #[test]
+    fn hybrid_channel_needs_the_same_pq_secret() {
+        let pq = crate::pq_kem::PqKeyPair::generate();
+        let (ct, host_pq) = crate::pq_kem::encapsulate_to(&pq.encapsulation_key_bytes()).unwrap();
+        let client_pq = pq.decapsulate_bytes(&ct).unwrap();
+        let mut tampered = ct;
+        tampered[0] ^= 1;
+        let wrong_pq = pq.decapsulate_bytes(&tampered).unwrap();
+
+        let channels = |client_secret: &crate::pq_kem::PqSharedSecret| {
+            let client = start(&identity(), b"c");
+            let host = start(&identity(), b"h");
+            let (client_eph, host_eph) = (*client.ephemeral_public(), *host.ephemeral_public());
+            (
+                client
+                    .into_channel(&host_eph, Some(client_secret), b"t", ChannelRole::Initiator)
+                    .unwrap(),
+                host.into_channel(&client_eph, Some(&host_pq), b"t", ChannelRole::Responder)
+                    .unwrap(),
+            )
+        };
+        let (client_ch, host_ch) = channels(&client_pq);
+        assert_eq!(
+            host_ch.open(&client_ch.seal(b"pq").unwrap()).unwrap(),
+            b"pq"
+        );
+        let (client_ch, host_ch) = channels(&wrong_pq);
+        assert!(host_ch.open(&client_ch.seal(b"pq").unwrap()).is_err());
     }
 
     #[test]

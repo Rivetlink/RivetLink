@@ -166,7 +166,7 @@ pub async fn capture_screenshot(req: CaptureParams<'_>) -> SdkResult<CaptureOutc
                     &host_packet,
                 )?;
                 channel = Some(
-                    kex.into_channel(&peer_eph, &transcript, ChannelRole::Initiator)
+                    kex.into_channel(&peer_eph, None, &transcript, ChannelRole::Initiator)
                         .map_err(|e| SdkError::Crypto(e.to_string()))?,
                 );
                 session_id = Some(sid);

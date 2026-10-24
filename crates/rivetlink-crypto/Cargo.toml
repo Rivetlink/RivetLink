@@ -6,7 +6,7 @@ license.workspace = true
 
 [features]
 default = ["post-quantum"]
-post-quantum = ["dep:ml-kem", "dep:ml-dsa"]
+post-quantum = ["dep:ml-dsa"]
 
 [dependencies]
 rivetlink-core = { workspace = true }
@@ -25,8 +25,9 @@ sha2 = { workspace = true }
 # Password-authenticated key agreement (SPAKE2) for direct LAN sessions.
 spake2 = { workspace = true }
 
-# Post-quantum (optional)
-ml-kem = { workspace = true, optional = true }
+# ML-KEM is part of every session handshake (hybrid with x25519).
+ml-kem = { workspace = true, features = ["zeroize"] }
+# Post-quantum signatures (optional)
 ml-dsa = { workspace = true, optional = true }
 
 [dev-dependencies]

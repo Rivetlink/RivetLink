@@ -12,13 +12,9 @@ pub mod pake;
 pub mod sealed;
 pub mod session_keys;
 
-#[cfg(feature = "post-quantum")]
 pub mod pq_kem;
 
 #[cfg(feature = "post-quantum")]
 pub mod pq_identity;
-
-#[cfg(feature = "post-quantum")]
-pub mod hybrid;
 
 pub use error::{CryptoError, CryptoResult};
