@@ -54,23 +54,30 @@ struct MonitorInfo {
     height: u32,
 }
 
-/// Scale `src` down to fit the `MAX_W`×`MAX_H` box, preserving aspect ratio and
-/// never upscaling; result dimensions are even (videoconvert/JPEG prefer it).
-/// Returns the fallback size when the source resolution is unknown.
+/// Scale `src` down to fit the `MAX_W`×`MAX_H` box (turned upright for a
+/// portrait screen, same pixel count so the H.264 level still holds),
+/// preserving aspect ratio and never upscaling; result dimensions are even
+/// (videoconvert/JPEG prefer it). Returns the fallback size when the source
+/// resolution is unknown.
 fn fit_output(src_w: u32, src_h: u32) -> (usize, usize) {
     if src_w == 0 || src_h == 0 {
         return (FALLBACK_W, FALLBACK_H);
     }
+    let (max_w, max_h) = if src_h > src_w {
+        (MAX_H, MAX_W)
+    } else {
+        (MAX_W, MAX_H)
+    };
     // Integer math (no float casts): shrink to the width bound, then the height
     // bound; each step scales the other side by the same ratio.
     let (mut w, mut h) = (src_w, src_h);
-    if w > MAX_W {
-        h = u32::try_from(u64::from(h) * u64::from(MAX_W) / u64::from(w)).unwrap_or(MAX_H);
-        w = MAX_W;
+    if w > max_w {
+        h = u32::try_from(u64::from(h) * u64::from(max_w) / u64::from(w)).unwrap_or(max_h);
+        w = max_w;
     }
-    if h > MAX_H {
-        w = u32::try_from(u64::from(w) * u64::from(MAX_H) / u64::from(h)).unwrap_or(MAX_W);
-        h = MAX_H;
+    if h > max_h {
+        w = u32::try_from(u64::from(w) * u64::from(max_h) / u64::from(h)).unwrap_or(max_w);
+        h = max_h;
     }
     let even = |v: u32| (v & !1).max(2) as usize;
     (even(w), even(h))
@@ -650,6 +657,15 @@ fn monitors() -> AgentResult<Vec<MonitorInfo>> {
         .and_then(|lm| lm.5.first()) // its first monitor id
         .map(|id| id.0.clone()); // connector
 
+    // Rotation lives on the logical monitor, not the mode: a portrait screen
+    // reports its landscape mode, but Mutter casts (and maps input to) the
+    // rotated picture.
+    let transforms: BTreeMap<String, u32> = state
+        .2
+        .iter()
+        .flat_map(|lm| lm.5.iter().map(move |id| (id.0.clone(), lm.3)))
+        .collect();
+
     let mut monitors: Vec<MonitorInfo> = state
         .1
         .into_iter()
@@ -668,9 +684,10 @@ fn monitors() -> AgentResult<Vec<MonitorInfo>> {
                 .find(|m| mode_flag(&m.6, "is-current"))
                 .or_else(|| modes.first())
                 .map_or((0, 0), |m| {
-                    (
+                    oriented(
                         u32::try_from(m.1).unwrap_or(0),
                         u32::try_from(m.2).unwrap_or(0),
+                        transforms.get(&connector).copied().unwrap_or(0),
                     )
                 });
             MonitorInfo {
@@ -689,6 +706,16 @@ fn monitors() -> AgentResult<Vec<MonitorInfo>> {
     Ok(monitors)
 }
 
+/// A mode's size as the monitor shows it. Mutter's transforms 1, 3, 5 and 7
+/// (90°, 270° and their flipped variants) turn the screen on its side.
+fn oriented(width: u32, height: u32, transform: u32) -> (u32, u32) {
+    if transform % 2 == 1 {
+        (height, width)
+    } else {
+        (width, height)
+    }
+}
+
 /// Read a boolean flag (e.g. `is-current`) from a Mutter mode's `a{sv}` props.
 fn mode_flag(props: &BTreeMap<String, OwnedValue>, key: &str) -> bool {
     matches!(props.get(key).map(|v| &**v), Some(Value::Bool(true)))
@@ -702,6 +729,19 @@ fn dbus_err(e: impl std::fmt::Display) -> AgentError {
 mod tests {
     use super::*;
     use std::io::Cursor;
+
+    #[test]
+    fn portrait_monitors_swap_their_mode_size() {
+        assert_eq!(oriented(1920, 1080, 0), (1920, 1080));
+        assert_eq!(oriented(1920, 1080, 1), (1080, 1920));
+        assert_eq!(oriented(1920, 1080, 2), (1920, 1080));
+        assert_eq!(oriented(1920, 1080, 3), (1080, 1920));
+        assert_eq!(oriented(1920, 1080, 7), (1080, 1920));
+        // A portrait screen streams upright at full size, not squeezed into
+        // the landscape box; a 4K portrait one shrinks to that upright box.
+        assert_eq!(fit_output(1080, 1920), (1080, 1920));
+        assert_eq!(fit_output(2160, 3840), (1080, 1920));
+    }
 
     #[test]
     fn fit_preserves_aspect_within_bounds() {
