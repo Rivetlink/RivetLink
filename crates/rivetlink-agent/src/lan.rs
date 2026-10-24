@@ -1637,6 +1637,12 @@ async fn stream_screen(
         // Stop the current capture before restarting on the new display.
         drop(rx);
         let _ = capture.await;
+        // The injector's RemoteDesktop session is bound to one monitor; drop
+        // it so the next input event binds one to the new display.
+        #[cfg(target_os = "linux")]
+        if display != Some(switch_to) {
+            injector = None;
+        }
         display = Some(switch_to);
     }
 
