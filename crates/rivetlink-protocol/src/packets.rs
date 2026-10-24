@@ -8,6 +8,15 @@ use serde::{Deserialize, Serialize};
 /// a relay cannot silently negotiate an older security construction.
 pub const RELAY_PROTOCOL_VERSION: u16 = 2;
 
+/// `SessionRequest.protocol_version` asking for a relay tunnel: after
+/// `SessionAccepted` both sides exchange binary WebSocket frames
+/// `[16-byte session id][payload]` that the relay forwards unread. The
+/// payload is the direct-LAN protocol, end-to-end encrypted.
+pub const RELAY_TUNNEL_VERSION: u16 = 3;
+
+/// Largest tunnel payload in one binary frame (excluding the session id).
+pub const MAX_TUNNEL_PAYLOAD: usize = 64 * 1024;
+
 /// The graphical-console state a Linux host reports to an authenticated
 /// RivetLink client. These states describe the *physical* console on seat0;
 /// they never imply that RivetLink knows an Ubuntu account password.

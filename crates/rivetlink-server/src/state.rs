@@ -6,10 +6,18 @@ use uuid::Uuid;
 
 use crate::config::ServerConfig;
 use crate::sessions::manager::SessionManager;
-use crate::websocket::connection::ConnectionMap;
+use crate::websocket::connection::{ConnectionMap, PrincipalKind};
 
-/// (user_id, org_id, raw_message_json) — org_id included for cross-tenant authorization checks.
-pub type SignalingMessage = (Uuid, Uuid, String);
+/// A text frame from an authenticated connection, queued for the router.
+#[derive(Debug, Clone)]
+pub struct SignalingMessage {
+    pub conn_id: Uuid,
+    pub principal_id: Uuid,
+    /// Included for cross-tenant authorization checks.
+    pub org_id: Uuid,
+    pub kind: PrincipalKind,
+    pub text: String,
+}
 
 /// Shared state containing database, config, connections, and signaling channel.
 #[derive(Debug, Clone)]

@@ -1,16 +1,25 @@
-//! Thread-safe map of connected WebSocket clients indexed by user or device ID.
+//! Thread-safe map of connected WebSocket clients.
+//!
+//! Every WebSocket gets its own connection id. A user may hold several at once
+//! (the app's signaling socket plus one per relay tunnel), so routing always
+//! targets a connection, never just a user. A device has one live connection;
+//! a reconnect replaces it.
 
+use axum::extract::ws::Message;
 use dashmap::DashMap;
 use std::sync::Arc;
 use tokio::sync::mpsc;
 use uuid::Uuid;
 
-/// Unbounded channel for sending WebSocket messages.
-pub type WsSender = mpsc::UnboundedSender<String>;
+/// Outgoing messages queued per connection. Bounded so one slow reader holds
+/// up only the senders writing to it, never the server's memory.
+pub const OUTGOING_QUEUE: usize = 512;
+
+/// Channel feeding a connection's WebSocket writer.
+pub type WsSender = mpsc::Sender<Message>;
 
 /// Whether a connected principal is a user (control client) or a device
-/// (host agent). The signaling router does not care about the distinction —
-/// it's recorded for tracing and audit purposes.
+/// (host agent).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum PrincipalKind {
     User,
@@ -30,48 +39,43 @@ pub struct ConnectedClient {
     pub sender: WsSender,
 }
 
-/// Concurrent map of connected clients keyed by user ID; safe across threads.
+/// Concurrent map of connected clients keyed by connection id.
 #[derive(Debug, Clone, Default)]
 pub struct ConnectionMap {
     inner: Arc<DashMap<Uuid, ConnectedClient>>,
+    /// device id → its current connection id.
+    devices: Arc<DashMap<Uuid, Uuid>>,
 }
 
 impl ConnectionMap {
     /// Create a new empty connection map.
     pub fn new() -> Self {
-        Self {
-            inner: Arc::new(DashMap::new()),
+        Self::default()
+    }
+
+    /// Register a connection. A device's newest connection becomes the one
+    /// session requests are routed to.
+    pub fn insert(&self, conn_id: Uuid, client: ConnectedClient) {
+        if client.kind == PrincipalKind::Device {
+            self.devices.insert(client.user_id, conn_id);
+        }
+        self.inner.insert(conn_id, client);
+    }
+
+    /// Remove a closed connection. A device stays online if it already
+    /// reconnected on a newer connection.
+    pub fn remove(&self, conn_id: &Uuid) {
+        if let Some((_, client)) = self.inner.remove(conn_id) {
+            if client.kind == PrincipalKind::Device {
+                self.devices
+                    .remove_if(&client.user_id, |_, current| current == conn_id);
+            }
         }
     }
 
-    /// Register a connected client.
-    pub fn insert(&self, user_id: Uuid, client: ConnectedClient) {
-        self.inner.insert(user_id, client);
-    }
-
-    /// Remove a disconnected client.
-    pub fn remove(&self, user_id: &Uuid) {
-        self.inner.remove(user_id);
-    }
-
-    /// Get message sender for a connected client; None if not connected.
-    pub fn get_sender(&self, user_id: &Uuid) -> Option<WsSender> {
-        self.inner.get(user_id).map(|c| c.sender.clone())
-    }
-
-    /// Check if user has an active connection.
-    pub fn contains(&self, user_id: &Uuid) -> bool {
-        self.inner.contains_key(user_id)
-    }
-
-    /// Get total number of connected clients.
-    pub fn connected_count(&self) -> usize {
-        self.inner.len()
-    }
-
-    /// Get a clone of the connected client info (for authorization checks).
-    pub fn get_client(&self, user_id: &Uuid) -> Option<ConnectedClient> {
-        self.inner.get(user_id).map(|c| c.clone())
+    /// The live connection of a device, if it is online.
+    pub fn device_conn(&self, device_id: &Uuid) -> Option<Uuid> {
+        self.devices.get(device_id).map(|conn| *conn)
     }
 
     /// Whether this exact principal currently has an authenticated device
@@ -79,18 +83,33 @@ impl ConnectionMap {
     /// that a Home Node is online.
     #[must_use]
     pub fn device_is_connected(&self, device_id: &Uuid) -> bool {
-        self.inner
-            .get(device_id)
-            .is_some_and(|client| client.kind == PrincipalKind::Device)
+        self.devices.contains_key(device_id)
     }
 
-    /// Send message to connected client; returns false if send fails or client disconnected.
-    pub fn send_to(&self, user_id: &Uuid, message: &str) -> bool {
-        if let Some(client) = self.inner.get(user_id) {
-            client.sender.send(message.to_string()).is_ok()
-        } else {
-            false
-        }
+    /// Get message sender for a connection; None if it is gone.
+    pub fn get_sender(&self, conn_id: &Uuid) -> Option<WsSender> {
+        self.inner.get(conn_id).map(|c| c.sender.clone())
+    }
+
+    /// Get total number of connections.
+    pub fn connected_count(&self) -> usize {
+        self.inner.len()
+    }
+
+    /// Get a clone of the connection's client info (for authorization checks).
+    pub fn get_client(&self, conn_id: &Uuid) -> Option<ConnectedClient> {
+        self.inner.get(conn_id).map(|c| c.clone())
+    }
+
+    /// Queue a text message without waiting; false if the connection is gone
+    /// or its queue is full.
+    pub fn send_to(&self, conn_id: &Uuid, message: &str) -> bool {
+        self.inner.get(conn_id).is_some_and(|client| {
+            client
+                .sender
+                .try_send(Message::Text(message.to_string()))
+                .is_ok()
+        })
     }
 }
 
@@ -98,109 +117,82 @@ impl ConnectionMap {
 mod tests {
     use super::*;
 
-    fn user_client(sender: WsSender) -> ConnectedClient {
-        ConnectedClient {
-            user_id: Uuid::now_v7(),
-            org_id: Uuid::now_v7(),
-            kind: PrincipalKind::User,
-            sender,
-        }
+    fn client(kind: PrincipalKind, user_id: Uuid) -> (ConnectedClient, mpsc::Receiver<Message>) {
+        let (tx, rx) = mpsc::channel(OUTGOING_QUEUE);
+        (
+            ConnectedClient {
+                user_id,
+                org_id: Uuid::now_v7(),
+                kind,
+                sender: tx,
+            },
+            rx,
+        )
     }
 
     #[test]
-    fn connection_map_insert_and_get() {
+    fn send_reaches_the_connection_until_it_is_removed() {
         let map = ConnectionMap::new();
-        let user_id = Uuid::now_v7();
-        let (tx, _rx) = mpsc::unbounded_channel();
-
-        let mut client = user_client(tx);
-        client.user_id = user_id;
-        map.insert(user_id, client);
-
-        assert!(map.contains(&user_id));
+        let conn = Uuid::now_v7();
+        let (c, mut rx) = client(PrincipalKind::User, Uuid::now_v7());
+        map.insert(conn, c);
         assert_eq!(map.connected_count(), 1);
-        assert!(map.get_sender(&user_id).is_some());
-    }
 
-    #[test]
-    fn connection_map_remove() {
-        let map = ConnectionMap::new();
-        let user_id = Uuid::now_v7();
-        let (tx, _rx) = mpsc::unbounded_channel();
+        assert!(map.send_to(&conn, "hello"));
+        assert_eq!(rx.try_recv().unwrap(), Message::Text("hello".into()));
 
-        let mut client = user_client(tx);
-        client.user_id = user_id;
-        map.insert(user_id, client);
-
-        map.remove(&user_id);
-        assert!(!map.contains(&user_id));
+        map.remove(&conn);
+        assert!(!map.send_to(&conn, "hello"));
         assert_eq!(map.connected_count(), 0);
     }
 
     #[test]
-    fn connection_map_send_to_connected() {
+    fn send_to_a_dropped_receiver_fails() {
         let map = ConnectionMap::new();
-        let user_id = Uuid::now_v7();
-        let (tx, mut rx) = mpsc::unbounded_channel();
-
-        let mut client = user_client(tx);
-        client.user_id = user_id;
-        map.insert(user_id, client);
-
-        assert!(map.send_to(&user_id, "hello"));
-        assert_eq!(rx.try_recv().unwrap(), "hello");
-    }
-
-    #[test]
-    fn connection_map_send_to_disconnected() {
-        let map = ConnectionMap::new();
-        let user_id = Uuid::now_v7();
-        assert!(!map.send_to(&user_id, "hello"));
-    }
-
-    #[test]
-    fn connection_map_send_to_dropped_receiver() {
-        let map = ConnectionMap::new();
-        let user_id = Uuid::now_v7();
-        let (tx, rx) = mpsc::unbounded_channel();
-
-        let mut client = user_client(tx);
-        client.user_id = user_id;
-        map.insert(user_id, client);
-
+        let conn = Uuid::now_v7();
+        let (c, rx) = client(PrincipalKind::User, Uuid::now_v7());
+        map.insert(conn, c);
         drop(rx);
-        assert!(!map.send_to(&user_id, "hello"));
+        assert!(!map.send_to(&conn, "hello"));
     }
 
     #[test]
-    fn principal_kind_distinguishes_user_and_device() {
-        let (tx, _rx) = mpsc::unbounded_channel();
-        let user = user_client(tx.clone());
-        let device = ConnectedClient {
-            user_id: Uuid::now_v7(),
-            org_id: Uuid::now_v7(),
-            kind: PrincipalKind::Device,
-            sender: tx,
-        };
-        assert_eq!(user.kind, PrincipalKind::User);
-        assert_eq!(device.kind, PrincipalKind::Device);
-        assert_ne!(user.kind, device.kind);
+    fn one_user_can_hold_several_connections() {
+        let map = ConnectionMap::new();
+        let user = Uuid::now_v7();
+        let (first, mut first_rx) = client(PrincipalKind::User, user);
+        let (second, mut second_rx) = client(PrincipalKind::User, user);
+        let (a, b) = (Uuid::now_v7(), Uuid::now_v7());
+        map.insert(a, first);
+        map.insert(b, second);
+        assert!(map.send_to(&a, "to-a"));
+        assert!(map.send_to(&b, "to-b"));
+        assert_eq!(first_rx.try_recv().unwrap(), Message::Text("to-a".into()));
+        assert_eq!(second_rx.try_recv().unwrap(), Message::Text("to-b".into()));
+    }
+
+    #[test]
+    fn a_device_reconnect_survives_the_old_connection_closing() {
+        let map = ConnectionMap::new();
+        let device = Uuid::now_v7();
+        let (old, _old_rx) = client(PrincipalKind::Device, device);
+        let (new, _new_rx) = client(PrincipalKind::Device, device);
+        let (old_conn, new_conn) = (Uuid::now_v7(), Uuid::now_v7());
+        map.insert(old_conn, old);
+        map.insert(new_conn, new);
+        map.remove(&old_conn);
+        assert_eq!(map.device_conn(&device), Some(new_conn));
+        assert!(map.device_is_connected(&device));
+        map.remove(&new_conn);
+        assert!(!map.device_is_connected(&device));
     }
 
     #[test]
     fn device_presence_does_not_confuse_a_user_with_a_device() {
         let map = ConnectionMap::new();
         let id = Uuid::now_v7();
-        let (tx, _rx) = mpsc::unbounded_channel();
-        map.insert(
-            id,
-            ConnectedClient {
-                user_id: id,
-                org_id: Uuid::now_v7(),
-                kind: PrincipalKind::User,
-                sender: tx,
-            },
-        );
+        let (user, _rx) = client(PrincipalKind::User, id);
+        map.insert(Uuid::now_v7(), user);
         assert!(!map.device_is_connected(&id));
     }
 }

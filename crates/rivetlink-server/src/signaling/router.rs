@@ -1,18 +1,22 @@
 //! Signal packet routing between connected WebSocket clients.
 //!
-//! Receives raw JSON messages from the WebSocket gateway, parses them as [`SignalPacket`],
-//! and forwards to the appropriate peer via the connection map and session manager.
+//! Receives text frames from the WebSocket gateway, parses them as [`SignalPacket`],
+//! and forwards them to the other connection of the referenced session.
 //!
-//! Authorization is enforced: cross-tenant requests are rejected, and session-bound
-//! packets are only forwarded if the sender is a member of that session.
+//! Authorization is enforced: a session request must target an online device of
+//! the sender's own organisation, and session-bound packets are only forwarded
+//! from one of the session's two connections to the other.
 
-use rivetlink_protocol::SignalPacket;
+use std::time::Instant;
+
+use rivetlink_core::SessionId;
+use rivetlink_protocol::{SignalPacket, RELAY_TUNNEL_VERSION};
 use tokio::sync::mpsc;
 use uuid::Uuid;
 
-use crate::sessions::manager::SessionManager;
+use crate::sessions::manager::{ActiveSession, SessionManager};
 use crate::state::SignalingMessage;
-use crate::websocket::connection::ConnectionMap;
+use crate::websocket::connection::{ConnectionMap, PrincipalKind};
 
 /// Run the signaling router loop, reading from the signaling channel
 /// and forwarding packets to the correct peer.
@@ -23,32 +27,21 @@ pub async fn run_signaling_router(
 ) {
     tracing::info!("signaling router started");
 
-    while let Some((sender_id, sender_org_id, raw_message)) = rx.recv().await {
-        let Ok(packet) = serde_json::from_str::<SignalPacket>(&raw_message) else {
-            tracing::warn!(sender = %sender_id, "invalid signal packet, ignoring");
+    while let Some(message) = rx.recv().await {
+        let Ok(packet) = serde_json::from_str::<SignalPacket>(&message.text) else {
+            tracing::warn!(sender = %message.principal_id, "invalid signal packet, ignoring");
             continue;
         };
-
-        route_packet(
-            &connections,
-            &sessions,
-            &sender_id,
-            &sender_org_id,
-            &raw_message,
-            &packet,
-        );
+        route_packet(&connections, &sessions, &message, &packet);
     }
 
     tracing::info!("signaling router stopped");
 }
 
-#[allow(clippy::cognitive_complexity, clippy::too_many_lines)]
 fn route_packet(
     connections: &ConnectionMap,
     sessions: &SessionManager,
-    sender_id: &Uuid,
-    sender_org_id: &Uuid,
-    raw_message: &str,
+    message: &SignalingMessage,
     packet: &SignalPacket,
 ) {
     match packet {
@@ -59,31 +52,43 @@ fn route_packet(
             requested_capability,
             ..
         } => {
-            // Verify target device is in same org (cross-tenant check)
-            if let Some(target_client) = connections.get_client(&device_id.0) {
-                if target_client.org_id != *sender_org_id {
-                    tracing::warn!(
-                        sender = %sender_id,
-                        target_device = %device_id,
-                        "cross-tenant session request rejected"
-                    );
-                    return;
-                }
-            }
-
             let session_id = Uuid::now_v7();
-            if sessions
-                .create_session(session_id, *sender_org_id, device_id.0, *sender_id)
-                .is_none()
-            {
-                tracing::warn!(
-                    sender = %sender_id,
-                    "session creation refused: party already in active session"
-                );
-                return;
+            let reject = |reason: &str| {
+                tracing::warn!(sender = %message.principal_id, target_device = %device_id, reason, "session request refused");
+                let rejected = SignalPacket::SessionRejected {
+                    session_id: SessionId(session_id),
+                    reason: reason.to_string(),
+                };
+                if let Ok(text) = serde_json::to_string(&rejected) {
+                    connections.send_to(&message.conn_id, &text);
+                }
+            };
+            if message.kind != PrincipalKind::User {
+                return reject("only users can open sessions");
+            }
+            // Offline and foreign devices get the same answer, so a request
+            // does not reveal whether a device id exists in another tenant.
+            let Some(device_conn) = connections.device_conn(&device_id.0).filter(|conn| {
+                connections
+                    .get_client(conn)
+                    .is_some_and(|device| device.org_id == message.org_id)
+            }) else {
+                return reject("device is offline or unknown");
+            };
+            if let Err(reason) = sessions.create_session(ActiveSession {
+                id: session_id,
+                org_id: message.org_id,
+                device_id: device_id.0,
+                device_conn,
+                initiator_id: message.principal_id,
+                initiator_conn: message.conn_id,
+                tunnel: *protocol_version == RELAY_TUNNEL_VERSION,
+                started_at: Instant::now(),
+            }) {
+                return reject(reason);
             }
 
-            tracing::info!(from = %sender_id, target_device = %device_id, "session request");
+            tracing::info!(from = %message.principal_id, target_device = %device_id, session = %session_id, protocol_version, "session request");
 
             // Enrich the request with the allocated session_id so the host can
             // reference the session when it accepts or rejects.
@@ -92,519 +97,315 @@ fn route_packet(
                 client_public_key: client_public_key.clone(),
                 protocol_version: *protocol_version,
                 requested_capability: *requested_capability,
-                session_id: Some(rivetlink_core::SessionId(session_id)),
+                session_id: Some(SessionId(session_id)),
             };
             match serde_json::to_string(&enriched) {
-                Ok(msg) => forward_to_device(connections, &device_id.0, &msg),
+                Ok(text) => {
+                    if !connections.send_to(&device_conn, &text) {
+                        tracing::warn!(target_device = %device_id, "target device not reachable");
+                    }
+                },
                 Err(e) => {
                     tracing::error!(error = %e, "failed to serialize enriched session request");
                 },
             }
         },
-        SignalPacket::AuthChallenge { session_id, .. } => {
-            if !verify_session_member(sessions, sender_id, &session_id.0) {
-                return;
+        SignalPacket::SessionRejected { session_id, .. }
+        | SignalPacket::SessionClosed { session_id } => {
+            if forward(connections, sessions, message, session_id) {
+                tracing::info!(session = %session_id, "session ended");
+                sessions.remove_session(&session_id.0);
             }
-            tracing::debug!(session = %session_id, "forwarding auth challenge");
-            forward_to_peer(connections, sessions, sender_id, raw_message);
         },
-        SignalPacket::AuthResponse { session_id, .. } => {
-            if !verify_session_member(sessions, sender_id, &session_id.0) {
-                return;
-            }
-            tracing::debug!(session = %session_id, "forwarding auth response");
-            forward_to_peer(connections, sessions, sender_id, raw_message);
-        },
-        SignalPacket::SessionAccepted { session_id, .. } => {
-            if !verify_session_member(sessions, sender_id, &session_id.0) {
-                return;
-            }
-            tracing::info!(session = %session_id, "session accepted");
-            forward_to_peer(connections, sessions, sender_id, raw_message);
-        },
-        SignalPacket::SessionRejected { session_id, .. } => {
-            if !verify_session_member(sessions, sender_id, &session_id.0) {
-                return;
-            }
-            tracing::info!(session = %session_id, "session rejected");
-            forward_to_peer(connections, sessions, sender_id, raw_message);
-            sessions.remove_session(&session_id.0);
-        },
-        SignalPacket::IceCandidate { session_id, .. } => {
-            if !verify_session_member(sessions, sender_id, &session_id.0) {
-                return;
-            }
-            tracing::trace!(session = %session_id, "forwarding ICE candidate");
-            forward_to_peer(connections, sessions, sender_id, raw_message);
-        },
-        SignalPacket::SessionKeyExchange { session_id, .. } => {
-            if !verify_session_member(sessions, sender_id, &session_id.0) {
-                return;
-            }
-            tracing::debug!(session = %session_id, "forwarding session key exchange");
-            forward_to_peer(connections, sessions, sender_id, raw_message);
-        },
-        SignalPacket::ScreenshotRequest { session_id } => {
-            if !verify_session_member(sessions, sender_id, &session_id.0) {
-                return;
-            }
-            tracing::debug!(session = %session_id, "forwarding screenshot request");
-            forward_to_peer(connections, sessions, sender_id, raw_message);
-        },
-        SignalPacket::ScreenshotData { session_id, .. } => {
-            if !verify_session_member(sessions, sender_id, &session_id.0) {
-                return;
-            }
-            tracing::trace!(session = %session_id, "forwarding screenshot data chunk");
-            forward_to_peer(connections, sessions, sender_id, raw_message);
-        },
-        SignalPacket::HostConsoleState {
-            session_id,
-            state,
-            generation,
-        } => {
-            if !verify_session_member(sessions, sender_id, &session_id.0) {
-                return;
-            }
-            tracing::info!(session = %session_id, ?state, generation, "forwarding host console state");
-            forward_to_peer(connections, sessions, sender_id, raw_message);
-        },
-        SignalPacket::ConsoleInput { session_id, .. } => {
-            if !verify_session_member(sessions, sender_id, &session_id.0) {
-                return;
-            }
-            // Payload is end-to-end sealed and may contain password keystrokes;
-            // never inspect or log it at the relay.
-            tracing::trace!(session = %session_id, "forwarding sealed console input");
-            forward_to_peer(connections, sessions, sender_id, raw_message);
+        // Payloads are end-to-end sealed (console input may contain password
+        // keystrokes); never inspect or log them at the relay.
+        SignalPacket::AuthChallenge { session_id, .. }
+        | SignalPacket::AuthResponse { session_id, .. }
+        | SignalPacket::SessionAccepted { session_id, .. }
+        | SignalPacket::IceCandidate { session_id, .. }
+        | SignalPacket::SessionKeyExchange { session_id, .. }
+        | SignalPacket::ScreenshotRequest { session_id }
+        | SignalPacket::ScreenshotData { session_id, .. }
+        | SignalPacket::HostConsoleState { session_id, .. }
+        | SignalPacket::ConsoleInput { session_id, .. } => {
+            forward(connections, sessions, message, session_id);
         },
         SignalPacket::Heartbeat => {},
-        SignalPacket::SessionClosed { session_id } => {
-            if !verify_session_member(sessions, sender_id, &session_id.0) {
-                return;
-            }
-            tracing::info!(session = %session_id, "session closed");
-            forward_to_peer(connections, sessions, sender_id, raw_message);
-            sessions.remove_session(&session_id.0);
-        },
     }
 }
 
-/// Verify sender is a participant in the referenced session.
-fn verify_session_member(sessions: &SessionManager, sender_id: &Uuid, session_id: &Uuid) -> bool {
-    if !sessions.is_session_member(sender_id, session_id) {
+/// Forward the raw frame to the session's other connection. Returns false
+/// (and drops it) when the sender is not one of the session's connections.
+fn forward(
+    connections: &ConnectionMap,
+    sessions: &SessionManager,
+    message: &SignalingMessage,
+    session_id: &SessionId,
+) -> bool {
+    let Some(peer) = sessions.peer_conn(&session_id.0, &message.conn_id) else {
         tracing::warn!(
-            sender = %sender_id,
+            sender = %message.principal_id,
             session = %session_id,
             "unauthorized: sender is not a session member"
         );
         return false;
+    };
+    if !connections.send_to(&peer, &message.text) {
+        tracing::warn!(session = %session_id, "peer not reachable");
     }
     true
-}
-
-/// Forward a message directly to a device by its user_id.
-fn forward_to_device(connections: &ConnectionMap, device_user_id: &Uuid, message: &str) {
-    if !connections.send_to(device_user_id, message) {
-        tracing::warn!(target_device = %device_user_id, "target device not connected");
-    }
-}
-
-/// Forward a message to the peer in the sender's active session.
-fn forward_to_peer(
-    connections: &ConnectionMap,
-    sessions: &SessionManager,
-    sender_id: &Uuid,
-    message: &str,
-) {
-    match sessions.find_peer(sender_id) {
-        Some(peer_id) => {
-            if !connections.send_to(&peer_id, message) {
-                tracing::warn!(peer = %peer_id, "peer not connected");
-            }
-        },
-        None => {
-            tracing::warn!(sender = %sender_id, "no active session found for sender");
-        },
-    }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::websocket::connection::{ConnectedClient, ConnectionMap, PrincipalKind};
+    use crate::websocket::connection::{ConnectedClient, OUTGOING_QUEUE};
+    use axum::extract::ws::Message;
     use rivetlink_core::DeviceId;
-    use tokio::sync::mpsc;
-
-    fn setup() -> (ConnectionMap, SessionManager) {
-        (ConnectionMap::new(), SessionManager::new())
-    }
+    use rivetlink_protocol::{SessionCapability, RELAY_PROTOCOL_VERSION};
 
     fn org_id() -> Uuid {
-        // Shared org for same-tenant tests
         Uuid::from_u128(0x1234_5678_9abc_def0_1234_5678_9abc_def0)
     }
 
-    #[tokio::test]
-    async fn session_request_forwarded_to_same_org_device() {
-        let (connections, sessions) = setup();
-        let (sig_tx, sig_rx) = mpsc::unbounded_channel::<SignalingMessage>();
-        let shared_org = org_id();
-
-        let device_user_id = Uuid::now_v7();
-        let (ws_tx, mut ws_rx) = mpsc::unbounded_channel();
-
-        connections.insert(
-            device_user_id,
-            ConnectedClient {
-                user_id: device_user_id,
-                org_id: shared_org,
-                kind: PrincipalKind::User,
-                sender: ws_tx,
-            },
-        );
-
-        let conn_clone = connections.clone();
-        let sess_clone = sessions.clone();
-        let router_handle = tokio::spawn(run_signaling_router(sig_rx, conn_clone, sess_clone));
-
-        let sender_id = Uuid::now_v7();
-        let packet = SignalPacket::SessionRequest {
-            device_id: DeviceId(device_user_id),
-            client_public_key: "test_key".to_string(),
-            protocol_version: rivetlink_protocol::RELAY_PROTOCOL_VERSION,
-            requested_capability: rivetlink_protocol::SessionCapability::Screenshot,
-            session_id: None,
-        };
-        let message = serde_json::to_string(&packet).unwrap();
-
-        sig_tx.send((sender_id, shared_org, message)).unwrap();
-
-        let received = tokio::time::timeout(std::time::Duration::from_millis(100), ws_rx.recv())
-            .await
-            .unwrap()
-            .unwrap();
-
-        assert!(received.contains("SESSION_REQUEST"));
-        assert!(received.contains("test_key"));
-
-        tokio::time::sleep(std::time::Duration::from_millis(20)).await;
-        assert_eq!(sessions.active_count(), 1);
-
-        drop(sig_tx);
-        let _ = router_handle.await;
+    struct Conn {
+        conn_id: Uuid,
+        principal_id: Uuid,
+        org_id: Uuid,
+        kind: PrincipalKind,
+        rx: mpsc::Receiver<Message>,
     }
 
-    #[tokio::test]
-    async fn relay_preserves_requested_capability_for_host_authorization() {
-        let (connections, sessions) = setup();
-        let (sig_tx, sig_rx) = mpsc::unbounded_channel::<SignalingMessage>();
-        let shared_org = org_id();
-        let device_id = Uuid::now_v7();
-        let (host_tx, mut host_rx) = mpsc::unbounded_channel();
-        connections.insert(
-            device_id,
-            ConnectedClient {
-                user_id: device_id,
-                org_id: shared_org,
-                kind: PrincipalKind::Device,
-                sender: host_tx,
-            },
-        );
-        let router_handle = tokio::spawn(run_signaling_router(
-            sig_rx,
-            connections.clone(),
-            sessions.clone(),
-        ));
-
-        let request = SignalPacket::SessionRequest {
-            device_id: DeviceId(device_id),
-            client_public_key: "controller-key".to_string(),
-            protocol_version: rivetlink_protocol::RELAY_PROTOCOL_VERSION,
-            requested_capability: rivetlink_protocol::SessionCapability::ConsoleControl,
-            session_id: None,
-        };
-        sig_tx
-            .send((
-                Uuid::now_v7(),
-                shared_org,
-                serde_json::to_string(&request).unwrap(),
-            ))
-            .unwrap();
-        let raw = tokio::time::timeout(std::time::Duration::from_millis(100), host_rx.recv())
-            .await
-            .unwrap()
-            .unwrap();
-        let forwarded: SignalPacket = serde_json::from_str(&raw).unwrap();
-        assert!(matches!(
-            forwarded,
-            SignalPacket::SessionRequest {
-                requested_capability: rivetlink_protocol::SessionCapability::ConsoleControl,
-                session_id: Some(_),
-                ..
+    impl Conn {
+        fn say(&self, packet: &SignalPacket) -> SignalingMessage {
+            SignalingMessage {
+                conn_id: self.conn_id,
+                principal_id: self.principal_id,
+                org_id: self.org_id,
+                kind: self.kind,
+                text: serde_json::to_string(packet).unwrap(),
             }
-        ));
+        }
 
-        drop(sig_tx);
-        let _ = router_handle.await;
+        fn next(&mut self) -> Option<SignalPacket> {
+            match self.rx.try_recv().ok()? {
+                Message::Text(text) => Some(serde_json::from_str(&text).unwrap()),
+                other => panic!("unexpected {other:?}"),
+            }
+        }
     }
 
-    #[tokio::test]
-    async fn cross_tenant_session_request_rejected() {
-        let (connections, sessions) = setup();
-        let (sig_tx, sig_rx) = mpsc::unbounded_channel::<SignalingMessage>();
-
-        let device_org = Uuid::now_v7();
-        let attacker_org = Uuid::now_v7();
-
-        let device_user_id = Uuid::now_v7();
-        let (ws_tx, mut ws_rx) = mpsc::unbounded_channel();
-
+    fn connect(connections: &ConnectionMap, kind: PrincipalKind, org_id: Uuid) -> Conn {
+        let (tx, rx) = mpsc::channel(OUTGOING_QUEUE);
+        let (conn_id, principal_id) = (Uuid::now_v7(), Uuid::now_v7());
         connections.insert(
-            device_user_id,
+            conn_id,
             ConnectedClient {
-                user_id: device_user_id,
-                org_id: device_org,
-                kind: PrincipalKind::User,
-                sender: ws_tx,
+                user_id: principal_id,
+                org_id,
+                kind,
+                sender: tx,
             },
         );
+        Conn {
+            conn_id,
+            principal_id,
+            org_id,
+            kind,
+            rx,
+        }
+    }
 
-        let conn_clone = connections.clone();
-        let sess_clone = sessions.clone();
-        let router_handle = tokio::spawn(run_signaling_router(sig_rx, conn_clone, sess_clone));
-
-        let attacker_id = Uuid::now_v7();
-        let packet = SignalPacket::SessionRequest {
-            device_id: DeviceId(device_user_id),
-            client_public_key: "attacker_key".to_string(),
-            protocol_version: rivetlink_protocol::RELAY_PROTOCOL_VERSION,
-            requested_capability: rivetlink_protocol::SessionCapability::Screenshot,
+    fn request(device: &Conn, protocol_version: u16) -> SignalPacket {
+        SignalPacket::SessionRequest {
+            device_id: DeviceId(device.principal_id),
+            client_public_key: "client-key".to_string(),
+            protocol_version,
+            requested_capability: SessionCapability::ConsoleControl,
             session_id: None,
-        };
-        let message = serde_json::to_string(&packet).unwrap();
-
-        // Attacker sends from different org
-        sig_tx.send((attacker_id, attacker_org, message)).unwrap();
-
-        let result =
-            tokio::time::timeout(std::time::Duration::from_millis(100), ws_rx.recv()).await;
-        assert!(
-            result.is_err(),
-            "cross-tenant request should not be forwarded"
-        );
-        assert_eq!(sessions.active_count(), 0);
-
-        drop(sig_tx);
-        let _ = router_handle.await;
+        }
     }
 
-    #[tokio::test]
-    async fn session_close_requires_membership() {
-        let (connections, sessions) = setup();
-        let (sig_tx, sig_rx) = mpsc::unbounded_channel::<SignalingMessage>();
-        let shared_org = org_id();
+    fn route(connections: &ConnectionMap, sessions: &SessionManager, message: &SignalingMessage) {
+        let packet = serde_json::from_str(&message.text).unwrap();
+        route_packet(connections, sessions, message, &packet);
+    }
 
-        // Create a session between client and device
-        let client_id = Uuid::now_v7();
-        let device_id = Uuid::now_v7();
-        let session_id = Uuid::now_v7();
-        sessions.create_session(session_id, shared_org, device_id, client_id);
+    #[test]
+    fn session_request_reaches_the_device_with_a_session_id() {
+        let (connections, sessions) = (ConnectionMap::new(), SessionManager::new());
+        let mut device = connect(&connections, PrincipalKind::Device, org_id());
+        let user = connect(&connections, PrincipalKind::User, org_id());
 
-        let (dev_tx, _dev_rx) = mpsc::unbounded_channel();
-        connections.insert(
-            device_id,
-            ConnectedClient {
-                user_id: device_id,
-                org_id: shared_org,
-                kind: PrincipalKind::User,
-                sender: dev_tx,
-            },
+        route(
+            &connections,
+            &sessions,
+            &user.say(&request(&device, RELAY_TUNNEL_VERSION)),
         );
 
-        let conn_clone = connections.clone();
-        let sess_clone = sessions.clone();
-        let router_handle = tokio::spawn(run_signaling_router(sig_rx, conn_clone, sess_clone));
-
-        // Attacker (not in session) tries to close it
-        let attacker_id = Uuid::now_v7();
-        let close_packet = SignalPacket::SessionClosed {
-            session_id: rivetlink_core::SessionId(session_id),
+        let Some(SignalPacket::SessionRequest {
+            session_id: Some(sid),
+            requested_capability: SessionCapability::ConsoleControl,
+            ..
+        }) = device.next()
+        else {
+            panic!("expected an enriched session request");
         };
-        let message = serde_json::to_string(&close_packet).unwrap();
-
-        sig_tx.send((attacker_id, shared_org, message)).unwrap();
-
-        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
-
-        // Session should still be active — attacker wasn't a member
         assert_eq!(sessions.active_count(), 1);
-
-        drop(sig_tx);
-        let _ = router_handle.await;
+        assert_eq!(
+            sessions.tunnel_peer_conn(&sid.0, &user.conn_id),
+            Some(device.conn_id)
+        );
     }
 
-    #[tokio::test]
-    async fn session_close_by_member_succeeds() {
-        let (connections, sessions) = setup();
-        let (sig_tx, sig_rx) = mpsc::unbounded_channel::<SignalingMessage>();
-        let shared_org = org_id();
-
-        let client_id = Uuid::now_v7();
-        let device_id = Uuid::now_v7();
-        let session_id = Uuid::now_v7();
-        sessions.create_session(session_id, shared_org, device_id, client_id);
-
-        let (dev_tx, _dev_rx) = mpsc::unbounded_channel();
-        connections.insert(
-            device_id,
-            ConnectedClient {
-                user_id: device_id,
-                org_id: shared_org,
-                kind: PrincipalKind::User,
-                sender: dev_tx,
-            },
-        );
-
-        let conn_clone = connections.clone();
-        let sess_clone = sessions.clone();
-        let router_handle = tokio::spawn(run_signaling_router(sig_rx, conn_clone, sess_clone));
-
-        // Client (session member) closes session
-        let close_packet = SignalPacket::SessionClosed {
-            session_id: rivetlink_core::SessionId(session_id),
+    #[test]
+    fn requests_for_offline_or_foreign_devices_are_rejected_alike() {
+        let (connections, sessions) = (ConnectionMap::new(), SessionManager::new());
+        let mut foreign = connect(&connections, PrincipalKind::Device, Uuid::now_v7());
+        let mut user = connect(&connections, PrincipalKind::User, org_id());
+        let offline = Conn {
+            conn_id: Uuid::now_v7(),
+            principal_id: Uuid::now_v7(),
+            org_id: org_id(),
+            kind: PrincipalKind::Device,
+            rx: mpsc::channel(1).1,
         };
-        let message = serde_json::to_string(&close_packet).unwrap();
 
-        sig_tx.send((client_id, shared_org, message)).unwrap();
-
-        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
-
-        // Session should be removed
+        for target in [&foreign, &offline] {
+            route(
+                &connections,
+                &sessions,
+                &user.say(&request(target, RELAY_PROTOCOL_VERSION)),
+            );
+            let Some(SignalPacket::SessionRejected { reason, .. }) = user.next() else {
+                panic!("expected a rejection");
+            };
+            assert_eq!(reason, "device is offline or unknown");
+        }
+        assert!(foreign.next().is_none());
         assert_eq!(sessions.active_count(), 0);
-
-        drop(sig_tx);
-        let _ = router_handle.await;
     }
 
-    #[tokio::test]
-    async fn console_state_is_forwarded_only_to_the_authenticated_session_peer() {
-        let (connections, sessions) = setup();
-        let (sig_tx, sig_rx) = mpsc::unbounded_channel::<SignalingMessage>();
-        let shared_org = org_id();
-        let client_id = Uuid::now_v7();
-        let device_id = Uuid::now_v7();
-        let session_id = Uuid::now_v7();
-        sessions.create_session(session_id, shared_org, device_id, client_id);
+    #[test]
+    fn a_device_cannot_open_a_session() {
+        let (connections, sessions) = (ConnectionMap::new(), SessionManager::new());
+        let target = connect(&connections, PrincipalKind::Device, org_id());
+        let mut other_device = connect(&connections, PrincipalKind::Device, org_id());
+        route(
+            &connections,
+            &sessions,
+            &other_device.say(&request(&target, RELAY_TUNNEL_VERSION)),
+        );
+        assert!(matches!(
+            other_device.next(),
+            Some(SignalPacket::SessionRejected { .. })
+        ));
+        assert_eq!(sessions.active_count(), 0);
+    }
 
-        let (client_tx, mut client_rx) = mpsc::unbounded_channel();
+    #[test]
+    fn packets_go_to_the_requesting_connection_only() {
+        let (connections, sessions) = (ConnectionMap::new(), SessionManager::new());
+        let mut device = connect(&connections, PrincipalKind::Device, org_id());
+        let mut user = connect(&connections, PrincipalKind::User, org_id());
+        // A second socket of the same user (e.g. the app's signaling socket).
+        let (tx, mut sibling_rx) = mpsc::channel(OUTGOING_QUEUE);
         connections.insert(
-            client_id,
+            Uuid::now_v7(),
             ConnectedClient {
-                user_id: client_id,
-                org_id: shared_org,
+                user_id: user.principal_id,
+                org_id: org_id(),
                 kind: PrincipalKind::User,
-                sender: client_tx,
+                sender: tx,
             },
         );
 
-        let router_handle = tokio::spawn(run_signaling_router(
-            sig_rx,
-            connections.clone(),
-            sessions.clone(),
+        route(
+            &connections,
+            &sessions,
+            &user.say(&request(&device, RELAY_TUNNEL_VERSION)),
+        );
+        let Some(SignalPacket::SessionRequest {
+            session_id: Some(sid),
+            ..
+        }) = device.next()
+        else {
+            panic!("expected request");
+        };
+        let accepted = SignalPacket::SessionAccepted {
+            session_id: sid,
+            role: rivetlink_core::SessionRole::Controller,
+        };
+        route(&connections, &sessions, &device.say(&accepted));
+        assert!(matches!(
+            user.next(),
+            Some(SignalPacket::SessionAccepted { .. })
         ));
-        let packet = SignalPacket::HostConsoleState {
-            session_id: rivetlink_core::SessionId(session_id),
+        assert!(sibling_rx.try_recv().is_err());
+    }
+
+    #[test]
+    fn outsiders_cannot_inject_or_close() {
+        let (connections, sessions) = (ConnectionMap::new(), SessionManager::new());
+        let mut device = connect(&connections, PrincipalKind::Device, org_id());
+        let mut user = connect(&connections, PrincipalKind::User, org_id());
+        let outsider = connect(&connections, PrincipalKind::User, org_id());
+        route(
+            &connections,
+            &sessions,
+            &user.say(&request(&device, RELAY_TUNNEL_VERSION)),
+        );
+        let Some(SignalPacket::SessionRequest {
+            session_id: Some(sid),
+            ..
+        }) = device.next()
+        else {
+            panic!("expected request");
+        };
+
+        let state = SignalPacket::HostConsoleState {
+            session_id: sid,
             state: rivetlink_protocol::HostConsoleState::GdmLogin,
             generation: 1,
         };
-        sig_tx
-            .send((
-                device_id,
-                shared_org,
-                serde_json::to_string(&packet).unwrap(),
-            ))
-            .unwrap();
-
-        let forwarded =
-            tokio::time::timeout(std::time::Duration::from_millis(100), client_rx.recv())
-                .await
-                .unwrap()
-                .unwrap();
-        assert!(forwarded.contains("HOST_CONSOLE_STATE"));
-        assert!(forwarded.contains("gdm_login"));
-
-        // An arbitrary tenant peer cannot inject visible console state.
-        let outsider = Uuid::now_v7();
-        sig_tx
-            .send((
-                outsider,
-                shared_org,
-                serde_json::to_string(&packet).unwrap(),
-            ))
-            .unwrap();
-        assert!(
-            tokio::time::timeout(std::time::Duration::from_millis(50), client_rx.recv())
-                .await
-                .is_err()
+        route(&connections, &sessions, &outsider.say(&state));
+        route(
+            &connections,
+            &sessions,
+            &outsider.say(&SignalPacket::SessionClosed { session_id: sid }),
         );
+        assert!(user.next().is_none());
+        assert_eq!(sessions.active_count(), 1);
 
-        drop(sig_tx);
-        let _ = router_handle.await;
+        route(&connections, &sessions, &device.say(&state));
+        assert!(matches!(
+            user.next(),
+            Some(SignalPacket::HostConsoleState { .. })
+        ));
+        route(
+            &connections,
+            &sessions,
+            &user.say(&SignalPacket::SessionClosed { session_id: sid }),
+        );
+        assert!(matches!(
+            device.next(),
+            Some(SignalPacket::SessionClosed { .. })
+        ));
+        assert_eq!(sessions.active_count(), 0);
     }
 
     #[tokio::test]
-    async fn invalid_packet_ignored() {
-        let (connections, sessions) = setup();
-        let (sig_tx, sig_rx) = mpsc::unbounded_channel::<SignalingMessage>();
-
-        let conn_clone = connections.clone();
-        let sess_clone = sessions.clone();
-        let router_handle = tokio::spawn(run_signaling_router(sig_rx, conn_clone, sess_clone));
-
-        sig_tx
-            .send((
-                Uuid::now_v7(),
-                Uuid::now_v7(),
-                "not valid json!!!".to_string(),
-            ))
-            .unwrap();
-
-        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
-
-        drop(sig_tx);
-        let _ = router_handle.await;
-    }
-
-    #[tokio::test]
-    async fn heartbeat_packet_not_forwarded() {
-        let (connections, sessions) = setup();
-        let (sig_tx, sig_rx) = mpsc::unbounded_channel::<SignalingMessage>();
-        let shared_org = org_id();
-
-        let device_id = Uuid::now_v7();
-        let (ws_tx, mut ws_rx) = mpsc::unbounded_channel();
-        connections.insert(
-            device_id,
-            ConnectedClient {
-                user_id: device_id,
-                org_id: shared_org,
-                kind: PrincipalKind::User,
-                sender: ws_tx,
-            },
-        );
-
-        let conn_clone = connections.clone();
-        let sess_clone = sessions.clone();
-        let router_handle = tokio::spawn(run_signaling_router(sig_rx, conn_clone, sess_clone));
-
-        let heartbeat = serde_json::to_string(&SignalPacket::Heartbeat).unwrap();
-        sig_tx.send((device_id, shared_org, heartbeat)).unwrap();
-
-        let result = tokio::time::timeout(std::time::Duration::from_millis(50), ws_rx.recv()).await;
-        assert!(result.is_err(), "heartbeat should not be forwarded");
-
-        drop(sig_tx);
-        let _ = router_handle.await;
+    async fn invalid_and_heartbeat_packets_are_dropped() {
+        let (connections, sessions) = (ConnectionMap::new(), SessionManager::new());
+        let mut device = connect(&connections, PrincipalKind::Device, org_id());
+        let (tx, rx) = mpsc::unbounded_channel();
+        let router = tokio::spawn(run_signaling_router(rx, connections.clone(), sessions));
+        let mut garbage = device.say(&SignalPacket::Heartbeat);
+        tx.send(garbage.clone()).unwrap();
+        garbage.text = "not valid json!!!".to_string();
+        tx.send(garbage).unwrap();
+        drop(tx);
+        router.await.unwrap();
+        assert!(device.next().is_none());
     }
 }

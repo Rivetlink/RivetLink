@@ -1564,4 +1564,158 @@ mod device_auth {
 
         handle.abort();
     }
+
+    type Ws = tokio_tungstenite::WebSocketStream<
+        tokio_tungstenite::MaybeTlsStream<tokio::net::TcpStream>,
+    >;
+
+    async fn next_frame(ws: &mut Ws) -> Option<Message> {
+        tokio::time::timeout(std::time::Duration::from_millis(500), ws.next())
+            .await
+            .ok()
+            .flatten()
+            .map(Result::unwrap)
+    }
+
+    async fn next_json(ws: &mut Ws) -> Value {
+        match next_frame(ws).await {
+            Some(Message::Text(t)) => serde_json::from_str(&t).unwrap(),
+            other => panic!("expected a text frame, got {other:?}"),
+        }
+    }
+
+    async fn connect_user(addr: SocketAddr, token: &str) -> Ws {
+        let (mut ws, _) = tokio_tungstenite::connect_async(format!("ws://{addr}/ws"))
+            .await
+            .unwrap();
+        ws.send(Message::Text(
+            json!({"type": "AUTH", "token": token}).to_string(),
+        ))
+        .await
+        .unwrap();
+        assert_eq!(next_json(&mut ws).await["type"], "AUTHENTICATED");
+        ws
+    }
+
+    async fn connect_device(addr: SocketAddr, device_id: &str, key: &SigningKey) -> Ws {
+        let (mut ws, _) = tokio_tungstenite::connect_async(format!("ws://{addr}/ws"))
+            .await
+            .unwrap();
+        ws.send(Message::Text(
+            json!({"type": "DEVICE_HELLO", "device_id": device_id, "protocol_version": DEVICE_AUTH_PROTOCOL_VERSION}).to_string(),
+        ))
+        .await
+        .unwrap();
+        let challenge = next_json(&mut ws).await;
+        let nonce = base64::engine::general_purpose::STANDARD
+            .decode(challenge["nonce"].as_str().unwrap())
+            .unwrap();
+        let sig = key.sign(&challenge_binding(device_id, &nonce));
+        ws.send(Message::Text(
+            json!({"type": "DEVICE_AUTH", "signature": base64::engine::general_purpose::STANDARD.encode(sig.to_bytes())}).to_string(),
+        ))
+        .await
+        .unwrap();
+        assert_eq!(next_json(&mut ws).await["type"], "AUTHENTICATED");
+        ws
+    }
+
+    #[tokio::test]
+    async fn tunnel_frames_flow_between_the_session_connections_only() {
+        use rivetlink_protocol::{SessionCapability, SignalPacket, RELAY_TUNNEL_VERSION};
+        let Some(state) = setup().await else {
+            eprintln!("skipping: postgres unavailable");
+            return;
+        };
+        // setup() leaves the router off; this test needs it.
+        let (signaling_tx, signaling_rx) = mpsc::unbounded_channel();
+        let state = AppState {
+            signaling_tx,
+            ..state
+        };
+        tokio::spawn(rivetlink_server::signaling::router::run_signaling_router(
+            signaling_rx,
+            state.connections.clone(),
+            state.sessions.clone(),
+        ));
+        let (addr, handle) = spawn_test_server(state.clone()).await;
+
+        let email = unique_email("tunnel");
+        let reg = http_post(
+            addr,
+            "/auth/register",
+            None,
+            json!({
+                "email": email,
+                "password": "secret-password",
+                "display_name": "Tunnel Test",
+                "organization_name": "Tunnel Org",
+            }),
+        )
+        .await;
+        let token = reg["access_token"].as_str().unwrap().to_string();
+        let device_key = fresh_signing_key();
+        let device = http_post(
+            addr,
+            "/devices/register",
+            Some(&token),
+            json!({
+                "public_key": base64::engine::general_purpose::STANDARD.encode(device_key.verifying_key().as_bytes()),
+                "hostname": "tunnel-host",
+                "platform": "linux",
+            }),
+        )
+        .await;
+        let device_id = device["id"].as_str().unwrap().to_string();
+
+        let mut host = connect_device(addr, &device_id, &device_key).await;
+        let mut client = connect_user(addr, &token).await;
+        // Another socket of the same account must not be able to use the session.
+        let mut sibling = connect_user(addr, &token).await;
+
+        let request = SignalPacket::SessionRequest {
+            device_id: rivetlink_core::DeviceId(uuid::Uuid::parse_str(&device_id).unwrap()),
+            client_public_key: "client-key".to_string(),
+            protocol_version: RELAY_TUNNEL_VERSION,
+            requested_capability: SessionCapability::ConsoleControl,
+            session_id: None,
+        };
+        client
+            .send(Message::Text(serde_json::to_string(&request).unwrap()))
+            .await
+            .unwrap();
+        let forwarded = next_json(&mut host).await;
+        assert_eq!(forwarded["type"], "SESSION_REQUEST");
+        let sid = uuid::Uuid::parse_str(forwarded["session_id"].as_str().unwrap()).unwrap();
+        host.send(Message::Text(
+            json!({"type": "SESSION_ACCEPTED", "session_id": sid, "role": "controller"})
+                .to_string(),
+        ))
+        .await
+        .unwrap();
+        assert_eq!(next_json(&mut client).await["type"], "SESSION_ACCEPTED");
+
+        let frame = |payload: &[u8]| [sid.as_bytes().as_slice(), payload].concat();
+        client.send(Message::Binary(frame(b"ping"))).await.unwrap();
+        assert_eq!(
+            next_frame(&mut host).await,
+            Some(Message::Binary(frame(b"ping")))
+        );
+        host.send(Message::Binary(frame(b"pong"))).await.unwrap();
+        assert_eq!(
+            next_frame(&mut client).await,
+            Some(Message::Binary(frame(b"pong")))
+        );
+
+        sibling.send(Message::Binary(frame(b"evil"))).await.unwrap();
+        assert_eq!(next_frame(&mut host).await, None);
+
+        // The client vanishing ends the session and tells the host.
+        drop(client);
+        assert_eq!(next_json(&mut host).await["type"], "SESSION_CLOSED");
+        assert_eq!(state.sessions.active_count(), 0);
+
+        handle.abort();
+        cleanup_test_data(&state, &email).await;
+    }
 }

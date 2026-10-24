@@ -26,12 +26,23 @@ use serde::Deserialize;
 use tokio::sync::mpsc;
 use uuid::Uuid;
 
+use rivetlink_core::SessionId;
+use rivetlink_protocol::{SignalPacket, MAX_TUNNEL_PAYLOAD};
+
 use crate::auth::jwt;
 use crate::db::devices;
-use crate::state::AppState;
-use crate::websocket::connection::{ConnectedClient, PrincipalKind};
+use crate::sessions::manager::ActiveSession;
+use crate::state::{AppState, SignalingMessage};
+use crate::websocket::connection::{ConnectedClient, ConnectionMap, PrincipalKind, OUTGOING_QUEUE};
 use crate::websocket::heartbeat::HeartbeatTracker;
 
+/// Largest WebSocket message accepted. Tunnel frames are at most 64 KiB plus
+/// the session id; legacy screenshot chunks are ~65 KiB of JSON.
+const MAX_WS_MESSAGE: usize = 256 * 1024;
+/// How long a tunnel frame may wait for room in the receiver's queue before
+/// the session is ended as stuck (matches the agent's LAN frame timeout).
+const TUNNEL_SEND_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(10);
+const SESSION_ID_LEN: usize = 16;
 const DEVICE_CHALLENGE_SIZE: usize = 32;
 const DEVICE_AUTH_PROTOCOL_VERSION: u16 = 2;
 const DEVICE_AUTH_DOMAIN: &[u8] = b"rivetlink-relay-device-auth-v2";
@@ -66,7 +77,9 @@ struct AuthOutcome {
 
 /// Upgrade HTTP request to WebSocket; returns rejection with auth timeout if no JWT.
 pub async fn ws_upgrade(ws: WebSocketUpgrade, State(state): State<AppState>) -> impl IntoResponse {
-    ws.on_upgrade(move |socket| handle_socket(socket, state))
+    ws.max_message_size(MAX_WS_MESSAGE)
+        .max_frame_size(MAX_WS_MESSAGE)
+        .on_upgrade(move |socket| handle_socket(socket, state))
 }
 
 #[allow(clippy::cognitive_complexity)]
@@ -99,10 +112,11 @@ async fn handle_socket(socket: WebSocket, state: AppState) {
 
     tracing::info!(principal = %principal_id, ?kind, "websocket authenticated");
 
-    let (outgoing_tx, mut outgoing_rx) = mpsc::unbounded_channel::<String>();
+    let conn_id = Uuid::now_v7();
+    let (outgoing_tx, mut outgoing_rx) = mpsc::channel::<Message>(OUTGOING_QUEUE);
 
     state.connections.insert(
-        principal_id,
+        conn_id,
         ConnectedClient {
             user_id: principal_id,
             org_id,
@@ -111,33 +125,24 @@ async fn handle_socket(socket: WebSocket, state: AppState) {
         },
     );
 
-    let payload = match kind {
-        PrincipalKind::User => serde_json::json!({
-            "type": "AUTHENTICATED",
-            "user_id": principal_id.to_string(),
-        }),
-        PrincipalKind::Device => serde_json::json!({
-            "type": "AUTHENTICATED",
-            "device_id": principal_id.to_string(),
-        }),
-    };
-    let _ = ws_sink.send(Message::Text(payload.to_string())).await;
+    let _ = ws_sink
+        .send(Message::Text(authenticated_message(kind, principal_id)))
+        .await;
 
     let heartbeat = HeartbeatTracker::new(state.config.disconnect_timeout_secs);
 
-    let connections_for_cleanup = state.connections.clone();
-    let signaling_tx = state.signaling_tx.clone();
-
     let write_task = tokio::spawn(async move {
         while let Some(msg) = outgoing_rx.recv().await {
-            if ws_sink.send(Message::Text(msg)).await.is_err() {
+            if ws_sink.send(msg).await.is_err() {
                 break;
             }
         }
     });
 
     let heartbeat_interval_secs = state.config.heartbeat_interval_secs;
+    let reader_state = state.clone();
     let read_task = tokio::spawn(async move {
+        let state = reader_state;
         let mut heartbeat = heartbeat;
         let mut interval =
             tokio::time::interval(std::time::Duration::from_secs(heartbeat_interval_secs));
@@ -148,10 +153,21 @@ async fn handle_socket(socket: WebSocket, state: AppState) {
                     match msg {
                         Some(Ok(Message::Text(text))) => {
                             heartbeat.touch();
-                            if let Err(e) = signaling_tx.send((principal_id, org_id, text)) {
+                            let message = SignalingMessage {
+                                conn_id,
+                                principal_id,
+                                org_id,
+                                kind,
+                                text,
+                            };
+                            if let Err(e) = state.signaling_tx.send(message) {
                                 tracing::error!(error = %e, "signaling channel closed");
                                 break;
                             }
+                        },
+                        Some(Ok(Message::Binary(frame))) => {
+                            heartbeat.touch();
+                            forward_tunnel_frame(&state, conn_id, frame).await;
                         },
                         Some(Ok(Message::Ping(_))) => {
                             heartbeat.touch();
@@ -175,8 +191,74 @@ async fn handle_socket(socket: WebSocket, state: AppState) {
         _ = read_task => {},
     }
 
-    connections_for_cleanup.remove(&principal_id);
+    forget_connection(&state, conn_id);
     tracing::info!(principal = %principal_id, "websocket disconnected");
+}
+
+/// The `AUTHENTICATED` frame telling a principal who it is.
+fn authenticated_message(kind: PrincipalKind, principal_id: Uuid) -> String {
+    let payload = match kind {
+        PrincipalKind::User => serde_json::json!({
+            "type": "AUTHENTICATED",
+            "user_id": principal_id.to_string(),
+        }),
+        PrincipalKind::Device => serde_json::json!({
+            "type": "AUTHENTICATED",
+            "device_id": principal_id.to_string(),
+        }),
+    };
+    payload.to_string()
+}
+
+/// Forward one tunnel frame `[session id][payload]` to the session's other
+/// connection, unread. Waits while that connection's queue is full, so a slow
+/// viewer slows the host down (like TCP on the LAN path) instead of growing
+/// memory; a peer that stays stuck ends the session.
+async fn forward_tunnel_frame(state: &AppState, conn_id: Uuid, frame: Vec<u8>) {
+    if frame.len() <= SESSION_ID_LEN || frame.len() > SESSION_ID_LEN + MAX_TUNNEL_PAYLOAD {
+        tracing::warn!(len = frame.len(), "dropping malformed tunnel frame");
+        return;
+    }
+    let Ok(session_id) = Uuid::from_slice(&frame[..SESSION_ID_LEN]) else {
+        return;
+    };
+    let Some(peer) = state.sessions.tunnel_peer_conn(&session_id, &conn_id) else {
+        tracing::debug!(session = %session_id, "dropping tunnel frame for a session this connection is not in");
+        return;
+    };
+    let Some(sender) = state.connections.get_sender(&peer) else {
+        return;
+    };
+    if sender
+        .send_timeout(Message::Binary(frame), TUNNEL_SEND_TIMEOUT)
+        .await
+        .is_err()
+    {
+        tracing::warn!(session = %session_id, "tunnel peer stuck or gone, ending session");
+        if let Some(session) = state.sessions.remove_session(&session_id) {
+            notify_closed(&state.connections, &session);
+        }
+    }
+}
+
+/// Drop a closed connection and end every session it took part in.
+fn forget_connection(state: &AppState, conn_id: Uuid) {
+    state.connections.remove(&conn_id);
+    for session in state.sessions.remove_for_conn(&conn_id) {
+        notify_closed(&state.connections, &session);
+    }
+}
+
+/// Tell both ends that the relay ended the session.
+fn notify_closed(connections: &ConnectionMap, session: &ActiveSession) {
+    let Ok(text) = serde_json::to_string(&SignalPacket::SessionClosed {
+        session_id: SessionId(session.id),
+    }) else {
+        return;
+    };
+    for conn in [session.initiator_conn, session.device_conn] {
+        connections.send_to(&conn, &text);
+    }
 }
 
 /// Read the first frame and dispatch on its `type` discriminator.
