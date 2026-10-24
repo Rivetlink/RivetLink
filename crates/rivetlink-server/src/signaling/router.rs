@@ -99,15 +99,14 @@ fn route_packet(
                 requested_capability: *requested_capability,
                 session_id: Some(SessionId(session_id)),
             };
-            match serde_json::to_string(&enriched) {
-                Ok(text) => {
-                    if !connections.send_to(&device_conn, &text) {
-                        tracing::warn!(target_device = %device_id, "target device not reachable");
-                    }
-                },
-                Err(e) => {
-                    tracing::error!(error = %e, "failed to serialize enriched session request");
-                },
+            let delivered = serde_json::to_string(&enriched)
+                .is_ok_and(|text| connections.send_to(&device_conn, &text));
+            // Either connection may have closed while this request waited in
+            // the router queue. Its cleanup already ran, so a session bound to
+            // it would never be removed and would hold a slot for good.
+            if !delivered || connections.get_sender(&message.conn_id).is_none() {
+                sessions.remove_session(&session_id);
+                reject("device is offline or unknown");
             }
         },
         SignalPacket::SessionRejected { session_id, .. }
@@ -229,6 +228,19 @@ mod tests {
     fn route(connections: &ConnectionMap, sessions: &SessionManager, message: &SignalingMessage) {
         let packet = serde_json::from_str(&message.text).unwrap();
         route_packet(connections, sessions, message, &packet);
+    }
+
+    #[test]
+    fn a_request_from_a_connection_that_already_closed_leaves_no_session() {
+        let (connections, sessions) = (ConnectionMap::new(), SessionManager::new());
+        let device = connect(&connections, PrincipalKind::Device, org_id());
+        let user = connect(&connections, PrincipalKind::User, org_id());
+        // The socket closed (and was cleaned up) while its request was queued.
+        let queued = user.say(&request(&device, RELAY_TUNNEL_VERSION));
+        connections.remove(&user.conn_id);
+
+        route(&connections, &sessions, &queued);
+        assert_eq!(sessions.active_count(), 0);
     }
 
     #[test]

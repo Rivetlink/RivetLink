@@ -327,7 +327,7 @@ impl RelayClient {
     /// error) drops every running tunnel.
     #[allow(clippy::cognitive_complexity, clippy::too_many_lines)]
     pub async fn run_host_tunnels<H, F, Fut>(
-        mut self,
+        self,
         handler: &mut H,
         max_tunnels: usize,
         serve: F,
@@ -346,9 +346,22 @@ impl RelayClient {
         let mut inbound: BTreeMap<Uuid, mpsc::Sender<Vec<u8>>> = BTreeMap::new();
         let mut tunnels = tokio::task::JoinSet::new();
 
+        // Writing runs on its own task. The read loop below may wait on a
+        // slow tunnel, and that tunnel may itself wait for the link to drain
+        // its output; one task doing both would deadlock.
+        let (mut sink, mut incoming) = self.stream.split();
+        let mut writer = tokio::task::JoinSet::new();
+        writer.spawn(async move {
+            while let Some(message) = out_rx.recv().await {
+                if sink.send(message).await.is_err() {
+                    return;
+                }
+            }
+        });
+
         loop {
             let reply: Vec<String> = tokio::select! {
-                msg = self.stream.next() => match msg {
+                msg = incoming.next() => match msg {
                     Some(Ok(Message::Binary(frame))) => {
                         let Some((sid, payload)) = split_tunnel_frame(&frame) else { continue };
                         let Some(tx) = inbound.get(&sid) else { continue };
@@ -367,7 +380,9 @@ impl RelayClient {
                                 session_id: Some(sid),
                                 ..
                             }) => {
-                                let packet = if inbound.len() >= max_tunnels {
+                                // Counts running tasks: a tunnel dropped from
+                                // `inbound` still runs until it notices.
+                                let packet = if tunnels.len() >= max_tunnels {
                                     SignalPacket::SessionRejected { session_id: sid, reason: "host busy".to_string() }
                                 } else {
                                     let (host_end, pump_end) = tokio::io::duplex(TUNNEL_BUFFER);
@@ -405,40 +420,33 @@ impl RelayClient {
                     Some(Ok(_)) => continue,
                     Some(Err(e)) => return Err(AgentError::WebSocket(e.to_string())),
                 },
-                Some(message) = out_rx.recv() => {
-                    self.stream
-                        .send(message)
-                        .await
-                        .map_err(|e| AgentError::WebSocket(e.to_string()))?;
-                    continue;
+                _ = writer.join_next() => {
+                    return Err(AgentError::WebSocket("relay link write failed".to_string()));
                 },
-                Some(Ok(sid)) = tunnels.join_next(), if !tunnels.is_empty() => {
-                    inbound.remove(&sid);
-                    tracing::info!(session = %sid, "relay tunnel ended");
+                Some(ended) = tunnels.join_next(), if !tunnels.is_empty() => {
+                    if let Ok(sid) = ended {
+                        inbound.remove(&sid);
+                        tracing::info!(session = %sid, "relay tunnel ended");
+                    }
                     continue;
                 },
                 _ = interval.tick() => vec![serde_json::json!({"type": "HEARTBEAT"}).to_string()],
             };
             for frame in reply {
-                self.stream
-                    .send(Message::Text(frame))
-                    .await
-                    .map_err(|e| AgentError::WebSocket(e.to_string()))?;
+                if out_tx.send(Message::Text(frame)).await.is_err() {
+                    return Err(AgentError::WebSocket("relay link closed".to_string()));
+                }
             }
         }
     }
 }
 
 fn ensure_secure_relay_url(url: &str) -> AgentResult<()> {
-    // Plain ws:// only to this machine (tests, a relay on the same host).
-    let loopback = ["ws://127.0.0.1:", "ws://localhost:", "ws://[::1]:"];
-    if url.starts_with("wss://") || loopback.iter().any(|prefix| url.starts_with(prefix)) {
-        Ok(())
-    } else {
-        Err(AgentError::Config(
+    rivetlink_sdk::relay_tunnel::require_secure_ws(url).map_err(|_| {
+        AgentError::Config(
             "relay_url must use wss://; plaintext relay WebSockets are unsafe".to_string(),
-        ))
-    }
+        )
+    })
 }
 
 fn device_challenge_binding(device_id: Uuid, nonce: &[u8; 32]) -> Vec<u8> {
@@ -496,15 +504,15 @@ async fn tunnel_pump(
         }
     };
     tokio::select! {
-        () = upstream => {
-            let closed = rivetlink_protocol::SignalPacket::SessionClosed {
-                session_id: rivetlink_core::SessionId(session_id),
-            };
-            if let Ok(text) = serde_json::to_string(&closed) {
-                let _ = out.send(Message::Text(text)).await;
-            }
-        },
+        () = upstream => {},
         () = downstream => {},
+    }
+    // Whichever side ended it, the relay and the viewer must hear of it.
+    let closed = rivetlink_protocol::SignalPacket::SessionClosed {
+        session_id: rivetlink_core::SessionId(session_id),
+    };
+    if let Ok(text) = serde_json::to_string(&closed) {
+        let _ = out.send(Message::Text(text)).await;
     }
 }
 

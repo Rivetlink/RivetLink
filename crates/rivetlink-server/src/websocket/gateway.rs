@@ -42,6 +42,8 @@ const MAX_WS_MESSAGE: usize = 256 * 1024;
 /// How long a tunnel frame may wait for room in the receiver's queue before
 /// the session is ended as stuck (matches the agent's LAN frame timeout).
 const TUNNEL_SEND_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(10);
+/// How long a session-closed notice may wait for room in a full queue.
+const CLOSE_NOTICE_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(30);
 const SESSION_ID_LEN: usize = 16;
 const DEVICE_CHALLENGE_SIZE: usize = 32;
 const DEVICE_AUTH_PROTOCOL_VERSION: u16 = 2;
@@ -131,7 +133,7 @@ async fn handle_socket(socket: WebSocket, state: AppState) {
 
     let heartbeat = HeartbeatTracker::new(state.config.disconnect_timeout_secs);
 
-    let write_task = tokio::spawn(async move {
+    let mut write_task = tokio::spawn(async move {
         while let Some(msg) = outgoing_rx.recv().await {
             if ws_sink.send(msg).await.is_err() {
                 break;
@@ -141,7 +143,7 @@ async fn handle_socket(socket: WebSocket, state: AppState) {
 
     let heartbeat_interval_secs = state.config.heartbeat_interval_secs;
     let reader_state = state.clone();
-    let read_task = tokio::spawn(async move {
+    let mut read_task = tokio::spawn(async move {
         let state = reader_state;
         let mut heartbeat = heartbeat;
         let mut interval =
@@ -187,9 +189,12 @@ async fn handle_socket(socket: WebSocket, state: AppState) {
     });
 
     tokio::select! {
-        _ = write_task => {},
-        _ = read_task => {},
+        _ = &mut write_task => {},
+        _ = &mut read_task => {},
     }
+    // Both halves share the socket; it only closes once neither task holds it.
+    write_task.abort();
+    read_task.abort();
 
     forget_connection(&state, conn_id);
     tracing::info!(principal = %principal_id, "websocket disconnected");
@@ -211,9 +216,8 @@ fn authenticated_message(kind: PrincipalKind, principal_id: Uuid) -> String {
 }
 
 /// Forward one tunnel frame `[session id][payload]` to the session's other
-/// connection, unread. Waits while that connection's queue is full, so a slow
-/// viewer slows the host down (like TCP on the LAN path) instead of growing
-/// memory; a peer that stays stuck ends the session.
+/// connection, unread. Queues are bounded, so memory never grows with a slow
+/// peer; a peer that cannot keep up ends the session.
 async fn forward_tunnel_frame(state: &AppState, conn_id: Uuid, frame: Vec<u8>) {
     if frame.len() <= SESSION_ID_LEN || frame.len() > SESSION_ID_LEN + MAX_TUNNEL_PAYLOAD {
         tracing::warn!(len = frame.len(), "dropping malformed tunnel frame");
@@ -226,17 +230,29 @@ async fn forward_tunnel_frame(state: &AppState, conn_id: Uuid, frame: Vec<u8>) {
         tracing::debug!(session = %session_id, "dropping tunnel frame for a session this connection is not in");
         return;
     };
-    let Some(sender) = state.connections.get_sender(&peer) else {
+    let Some(client) = state.connections.get_client(&peer) else {
         return;
     };
-    if sender
-        .send_timeout(Message::Binary(frame), TUNNEL_SEND_TIMEOUT)
-        .await
-        .is_err()
-    {
+    // A host's frames go to many viewers through its one connection, so a
+    // viewer whose queue is full is cut off instead of stalling the others.
+    // Frames to a host wait, which slows only the viewer sending them.
+    let delivered = if client.kind == PrincipalKind::User {
+        client.sender.try_send(Message::Binary(frame)).is_ok()
+    } else {
+        client
+            .sender
+            .send_timeout(Message::Binary(frame), TUNNEL_SEND_TIMEOUT)
+            .await
+            .is_ok()
+    };
+    if !delivered {
         tracing::warn!(session = %session_id, "tunnel peer stuck or gone, ending session");
         if let Some(session) = state.sessions.remove_session(&session_id) {
             notify_closed(&state.connections, &session);
+        }
+        if client.kind == PrincipalKind::User {
+            // Closing the stuck viewer's socket gives its side an EOF.
+            state.connections.remove(&peer);
         }
     }
 }
@@ -249,7 +265,9 @@ fn forget_connection(state: &AppState, conn_id: Uuid) {
     }
 }
 
-/// Tell both ends that the relay ended the session.
+/// Tell both ends that the relay ended the session. The notice waits for
+/// room in a full queue: a host that missed it would keep serving the
+/// session (capturing and encoding) for nobody.
 fn notify_closed(connections: &ConnectionMap, session: &ActiveSession) {
     let Ok(text) = serde_json::to_string(&SignalPacket::SessionClosed {
         session_id: SessionId(session.id),
@@ -257,7 +275,12 @@ fn notify_closed(connections: &ConnectionMap, session: &ActiveSession) {
         return;
     };
     for conn in [session.initiator_conn, session.device_conn] {
-        connections.send_to(&conn, &text);
+        if let Some(sender) = connections.get_sender(&conn) {
+            let message = Message::Text(text.clone());
+            tokio::spawn(async move {
+                let _ = sender.send_timeout(message, CLOSE_NOTICE_TIMEOUT).await;
+            });
+        }
     }
 }
 

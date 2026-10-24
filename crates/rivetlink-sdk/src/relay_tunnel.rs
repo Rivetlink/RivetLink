@@ -56,14 +56,22 @@ pub async fn open(params: TunnelParams<'_>) -> SdkResult<DuplexStream> {
 /// Only `wss://` crosses a network. Plain `ws://` is allowed to the local
 /// machine, for tests and a relay on the same host.
 pub fn require_secure_ws(url: &str) -> SdkResult<()> {
-    let loopback = ["ws://127.0.0.1:", "ws://localhost:", "ws://[::1]:"];
-    if url.starts_with("wss://") || loopback.iter().any(|prefix| url.starts_with(prefix)) {
-        Ok(())
-    } else {
-        Err(SdkError::Config(
-            "relay URL must use wss://; plaintext relay WebSockets are unsafe".to_string(),
-        ))
+    if url.starts_with("wss://") {
+        return Ok(());
     }
+    if let Some(rest) = url.strip_prefix("ws://") {
+        let authority = rest.split(['/', '?', '#']).next().unwrap_or_default();
+        let host = authority
+            .rsplit_once(':')
+            .map_or(authority, |(host, _)| host);
+        // No userinfo: `ws://localhost:80@evil.com` connects to evil.com.
+        if !authority.contains('@') && ["127.0.0.1", "localhost", "[::1]"].contains(&host) {
+            return Ok(());
+        }
+    }
+    Err(SdkError::Config(
+        "relay URL must use wss://; plaintext relay WebSockets are unsafe".to_string(),
+    ))
 }
 
 type Ws =
@@ -221,5 +229,9 @@ mod tests {
         assert!(require_secure_ws("ws://127.0.0.1.evil.com:80/ws").is_err());
         assert!(require_secure_ws("ws://localhost.evil.com/ws").is_err());
         assert!(require_secure_ws("http://127.0.0.1:8080").is_err());
+        assert!(require_secure_ws("ws://[::1]:8080/ws").is_ok());
+        assert!(require_secure_ws("ws://localhost:80@evil.com/ws").is_err());
+        assert!(require_secure_ws("ws://127.0.0.1:80@evil.com:80/ws").is_err());
+        assert!(require_secure_ws("ws://evil.com/127.0.0.1:80").is_err());
     }
 }
