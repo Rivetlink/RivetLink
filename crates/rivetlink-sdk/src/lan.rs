@@ -746,8 +746,8 @@ async fn connect_key(
     Ok((stream, channel))
 }
 
-async fn key_handshake(
-    stream: &mut TcpStream,
+async fn key_handshake<S: AsyncRead + AsyncWrite + Unpin>(
+    stream: &mut S,
     identity: &Identity,
     pinned: Option<VerifyingKey>,
     hybrid: bool,
@@ -759,6 +759,31 @@ async fn key_handshake(
     .await
     .map_err(|_| SdkError::Crypto("direct-LAN handshake timed out".to_string()))?
 }
+
+/// Key-mode handshake over an already open stream, such as a relay tunnel.
+/// The host must match `pinned_host_b64`. Always hybrid: a host that speaks
+/// the tunnel also speaks v3, so a failure is never answered with a classical
+/// retry (a relay could otherwise force one by cutting the connection).
+pub async fn connect_key_over<S: AsyncRead + AsyncWrite + Unpin>(
+    stream: &mut S,
+    identity: &Identity,
+    pinned_host_b64: &str,
+) -> SdkResult<SealedChannel> {
+    let pinned = parse_pinned_host(Some(pinned_host_b64))?;
+    let channel = key_handshake(stream, identity, pinned, true).await?;
+    // The host proved v3, so the direct LAN path must not fall back either.
+    if let Some(key) = pinned {
+        pq_pins::remember(B64.encode(key.to_bytes()));
+    }
+    Ok(channel)
+}
+
+/// Any byte stream a LAN session can run over: TCP or a relay tunnel.
+pub trait LanIo: AsyncRead + AsyncWrite + Send + Unpin {}
+impl<T: AsyncRead + AsyncWrite + Send + Unpin> LanIo for T {}
+
+/// A LAN session stream whose transport is chosen at runtime.
+pub type BoxedIo = Box<dyn LanIo>;
 
 /// A host older than v3 rejects the hybrid hello by closing the connection.
 /// Only that — not a timeout or a protocol error — earns a classical retry.
@@ -817,13 +842,18 @@ pub async fn console_capture_key_pinned(
     inputs: Vec<ConsoleInputPacket>,
 ) -> SdkResult<ConsoleCapture> {
     let (mut stream, channel) = connect_key_pinned(addr, identity, pinned_host_b64).await?;
-    send_request(
-        &mut stream,
-        &channel,
-        &LanRequest::ConsoleCapture { inputs },
-    )
-    .await?;
-    match recv_response(&mut stream, &channel).await? {
+    console_capture_on(&mut stream, &channel, inputs).await
+}
+
+/// One physical-console transaction on an established session. A relay
+/// tunnel reuses one session for many of these.
+pub async fn console_capture_on<S: AsyncRead + AsyncWrite + Unpin>(
+    stream: &mut S,
+    channel: &SealedChannel,
+    inputs: Vec<ConsoleInputPacket>,
+) -> SdkResult<ConsoleCapture> {
+    send_request(stream, channel, &LanRequest::ConsoleCapture { inputs }).await?;
+    match recv_response(stream, channel).await? {
         LanResponse::ConsoleCapture {
             png_b64,
             state,
@@ -877,7 +907,10 @@ fn parse_pinned_host(pinned_host_b64: Option<&str>) -> SdkResult<Option<Verifyin
     }
 }
 
-async fn fetch_screenshot(stream: &mut TcpStream, channel: &SealedChannel) -> SdkResult<Vec<u8>> {
+async fn fetch_screenshot<S: AsyncRead + AsyncWrite + Unpin>(
+    stream: &mut S,
+    channel: &SealedChannel,
+) -> SdkResult<Vec<u8>> {
     send_request(stream, channel, &LanRequest::Screenshot).await?;
     match recv_response(stream, channel).await? {
         LanResponse::Screenshot { png_b64 } => B64
@@ -892,8 +925,8 @@ async fn fetch_screenshot(stream: &mut TcpStream, channel: &SealedChannel) -> Sd
 
 /// Ask the host which displays it can share. Returns an empty list when the
 /// host can't enumerate them (Linux: the ScreenCast portal owns selection).
-pub async fn list_displays(
-    stream: &mut TcpStream,
+pub async fn list_displays<S: AsyncRead + AsyncWrite + Unpin>(
+    stream: &mut S,
     channel: &SealedChannel,
 ) -> SdkResult<Vec<DisplayInfo>> {
     list_displays_and_features(stream, channel)
@@ -903,8 +936,8 @@ pub async fn list_displays(
 
 /// Like [`list_displays`], plus the optional features (see [`crate::share`])
 /// this client may use on the host. Empty for hosts without sharing.
-pub async fn list_displays_and_features(
-    stream: &mut TcpStream,
+pub async fn list_displays_and_features<S: AsyncRead + AsyncWrite + Unpin>(
+    stream: &mut S,
     channel: &SealedChannel,
 ) -> SdkResult<(Vec<DisplayInfo>, Vec<String>)> {
     send_request(stream, channel, &LanRequest::ListDisplays).await?;
@@ -930,8 +963,8 @@ pub async fn list_displays_and_features(
 // identity, control channel, sink); bundling them into a struct would add
 // ceremony without clarity.
 #[allow(clippy::too_many_arguments, clippy::cognitive_complexity)]
-pub async fn stream_frames<F, D, E>(
-    stream: TcpStream,
+pub async fn stream_frames<S, F, D, E>(
+    stream: S,
     channel: SealedChannel,
     fps: u16,
     display: Option<u32>,
@@ -945,6 +978,7 @@ pub async fn stream_frames<F, D, E>(
     mut on_share: E,
 ) -> SdkResult<()>
 where
+    S: AsyncRead + AsyncWrite + Send + 'static,
     F: FnMut(StreamFrame) -> bool,
     D: FnMut(Vec<DisplayInfo>),
     E: FnMut(LanResponse),
@@ -957,7 +991,7 @@ where
     let scr = display;
     tracing::info!(fps, screen = ?scr, "LAN stream: requesting StartStream");
     let channel = Arc::new(channel);
-    let (mut rd, mut wr) = stream.into_split();
+    let (mut rd, mut wr) = tokio::io::split(stream);
     // Announce our identity (signed) alongside the stream request so a host we
     // reached by PIN can offer to remember this device (trust-on-connect).
     let (identity_key, identity_sig) = match identity {
