@@ -30,6 +30,7 @@ use rivetlink_protocol::{ConsoleInputPacket, HostConsoleState};
 use crate::direct;
 use crate::error::{SdkError, SdkResult};
 use crate::identity::Identity;
+use crate::pq_pins;
 
 /// mDNS service type RivetLink hosts advertise under.
 pub const SERVICE_TYPE: &str = "_rivetlink._tcp.local.";
@@ -687,7 +688,16 @@ pub async fn connect_password(
 ) -> SdkResult<(TcpStream, SealedChannel)> {
     tracing::info!(%addr, "LAN connect: PIN mode");
     let mut stream = connect_nodelay(addr).await?;
-    let channel = direct::client_connect_password(&mut stream, password).await?;
+    // PIN mode has no host key to remember PQ support for, so an old host
+    // (one that closes on v3) always gets the classical retry.
+    let channel = match direct::client_connect_password(&mut stream, password, true).await {
+        Err(e) if is_old_host_close(&e) => {
+            tracing::warn!(%addr, "LAN connect: host closed hybrid handshake, retrying classical");
+            stream = connect_nodelay(addr).await?;
+            direct::client_connect_password(&mut stream, password, false).await?
+        },
+        result => result?,
+    };
     tracing::info!(%addr, "LAN connect: channel up (PIN)");
     Ok((stream, channel))
 }
@@ -699,17 +709,68 @@ pub async fn connect_key_pinned(
     identity: &Identity,
     pinned_host_b64: Option<&str>,
 ) -> SdkResult<(TcpStream, SealedChannel)> {
-    let pinned = parse_pinned_host(pinned_host_b64)?;
+    connect_key(addr, identity, parse_pinned_host(pinned_host_b64)?).await
+}
+
+/// Key-mode connect. Tries the hybrid (ML-KEM) handshake first. A host that
+/// closes the connection on it is assumed to predate v3 and gets one
+/// classical retry — unless it completed a hybrid handshake before, in which
+/// case the close is treated as a downgrade attempt and fails.
+async fn connect_key(
+    addr: SocketAddr,
+    identity: &Identity,
+    pinned: Option<VerifyingKey>,
+) -> SdkResult<(TcpStream, SealedChannel)> {
     tracing::info!(%addr, pinned = pinned.is_some(), "LAN connect: key mode");
+    let host_b64 = pinned.map(|key| B64.encode(key.to_bytes()));
     let mut stream = connect_nodelay(addr).await?;
-    let channel = tokio::time::timeout(
-        DIRECT_HANDSHAKE_TIMEOUT,
-        direct::client_connect_key(&mut stream, identity, pinned),
-    )
-    .await
-    .map_err(|_| SdkError::Crypto("direct-LAN handshake timed out".to_string()))??;
+    let channel = match key_handshake(&mut stream, identity, pinned, true).await {
+        Ok(channel) => {
+            if let Some(host) = host_b64 {
+                pq_pins::remember(host);
+            }
+            channel
+        },
+        Err(e) if is_old_host_close(&e) => {
+            if let Some(reason) = host_b64.as_deref().and_then(pq_pins::refuses_downgrade) {
+                tracing::warn!(%addr, reason, "LAN connect: classical retry refused");
+                return Err(SdkError::Crypto(reason.to_string()));
+            }
+            tracing::warn!(%addr, "LAN connect: host closed hybrid handshake, retrying classical");
+            stream = connect_nodelay(addr).await?;
+            key_handshake(&mut stream, identity, pinned, false).await?
+        },
+        Err(e) => return Err(e),
+    };
     tracing::info!(%addr, "LAN connect: channel up (key)");
     Ok((stream, channel))
+}
+
+async fn key_handshake(
+    stream: &mut TcpStream,
+    identity: &Identity,
+    pinned: Option<VerifyingKey>,
+    hybrid: bool,
+) -> SdkResult<SealedChannel> {
+    tokio::time::timeout(
+        DIRECT_HANDSHAKE_TIMEOUT,
+        direct::client_connect_key(stream, identity, pinned, hybrid),
+    )
+    .await
+    .map_err(|_| SdkError::Crypto("direct-LAN handshake timed out".to_string()))?
+}
+
+/// A host older than v3 rejects the hybrid hello by closing the connection.
+/// Only that — not a timeout or a protocol error — earns a classical retry.
+fn is_old_host_close(error: &SdkError) -> bool {
+    use std::io::ErrorKind;
+    matches!(
+        error,
+        SdkError::Io(e) if matches!(
+            e.kind(),
+            ErrorKind::UnexpectedEof | ErrorKind::ConnectionReset | ErrorKind::ConnectionAborted | ErrorKind::BrokenPipe
+        )
+    )
 }
 
 /// Connect to a host over the LAN with a shared PIN (PAKE) and fetch one
@@ -727,8 +788,7 @@ pub async fn screenshot_key(
     identity: &Identity,
     pinned_host: Option<VerifyingKey>,
 ) -> SdkResult<Vec<u8>> {
-    let mut stream = connect_nodelay(addr).await?;
-    let channel = direct::client_connect_key(&mut stream, identity, pinned_host).await?;
+    let (mut stream, channel) = connect_key(addr, identity, pinned_host).await?;
     fetch_screenshot(&mut stream, &channel).await
 }
 
@@ -1125,5 +1185,156 @@ mod tests {
             physical_console: false,
         };
         assert_eq!(dev.socket_addr().unwrap().to_string(), "192.168.1.5:7000");
+    }
+
+    /// A host that answers the first connection like a pre-v3 host (reads the
+    /// hello, then closes) and runs the real handshake on the second.
+    async fn old_then_new_host(
+        host_id: Identity,
+    ) -> (SocketAddr, tokio::task::JoinHandle<SdkResult<()>>) {
+        use tokio::net::TcpListener;
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let host = tokio::spawn(async move {
+            let (mut first, _) = listener.accept().await?;
+            let mut len = [0u8; 4];
+            first.read_exact(&mut len).await?;
+            let mut hello = vec![0u8; u32::from_be_bytes(len) as usize];
+            first.read_exact(&mut hello).await?;
+            drop(first);
+            let (mut second, _) = listener.accept().await?;
+            direct::host_accept_key(&mut second, &host_id, |_| true).await?;
+            Ok(())
+        });
+        (addr, host)
+    }
+
+    #[tokio::test]
+    async fn key_connect_falls_back_for_an_unpinned_old_host() {
+        let client = Identity::from_signing_key(ed25519_dalek::SigningKey::from_bytes(&[21u8; 32]));
+        let host_id =
+            Identity::from_signing_key(ed25519_dalek::SigningKey::from_bytes(&[22u8; 32]));
+        let pin = host_id.signing_key().verifying_key();
+        let (addr, host) = old_then_new_host(host_id).await;
+        connect_key(addr, &client, Some(pin)).await.unwrap();
+        host.await.unwrap().unwrap();
+        // A classical session does not mark the host as PQ-capable.
+        assert!(pq_pins::refuses_downgrade(&B64.encode(pin.to_bytes())).is_none());
+    }
+
+    #[tokio::test]
+    async fn key_connect_refuses_a_downgrade_from_a_pq_pinned_host() {
+        let client = Identity::from_signing_key(ed25519_dalek::SigningKey::from_bytes(&[23u8; 32]));
+        let host_id =
+            Identity::from_signing_key(ed25519_dalek::SigningKey::from_bytes(&[24u8; 32]));
+        let pin = host_id.signing_key().verifying_key();
+        pq_pins::remember(B64.encode(pin.to_bytes()));
+        let (addr, host) = old_then_new_host(host_id).await;
+        let error = connect_key(addr, &client, Some(pin)).await.unwrap_err();
+        assert!(error.to_string().contains("refusing a downgrade"));
+        host.abort();
+    }
+
+    #[tokio::test]
+    async fn a_hybrid_key_connect_pins_the_host() {
+        use tokio::net::TcpListener;
+        let client = Identity::from_signing_key(ed25519_dalek::SigningKey::from_bytes(&[25u8; 32]));
+        let host_id =
+            Identity::from_signing_key(ed25519_dalek::SigningKey::from_bytes(&[26u8; 32]));
+        let pin = host_id.signing_key().verifying_key();
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let host = tokio::spawn(async move {
+            let (mut stream, _) = listener.accept().await.unwrap();
+            direct::host_accept_key(&mut stream, &host_id, |_| true)
+                .await
+                .unwrap();
+        });
+        connect_key(addr, &client, Some(pin)).await.unwrap();
+        host.await.unwrap();
+        assert!(pq_pins::refuses_downgrade(&B64.encode(pin.to_bytes())).is_some());
+    }
+
+    #[tokio::test]
+    async fn password_connect_falls_back_for_an_old_host() {
+        use tokio::net::TcpListener;
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let host = tokio::spawn(async move {
+            let (mut first, _) = listener.accept().await.unwrap();
+            let mut len = [0u8; 4];
+            first.read_exact(&mut len).await.unwrap();
+            let mut hello = vec![0u8; u32::from_be_bytes(len) as usize];
+            first.read_exact(&mut hello).await.unwrap();
+            drop(first);
+            let (mut second, _) = listener.accept().await.unwrap();
+            direct::host_accept_password(&mut second, "4821")
+                .await
+                .unwrap();
+        });
+        connect_password(addr, "4821").await.unwrap();
+        host.await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn a_rejection_does_not_fall_back() {
+        use tokio::net::TcpListener;
+        let client = Identity::from_signing_key(ed25519_dalek::SigningKey::from_bytes(&[27u8; 32]));
+        let host_id =
+            Identity::from_signing_key(ed25519_dalek::SigningKey::from_bytes(&[28u8; 32]));
+        let pin = host_id.signing_key().verifying_key();
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        // One connection only: a retry would hit a closed port instead.
+        let host = tokio::spawn(async move {
+            let (mut stream, _) = listener.accept().await.unwrap();
+            drop(listener);
+            let _ = direct::host_accept_key(&mut stream, &host_id, |_| false).await;
+        });
+        let error = connect_key(addr, &client, Some(pin)).await.unwrap_err();
+        assert!(error.to_string().contains("connection rejected"), "{error}");
+        host.await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn a_close_after_the_host_answered_does_not_fall_back() {
+        use tokio::io::{AsyncReadExt as _, AsyncWriteExt as _};
+        let client = Identity::from_signing_key(ed25519_dalek::SigningKey::from_bytes(&[29u8; 32]));
+        let host_id =
+            Identity::from_signing_key(ed25519_dalek::SigningKey::from_bytes(&[30u8; 32]));
+        let pin = host_id.signing_key().verifying_key();
+        let (mut c, h) = tokio::io::duplex(16 * 1024);
+        // Relay the real host's key exchange, then cut the line before the
+        // confirmation can come back.
+        let host = tokio::spawn(async move {
+            let (mut relay, mut h) = (h, tokio::io::duplex(16 * 1024));
+            let real = tokio::spawn(async move {
+                let _ = direct::host_accept_key(&mut h.1, &host_id, |_| true).await;
+            });
+            for _ in 0..2 {
+                let mut len = [0u8; 4];
+                relay.read_exact(&mut len).await.unwrap();
+                let mut frame = vec![0u8; u32::from_be_bytes(len) as usize];
+                relay.read_exact(&mut frame).await.unwrap();
+                h.0.write_all(&len).await.unwrap();
+                h.0.write_all(&frame).await.unwrap();
+                if frame.starts_with(br#"{"t":"Confirm""#) {
+                    break;
+                }
+                let mut len = [0u8; 4];
+                h.0.read_exact(&mut len).await.unwrap();
+                let mut reply = vec![0u8; u32::from_be_bytes(len) as usize];
+                h.0.read_exact(&mut reply).await.unwrap();
+                relay.write_all(&len).await.unwrap();
+                relay.write_all(&reply).await.unwrap();
+            }
+            drop(relay);
+            real.abort();
+        });
+        let error = direct::client_connect_key(&mut c, &client, Some(pin), true)
+            .await
+            .unwrap_err();
+        assert!(!is_old_host_close(&error), "{error}");
+        host.await.unwrap();
     }
 }

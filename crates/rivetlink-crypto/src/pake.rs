@@ -24,9 +24,9 @@
 //! let b = pake::start(b"4821");
 //! let transcript = b"rivetlink-direct-session-transcript";
 //! let chan_a = a.handshake
-//!     .finish(&b.message, transcript, ChannelRole::Initiator).unwrap();
+//!     .finish(&b.message, None, transcript, ChannelRole::Initiator).unwrap();
 //! let chan_b = b.handshake
-//!     .finish(&a.message, transcript, ChannelRole::Responder).unwrap();
+//!     .finish(&a.message, None, transcript, ChannelRole::Responder).unwrap();
 //!
 //! // Matching PINs -> interoperable channel.
 //! let sealed = chan_a.seal(b"hello").unwrap();
@@ -91,23 +91,36 @@ impl PakeHandshake {
     /// Returns [`CryptoError::PakeFailed`] only if the peer's message is
     /// malformed. A *wrong* password does not fail here — it yields a channel
     /// whose first [`SealedChannel::open`] will fail (see the module docs).
+    ///
+    /// With `pq`, the channel key also depends on that ML-KEM secret (see
+    /// [`crate::handshake::hybrid_secret`]); the transcript must then include
+    /// the ML-KEM encapsulation key and ciphertext.
     pub fn finish(
         self,
         peer_message: &[u8],
+        pq: Option<&crate::pq_kem::PqSharedSecret>,
         transcript: &[u8],
         role: ChannelRole,
     ) -> CryptoResult<SealedChannel> {
-        let key = self
-            .state
-            .finish(peer_message)
-            .map_err(|_| CryptoError::PakeFailed)?;
+        let key = zeroize::Zeroizing::new(
+            self.state
+                .finish(peer_message)
+                .map_err(|_| CryptoError::PakeFailed)?,
+        );
 
         if key.len() != 32 {
             return Err(CryptoError::PakeFailed);
         }
-        let mut secret = [0u8; 32];
+        let mut secret = zeroize::Zeroizing::new([0u8; 32]);
         secret.copy_from_slice(&key);
-        SealedChannel::from_handshake_secret(&secret, transcript, role)
+        match pq {
+            Some(pq) => SealedChannel::from_handshake_secret(
+                crate::handshake::hybrid_secret(pq, &secret).as_slice(),
+                transcript,
+                role,
+            ),
+            None => SealedChannel::from_handshake_secret(secret.as_slice(), transcript, role),
+        }
     }
 }
 
@@ -122,11 +135,11 @@ mod tests {
         let transcript = b"rivetlink-pake-test";
         let chan_a = a
             .handshake
-            .finish(&b.message, transcript, ChannelRole::Initiator)
+            .finish(&b.message, None, transcript, ChannelRole::Initiator)
             .unwrap();
         let chan_b = b
             .handshake
-            .finish(&a.message, transcript, ChannelRole::Responder)
+            .finish(&a.message, None, transcript, ChannelRole::Responder)
             .unwrap();
 
         let sealed = chan_a.seal(b"secret").unwrap();
@@ -141,11 +154,11 @@ mod tests {
         let transcript = b"rivetlink-pake-test";
         let chan_a = a
             .handshake
-            .finish(&b.message, transcript, ChannelRole::Initiator)
+            .finish(&b.message, None, transcript, ChannelRole::Initiator)
             .unwrap();
         let chan_b = b
             .handshake
-            .finish(&a.message, transcript, ChannelRole::Responder)
+            .finish(&a.message, None, transcript, ChannelRole::Responder)
             .unwrap();
         // …but the keys differ, so the AEAD tag fails to authenticate.
         let sealed = chan_a.seal(b"secret").unwrap();
@@ -158,6 +171,7 @@ mod tests {
         assert!(matches!(
             a.handshake.finish(
                 b"not a valid spake message",
+                None,
                 b"rivetlink-pake-test",
                 ChannelRole::Initiator,
             ),
@@ -173,14 +187,14 @@ mod tests {
         let b1 = start(b"pw");
         let chan1 = a1
             .handshake
-            .finish(&b1.message, b"run1", ChannelRole::Initiator)
+            .finish(&b1.message, None, b"run1", ChannelRole::Initiator)
             .unwrap();
 
         let a2 = start(b"pw");
         let b2 = start(b"pw");
         let chan2 = a2
             .handshake
-            .finish(&b2.message, b"run2", ChannelRole::Initiator)
+            .finish(&b2.message, None, b"run2", ChannelRole::Initiator)
             .unwrap();
 
         let sealed = chan1.seal(b"x").unwrap();

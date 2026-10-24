@@ -16,6 +16,7 @@ pub mod direct;
 pub mod error;
 pub mod identity;
 pub mod lan;
+pub mod pq_pins;
 pub mod rest;
 pub mod session;
 pub mod share;

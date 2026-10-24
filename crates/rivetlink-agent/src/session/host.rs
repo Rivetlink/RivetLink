@@ -369,6 +369,7 @@ impl ScreenshotHost {
         self.channel = Some(
             kex.into_channel(
                 &peer_eph,
+                None,
                 &relay_transcript(
                     sid,
                     identity_public_key,
@@ -1040,6 +1041,7 @@ mod tests {
         let channel = client_kex
             .into_channel(
                 &decode_32(ephemeral_public_key).unwrap(),
+                None,
                 &relay_transcript(
                     session_id,
                     &client_b64,
@@ -1129,6 +1131,7 @@ mod tests {
         let client_channel = client_kex
             .into_channel(
                 &host_ephemeral,
+                None,
                 &relay_transcript(sid, &client_b64, host_identity, &client_packet, &host_kex)
                     .unwrap(),
                 ChannelRole::Initiator,

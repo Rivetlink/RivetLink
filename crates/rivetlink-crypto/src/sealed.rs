@@ -58,7 +58,7 @@ impl SealedChannel {
     /// associated data, so a key cannot be transplanted into another RivetLink
     /// protocol, role, or handshake.
     pub fn from_handshake_secret(
-        shared: &[u8; 32],
+        shared: &[u8],
         transcript: &[u8],
         role: ChannelRole,
     ) -> CryptoResult<Self> {
