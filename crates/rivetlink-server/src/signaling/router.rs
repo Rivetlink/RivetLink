@@ -142,11 +142,16 @@ fn forward(
     session_id: &SessionId,
 ) -> bool {
     let Some(peer) = sessions.peer_conn(&session_id.0, &message.conn_id) else {
-        tracing::warn!(
-            sender = %message.principal_id,
-            session = %session_id,
-            "unauthorized: sender is not a session member"
-        );
+        if sessions.get_session_org(&session_id.0).is_some() {
+            tracing::warn!(
+                sender = %message.principal_id,
+                session = %session_id,
+                "unauthorized: sender is not a session member"
+            );
+        } else {
+            // Routine: an end echoing the close of a session already gone.
+            tracing::debug!(session = %session_id, "packet for an ended session dropped");
+        }
         return false;
     };
     if !connections.send_to(&peer, &message.text) {

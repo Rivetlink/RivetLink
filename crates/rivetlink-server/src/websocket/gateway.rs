@@ -42,6 +42,8 @@ const MAX_WS_MESSAGE: usize = 256 * 1024;
 /// How long a tunnel frame may wait for room in the receiver's queue before
 /// the session is ended as stuck (matches the agent's LAN frame timeout).
 const TUNNEL_SEND_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(10);
+/// How long one message may take to reach a peer's socket.
+const SOCKET_WRITE_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(30);
 /// How long a session-closed notice may wait for room in a full queue.
 const CLOSE_NOTICE_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(30);
 const SESSION_ID_LEN: usize = 16;
@@ -115,7 +117,7 @@ async fn handle_socket(socket: WebSocket, state: AppState) {
     tracing::info!(principal = %principal_id, ?kind, "websocket authenticated");
 
     let conn_id = Uuid::now_v7();
-    let (outgoing_tx, mut outgoing_rx) = mpsc::channel::<Message>(OUTGOING_QUEUE);
+    let (outgoing_tx, outgoing_rx) = mpsc::channel::<Message>(OUTGOING_QUEUE);
 
     state.connections.insert(
         conn_id,
@@ -133,13 +135,7 @@ async fn handle_socket(socket: WebSocket, state: AppState) {
 
     let heartbeat = HeartbeatTracker::new(state.config.disconnect_timeout_secs);
 
-    let mut write_task = tokio::spawn(async move {
-        while let Some(msg) = outgoing_rx.recv().await {
-            if ws_sink.send(msg).await.is_err() {
-                break;
-            }
-        }
-    });
+    let mut write_task = tokio::spawn(write_loop(ws_sink, outgoing_rx));
 
     let heartbeat_interval_secs = state.config.heartbeat_interval_secs;
     let reader_state = state.clone();
@@ -200,6 +196,18 @@ async fn handle_socket(socket: WebSocket, state: AppState) {
     tracing::info!(principal = %principal_id, "websocket disconnected");
 }
 
+/// Drain a connection's queue into its socket.
+async fn write_loop(mut sink: SplitSink<WebSocket, Message>, mut queue: mpsc::Receiver<Message>) {
+    while let Some(msg) = queue.recv().await {
+        // A peer that stops reading must not pin its socket and queue
+        // forever (its pings alone would keep the heartbeat alive).
+        let sent = tokio::time::timeout(SOCKET_WRITE_TIMEOUT, sink.send(msg)).await;
+        if !matches!(sent, Ok(Ok(()))) {
+            break;
+        }
+    }
+}
+
 /// The `AUTHENTICATED` frame telling a principal who it is.
 fn authenticated_message(kind: PrincipalKind, principal_id: Uuid) -> String {
     let payload = match kind {
@@ -217,7 +225,7 @@ fn authenticated_message(kind: PrincipalKind, principal_id: Uuid) -> String {
 
 /// Forward one tunnel frame `[session id][payload]` to the session's other
 /// connection, unread. Queues are bounded, so memory never grows with a slow
-/// peer; a peer that cannot keep up ends the session.
+/// peer; a peer that stays stuck ends the session.
 async fn forward_tunnel_frame(state: &AppState, conn_id: Uuid, frame: Vec<u8>) {
     if frame.len() <= SESSION_ID_LEN || frame.len() > SESSION_ID_LEN + MAX_TUNNEL_PAYLOAD {
         tracing::warn!(len = frame.len(), "dropping malformed tunnel frame");
@@ -233,18 +241,15 @@ async fn forward_tunnel_frame(state: &AppState, conn_id: Uuid, frame: Vec<u8>) {
     let Some(client) = state.connections.get_client(&peer) else {
         return;
     };
-    // A host's frames go to many viewers through its one connection, so a
-    // viewer whose queue is full is cut off instead of stalling the others.
-    // Frames to a host wait, which slows only the viewer sending them.
-    let delivered = if client.kind == PrincipalKind::User {
-        client.sender.try_send(Message::Binary(frame)).is_ok()
-    } else {
-        client
-            .sender
-            .send_timeout(Message::Binary(frame), TUNNEL_SEND_TIMEOUT)
-            .await
-            .is_ok()
-    };
+    // Waiting is the stream's only backpressure (it has no acks), so a slow
+    // viewer slows its host down as on the LAN instead of being cut off.
+    // ponytail: a host's other viewers wait too; add a per-tunnel credit
+    // window if several viewers of one host on slow links becomes common.
+    let delivered = client
+        .sender
+        .send_timeout(Message::Binary(frame), TUNNEL_SEND_TIMEOUT)
+        .await
+        .is_ok();
     if !delivered {
         tracing::warn!(session = %session_id, "tunnel peer stuck or gone, ending session");
         if let Some(session) = state.sessions.remove_session(&session_id) {
