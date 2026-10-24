@@ -14,7 +14,9 @@ use base64::engine::general_purpose::STANDARD as B64;
 use base64::Engine;
 use ed25519_dalek::SigningKey;
 use socket2::{SockRef, TcpKeepalive};
-use tokio::io::{AsyncRead, AsyncWrite};
+#[cfg(target_os = "linux")]
+use tokio::io::AsyncRead;
+use tokio::io::AsyncWrite;
 use tokio::net::{TcpListener, TcpStream};
 use tokio::sync::mpsc::Sender;
 use tokio::sync::Semaphore;
