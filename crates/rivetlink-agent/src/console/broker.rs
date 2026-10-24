@@ -23,7 +23,7 @@ use super::worker::{
 use crate::error::{AgentError, AgentResult};
 use crate::session::{ConsentPolicy, ConsoleInputSink, ConsoleStateProvider, ScreenshotCapturer};
 use rivetlink_protocol::{ConsoleInputPacket, HostConsoleState, MouseButton};
-use rivetlink_sdk::lan::{PtrButton, StreamFrame};
+use rivetlink_sdk::lan::{DisplayInfo, PtrButton, StreamFrame};
 
 /// Upper bound for a base64 PNG response (~9 MiB decoded), matching the
 /// unattended host's configured maximum without trusting worker input blindly.
@@ -346,7 +346,7 @@ impl ConsoleWorkerPool {
         loop {
             let worker = self.current().await?;
             if !worker.desktop_stream_active() {
-                let stream = worker.start_desktop_stream(fps, h264).await?;
+                let stream = worker.start_desktop_stream(fps, h264, None).await?;
                 return Ok((stream, claim));
             }
             if tokio::time::Instant::now() >= deadline {
@@ -356,6 +356,47 @@ impl ConsoleWorkerPool {
             }
             tokio::time::sleep(Duration::from_millis(50)).await;
         }
+    }
+
+    /// Monitors of the current desktop worker, empty when it cannot switch.
+    pub async fn list_displays(&self) -> AgentResult<Vec<DisplayInfo>> {
+        self.current().await?.list_displays().await
+    }
+
+    /// Restart the viewer's stream on another monitor, keeping its claim: the
+    /// owner counter is not bumped, and the claim lock keeps every other
+    /// viewer out of the gap between stop and start. Refused while a takeover
+    /// holds that lock (it waits for this viewer to stop, so waiting here
+    /// would deadlock) and after this viewer was taken over.
+    pub async fn switch_desktop_display(
+        &self,
+        desktop: &mut ConsoleDesktopStream,
+        claim: &DesktopClaim,
+        fps: u16,
+        h264: bool,
+        display: u32,
+    ) -> AgentResult<()> {
+        let Ok(_claiming) = self.desktop_claim.try_lock() else {
+            return Err(AgentError::Relay(
+                "another device is taking the desktop over".to_string(),
+            ));
+        };
+        if *claim.owner.borrow() != claim.id {
+            return Err(AgentError::Relay(
+                "this viewer no longer owns the desktop stream".to_string(),
+            ));
+        }
+        let worker = desktop.worker();
+        if !worker.display_switch {
+            return Err(AgentError::Relay(
+                "the console worker cannot switch displays".to_string(),
+            ));
+        }
+        worker.stop_desktop_stream().await?;
+        *desktop = worker
+            .start_desktop_stream(fps, h264, Some(display))
+            .await?;
+        Ok(())
     }
 }
 
@@ -375,6 +416,8 @@ pub struct ConsoleWorkerClient {
     clipboard_changes: broadcast::Sender<String>,
     closed: watch::Receiver<bool>,
     state: HostConsoleState,
+    /// The worker understands display listing and selection.
+    display_switch: bool,
 }
 
 /// An active normal desktop stream from a worker in an authenticated GNOME
@@ -401,7 +444,11 @@ impl ConsoleWorkerClient {
         let (mut reader, writer) = stream.into_split();
         let ready: WorkerResponse =
             read_packet_with_limit(&mut reader, MAX_WORKER_RESPONSE).await?;
-        let WorkerResponse::Ready { state } = ready else {
+        let WorkerResponse::Ready {
+            state,
+            display_switch,
+        } = ready
+        else {
             return Err(AgentError::Config(
                 "console worker did not send a ready handshake".to_string(),
             ));
@@ -461,6 +508,7 @@ impl ConsoleWorkerClient {
             clipboard_changes,
             closed,
             state,
+            display_switch,
         })
     }
 
@@ -509,6 +557,7 @@ impl ConsoleWorkerClient {
         &self,
         fps: u16,
         h264: bool,
+        display: Option<u32>,
     ) -> AgentResult<ConsoleDesktopStream> {
         if self.state != HostConsoleState::DesktopReady {
             return Err(AgentError::Relay(
@@ -527,7 +576,7 @@ impl ConsoleWorkerClient {
         let frames = self.desktop_frames.subscribe();
         let ended = self.desktop_ended.subscribe();
         match self
-            .request(WorkerRequest::StartDesktopStream { fps, h264 })
+            .request(WorkerRequest::StartDesktopStream { fps, h264, display })
             .await
         {
             Ok(WorkerResponse::DesktopStreamStarted) => Ok(ConsoleDesktopStream {
@@ -560,6 +609,22 @@ impl ConsoleWorkerClient {
         }
     }
 
+    /// The desktop worker's monitors, primary first. Empty without asking
+    /// when the worker predates display switching (it would drop the
+    /// connection on the unknown request) or no desktop is signed in.
+    pub async fn list_displays(&self) -> AgentResult<Vec<DisplayInfo>> {
+        if !self.display_switch || self.state != HostConsoleState::DesktopReady {
+            return Ok(Vec::new());
+        }
+        match self.request(WorkerRequest::ListDisplays).await? {
+            WorkerResponse::Displays { displays } => Ok(displays),
+            WorkerResponse::Error { code } => Err(worker_error(code)),
+            _ => Err(AgentError::Config(
+                "unexpected console worker display-list response".to_string(),
+            )),
+        }
+    }
+
     /// Ask the worker's H.264 stream for a keyframe. Fire-and-forget on its
     /// own task: the worker sends no reply, and a write cancelled halfway (the
     /// caller sits in a `select!`) would corrupt the IPC framing. Requests
@@ -582,7 +647,7 @@ impl ConsoleWorkerClient {
         });
     }
 
-    fn desktop_stream_active(&self) -> bool {
+    pub(crate) fn desktop_stream_active(&self) -> bool {
         self.desktop_stream_active
             .load(std::sync::atomic::Ordering::Acquire)
     }
@@ -914,6 +979,7 @@ mod tests {
                 &mut worker_stream,
                 &WorkerResponse::Ready {
                     state: HostConsoleState::GdmLogin,
+                    display_switch: true,
                 },
             )
             .await
@@ -976,6 +1042,7 @@ mod tests {
             &mut worker,
             &WorkerResponse::Ready {
                 state: HostConsoleState::DesktopReady,
+                display_switch: true,
             },
         )
         .await
@@ -983,7 +1050,7 @@ mod tests {
         let client = ConsoleWorkerClient::from_stream(broker_stream)
             .await
             .unwrap();
-        let start = tokio::spawn(async move { client.start_desktop_stream(30, true).await });
+        let start = tokio::spawn(async move { client.start_desktop_stream(30, true, None).await });
         assert!(matches!(
             next_request(&mut worker).await,
             WorkerRequest::StartDesktopStream { h264: true, .. }
@@ -1018,6 +1085,154 @@ mod tests {
         ));
     }
 
+    /// A pool around one fake desktop worker. An old worker's ready packet
+    /// lacks `display_switch` entirely.
+    async fn desktop_pool(display_switch: bool) -> (UnixStream, ConsoleWorkerPool) {
+        let (mut worker, broker_stream) = UnixStream::pair().unwrap();
+        let mut ready = serde_json::to_value(WorkerResponse::Ready {
+            state: HostConsoleState::DesktopReady,
+            display_switch,
+        })
+        .unwrap();
+        if !display_switch {
+            ready.as_object_mut().unwrap().remove("display_switch");
+        }
+        write_packet(&mut worker, &ready).await.unwrap();
+        let client = ConsoleWorkerClient::from_stream(broker_stream)
+            .await
+            .unwrap();
+        let pool = ConsoleWorkerPool {
+            receiver: Arc::new(Mutex::new(watch::channel(Some(client)).1)),
+            generation: Arc::new(AtomicU64::new(0)),
+            desktop_owner: Arc::new(watch::channel(0).0),
+            desktop_claim: Arc::new(Mutex::new(())),
+        };
+        (worker, pool)
+    }
+
+    async fn claimed(
+        worker: &mut UnixStream,
+        pool: &ConsoleWorkerPool,
+    ) -> (ConsoleDesktopStream, DesktopClaim) {
+        let claiming = tokio::spawn({
+            let pool = pool.clone();
+            async move { pool.claim_desktop_stream(30, true, true).await }
+        });
+        assert!(matches!(
+            next_request(worker).await,
+            WorkerRequest::StartDesktopStream { display: None, .. }
+        ));
+        write_packet(worker, &WorkerResponse::DesktopStreamStarted)
+            .await
+            .unwrap();
+        claiming.await.unwrap().unwrap()
+    }
+
+    async fn nothing_sent(worker: &mut UnixStream) -> bool {
+        tokio::time::timeout(
+            Duration::from_millis(100),
+            read_packet_with_limit::<_, WorkerRequest>(worker, MAX_WORKER_RESPONSE),
+        )
+        .await
+        .is_err()
+    }
+
+    // Switching monitors restarts the stream on the same worker: stop, then
+    // start on the chosen display, without giving up the viewer's claim and
+    // without forwarding the old monitor's frames.
+    #[tokio::test]
+    async fn a_viewer_switches_monitor_and_keeps_its_claim() {
+        let (mut worker, pool) = desktop_pool(true).await;
+        let listing = tokio::spawn({
+            let pool = pool.clone();
+            async move { pool.list_displays().await }
+        });
+        assert!(matches!(
+            next_request(&mut worker).await,
+            WorkerRequest::ListDisplays
+        ));
+        let displays = vec![
+            DisplayInfo {
+                id: 0,
+                name: "DP-1".to_string(),
+            },
+            DisplayInfo {
+                id: 1,
+                name: "HDMI-1".to_string(),
+            },
+        ];
+        write_packet(&mut worker, &WorkerResponse::Displays { displays })
+            .await
+            .unwrap();
+        assert_eq!(listing.await.unwrap().unwrap().len(), 2);
+
+        let (mut desktop, claim) = claimed(&mut worker, &pool).await;
+        let switching = tokio::spawn(async move {
+            pool.switch_desktop_display(&mut desktop, &claim, 30, true, 1)
+                .await
+                .map(|()| (desktop, claim))
+        });
+        assert!(matches!(
+            next_request(&mut worker).await,
+            WorkerRequest::StopDesktopStream
+        ));
+        write_packet(&mut worker, &WorkerResponse::DesktopStreamStopped)
+            .await
+            .unwrap();
+        assert!(matches!(
+            next_request(&mut worker).await,
+            WorkerRequest::StartDesktopStream {
+                display: Some(1),
+                ..
+            }
+        ));
+        write_packet(&mut worker, &WorkerResponse::DesktopStreamStarted)
+            .await
+            .unwrap();
+        let (mut desktop, mut claim) = switching.await.unwrap().unwrap();
+
+        write_packet(&mut worker, &video(false)).await.unwrap();
+        write_packet(&mut worker, &video(true)).await.unwrap();
+        assert!(matches!(next_frame(&mut desktop).await, StreamFrame::Video(v) if v.keyframe));
+        assert!(
+            tokio::time::timeout(Duration::from_millis(100), claim.taken_over())
+                .await
+                .is_err()
+        );
+    }
+
+    // An old worker drops its connection on an unknown request, so it is
+    // never asked; a switch during a takeover or after one is refused
+    // without touching the running stream.
+    #[tokio::test]
+    async fn display_switch_is_refused_without_touching_the_stream() {
+        let (mut worker, pool) = desktop_pool(false).await;
+        assert!(pool.list_displays().await.unwrap().is_empty());
+        let (mut desktop, claim) = claimed(&mut worker, &pool).await;
+        assert!(pool
+            .switch_desktop_display(&mut desktop, &claim, 30, true, 1)
+            .await
+            .is_err());
+        assert!(nothing_sent(&mut worker).await);
+
+        let (mut worker, pool) = desktop_pool(true).await;
+        let (mut desktop, claim) = claimed(&mut worker, &pool).await;
+        {
+            let _takeover = pool.desktop_claim.lock().await;
+            assert!(pool
+                .switch_desktop_display(&mut desktop, &claim, 30, true, 1)
+                .await
+                .is_err());
+        }
+        pool.desktop_owner.send_modify(|owner| *owner += 1);
+        assert!(pool
+            .switch_desktop_display(&mut desktop, &claim, 30, true, 1)
+            .await
+            .is_err());
+        assert!(nothing_sent(&mut worker).await);
+        assert!(desktop.worker().desktop_stream_active());
+    }
+
     // The owner's Windows PC must be able to take the desktop over from their
     // MacBook: the first viewer is told to stop, and the second one starts
     // only after the worker has released the first stream.
@@ -1028,6 +1243,7 @@ mod tests {
             &mut worker,
             &WorkerResponse::Ready {
                 state: HostConsoleState::DesktopReady,
+                display_switch: true,
             },
         )
         .await

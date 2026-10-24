@@ -316,17 +316,23 @@ async fn serve_physical_console_client(
             // desktop stream after a successful LightDM login. This is a
             // backend handoff, not a second LAN listener or a new trust path.
             LanRequest::ListDisplays => {
+                let may_control = TrustedClients::load_or_empty(trusted.path())
+                    .is_ok_and(|live| live.may_control_unattended_console(&client));
                 let response = match source.console_state().await {
                     Some((HostConsoleState::DesktopReady, _)) => LanResponse::Displays {
-                        // Linux's Mutter backend owns monitor selection. An
-                        // empty list retains the existing client's primary
-                        // monitor behaviour and avoids leaking local topology.
-                        displays: Vec::new(),
+                        // Only a device that may control the desktop can
+                        // already reach every monitor with the pointer, so
+                        // only it sees and switches them. An empty list keeps
+                        // view-only devices on the primary without leaking
+                        // the local monitor topology.
+                        displays: if may_control {
+                            source.list_displays().await.unwrap_or_default()
+                        } else {
+                            Vec::new()
+                        },
                         // Devices allowed to control the desktop may also
                         // share its clipboard and the RivetLink folder.
-                        features: if TrustedClients::load_or_empty(trusted.path())
-                            .is_ok_and(|live| live.may_control_unattended_console(&client))
-                        {
+                        features: if may_control {
                             vec![
                                 rivetlink_sdk::share::FEATURE_CLIPBOARD.to_string(),
                                 rivetlink_sdk::share::FEATURE_FILES.to_string(),
@@ -619,6 +625,35 @@ async fn stream_authenticated_desktop(
             },
             request = control_rx.recv() => match request {
                 Some(LanRequest::RequestKeyframe) => desktop.request_keyframe(),
+                Some(LanRequest::SwitchDisplay { display: monitor }) => {
+                    if !TrustedClients::load_or_empty(trusted.path())
+                        .is_ok_and(|live| live.may_control_unattended_console(&client))
+                    {
+                        tracing::info!(client = %client, "display switch refused for a view-only device");
+                        continue;
+                    }
+                    // Keys held on the old monitor's input session would stay
+                    // pressed once the worker binds a new one.
+                    std::mem::take(&mut held).release(&source).await;
+                    match source
+                        .switch_desktop_display(&mut desktop, &claim, fps.clamp(1, 30), h264, monitor)
+                        .await
+                    {
+                        Ok(()) => tracing::info!(client = %client, monitor, "physical-console display switched"),
+                        // Busy or taken over: keep streaming; a takeover ends
+                        // this loop through `taken_over` next.
+                        Err(error) if desktop.worker().desktop_stream_active() => {
+                            tracing::info!(client = %client, error = %error, "physical-console display switch refused");
+                        },
+                        Err(error) => {
+                            tracing::warn!(client = %client, error = %error, "physical-console display switch failed");
+                            let _ = lan::send_response(&mut writer, &channel, &LanResponse::Error {
+                                message: "could not switch display".to_string(),
+                            }).await;
+                            break Ok(());
+                        },
+                    }
+                },
                 Some(request) if is_share_request(&request) => {
                     // Not `?`: the stream must still be stopped below.
                     let live = match TrustedClients::load_or_empty(trusted.path()) {
