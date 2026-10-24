@@ -7,7 +7,7 @@
 
 use base64::Engine;
 use rivetlink_protocol::HostConsoleState;
-use rivetlink_sdk::lan::{FrameDelta, PtrButton, StreamFrame, VideoFrame};
+use rivetlink_sdk::lan::{DisplayInfo, FrameDelta, PtrButton, StreamFrame, VideoFrame};
 use serde::{Deserialize, Serialize};
 use std::path::{Path, PathBuf};
 use std::time::Duration;
@@ -35,6 +35,7 @@ const BROKER_SOCKET_RETRY: Duration = Duration::from_millis(250);
 /// Do not let that stale worker supersede the currently visible login greeter.
 #[cfg(target_os = "linux")]
 const ACTIVE_SEAT_RETRY: Duration = Duration::from_secs(1);
+const DISPLAY_LIST_TIMEOUT: Duration = Duration::from_secs(3);
 
 /// Input accepted from the broker after its independent trusted-client check.
 /// This excludes shell commands and arbitrary keycode data.
@@ -64,7 +65,15 @@ pub enum WorkerRequest {
         /// stream tiles, so the broker must accept either.
         #[serde(default)]
         h264: bool,
+        /// Monitor index from [`WorkerResponse::Displays`]; `None` is the
+        /// primary. Sent only to workers that advertise `display_switch`.
+        #[serde(default)]
+        display: Option<u32>,
     },
+    /// List the session's monitors (primary first). Sent only to workers that
+    /// advertise `display_switch`; an older worker would drop the connection
+    /// on an unknown request.
+    ListDisplays,
     /// Make the running H.264 stream send a keyframe; `congested` also lowers
     /// its bitrate. Sent only after the worker streamed video. Fire-and-forget:
     /// the worker sends no response, so it can never be mistaken for the
@@ -110,8 +119,15 @@ pub enum WorkerRequest {
 pub enum WorkerResponse {
     Ready {
         state: HostConsoleState,
+        /// Understands [`WorkerRequest::ListDisplays`] and a `display` on
+        /// [`WorkerRequest::StartDesktopStream`]. Absent from older workers.
+        #[serde(default)]
+        display_switch: bool,
     },
     Pong,
+    Displays {
+        displays: Vec<DisplayInfo>,
+    },
     Capture {
         png_b64: String,
     },
@@ -274,14 +290,22 @@ async fn serve_with_session(stream: UnixStream, session: GraphicalSession) -> Ag
         &writer,
         &WorkerResponse::Ready {
             state: session.state,
+            display_switch: true,
         },
     )
     .await?;
     let mut input: Option<InputHandle> = None;
+    // The monitor the stream (and so the pointer mapping) currently targets.
+    let mut stream_display: Option<u32> = None;
     let mut clipboard: Option<ClipboardBridge> = None;
     let mut clipboard_forwarder: Option<tokio::task::JoinHandle<()>> = None;
     let mut shared: Option<SharedFolder> = None;
-    let mut desktop_stream: Option<tokio::task::JoinHandle<()>> = None;
+    // The forwarder task and its stop signal. A stop is only taken between
+    // packets: aborting a write halfway would corrupt the IPC framing.
+    let mut desktop_stream: Option<(
+        tokio::task::JoinHandle<()>,
+        tokio::sync::oneshot::Sender<()>,
+    )> = None;
     let mut video_control: Option<std::sync::Arc<crate::capture::screencast::VideoControl>> = None;
     let desktop_stream_active = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
 
@@ -290,7 +314,23 @@ async fn serve_with_session(stream: UnixStream, session: GraphicalSession) -> Ag
         let response = match request {
             WorkerRequest::Ping => WorkerResponse::Pong,
             WorkerRequest::Capture { timeout_ms } => capture(timeout_ms, &session).await,
-            WorkerRequest::StartDesktopStream { fps, h264 } => {
+            WorkerRequest::ListDisplays => WorkerResponse::Displays {
+                displays: if supports_normal_desktop_stream(&session) {
+                    // Bounded: the broker waits for this reply without a
+                    // timeout of its own.
+                    tokio::time::timeout(
+                        DISPLAY_LIST_TIMEOUT,
+                        tokio::task::spawn_blocking(crate::capture::screencast::list_displays),
+                    )
+                    .await
+                    .ok()
+                    .and_then(Result::ok)
+                    .unwrap_or_default()
+                } else {
+                    Vec::new()
+                },
+            },
+            WorkerRequest::StartDesktopStream { fps, h264, display } => {
                 if !supports_normal_desktop_stream(&session) {
                     WorkerResponse::Error {
                         code: WorkerErrorCode::ScreenCastUnavailable,
@@ -307,22 +347,37 @@ async fn serve_with_session(stream: UnixStream, session: GraphicalSession) -> Ag
                     // task can publish a frame, so the broker can switch its
                     // own protocol cleanly at this boundary.
                     write_worker_response(&writer, &WorkerResponse::DesktopStreamStarted).await?;
+                    if display != stream_display {
+                        // Dropping the handle closes its RemoteDesktop session;
+                        // the next input binds one to the new monitor.
+                        input = None;
+                        stream_display = display;
+                    }
                     let (frames_tx, mut frames_rx) = tokio::sync::mpsc::channel(2);
                     let active = std::sync::Arc::clone(&desktop_stream_active);
                     let stream_writer = std::sync::Arc::clone(&writer);
                     video_control = h264.then(std::sync::Arc::default);
                     let control = video_control.clone();
+                    let (stop_tx, mut stop_rx) = tokio::sync::oneshot::channel();
                     let handle = tokio::spawn(async move {
                         let capture = tokio::task::spawn_blocking(move || {
                             crate::capture::screencast::stream_blocking(
                                 fps.clamp(1, 30),
                                 60,
-                                None,
+                                display,
                                 control,
                                 frames_tx,
                             )
                         });
-                        while let Some(frame) = frames_rx.recv().await {
+                        loop {
+                            let frame = tokio::select! {
+                                frame = frames_rx.recv() => frame,
+                                // Stopped by the broker: dropping `frames_rx`
+                                // ends the capture, and no `DesktopStreamEnded`
+                                // may reach a stream started after this one.
+                                _ = &mut stop_rx => return,
+                            };
+                            let Some(frame) = frame else { break };
                             let response = match frame {
                                 StreamFrame::Tiles(delta) => WorkerResponse::DesktopFrame { delta },
                                 StreamFrame::Video(frame) => WorkerResponse::DesktopVideo { frame },
@@ -352,14 +407,16 @@ async fn serve_with_session(stream: UnixStream, session: GraphicalSession) -> Ag
                         )
                         .await;
                     });
-                    desktop_stream = Some(handle);
+                    desktop_stream = Some((handle, stop_tx));
                     // Start was already sent before the producer was launched.
                     continue;
                 }
             },
             WorkerRequest::StopDesktopStream => {
-                if let Some(handle) = desktop_stream.take() {
-                    handle.abort();
+                if let Some((handle, stop)) = desktop_stream.take() {
+                    // Every frame it sent lands before the stop reply.
+                    let _ = stop.send(());
+                    let _ = handle.await;
                 }
                 desktop_stream_active.store(false, std::sync::atomic::Ordering::Release);
                 video_control = None;
@@ -375,7 +432,9 @@ async fn serve_with_session(stream: UnixStream, session: GraphicalSession) -> Ag
                 }
                 continue;
             },
-            WorkerRequest::Input { event } => apply_input(&session, &mut input, event),
+            WorkerRequest::Input { event } => {
+                apply_input(&session, &mut input, stream_display, event)
+            },
             WorkerRequest::ClipboardEnable => {
                 enable_clipboard(&session, &writer, &mut clipboard, &mut clipboard_forwarder).await
             },
@@ -388,7 +447,7 @@ async fn serve_with_session(stream: UnixStream, session: GraphicalSession) -> Ag
                 shared_folder_request(&session, &mut shared, request)
             },
             WorkerRequest::Stop => {
-                if let Some(handle) = desktop_stream.take() {
+                if let Some((handle, _)) = desktop_stream.take() {
                     handle.abort();
                 }
                 if let Some(handle) = clipboard_forwarder.take() {
@@ -746,6 +805,7 @@ fn capture_error_code(state: HostConsoleState, error: &AgentError) -> WorkerErro
 fn apply_input(
     session: &GraphicalSession,
     handle: &mut Option<InputHandle>,
+    display: Option<u32>,
     event: ConsoleInput,
 ) -> WorkerResponse {
     if session.state == HostConsoleState::SessionLocked {
@@ -777,7 +837,7 @@ fn apply_input(
         GraphicalBackend::X11 { display } => InputHandle::spawn_x11(display.clone()),
         // The handle owns a Mutter RemoteDesktop session in this same D-Bus
         // session; it cannot target another seat or act as root.
-        GraphicalBackend::Wayland | GraphicalBackend::Unknown => InputHandle::spawn(None),
+        GraphicalBackend::Wayland | GraphicalBackend::Unknown => InputHandle::spawn(display),
     });
     handle.send(action);
     WorkerResponse::InputAccepted
@@ -957,6 +1017,31 @@ where
 mod tests {
     use super::*;
 
+    // Broker and worker update together, but a worker in a running session
+    // stays old until the next login: its packets must still decode.
+    #[test]
+    fn packets_without_display_fields_still_decode() {
+        let start: WorkerRequest =
+            serde_json::from_str(r#"{"type":"start_desktop_stream","fps":30}"#).unwrap();
+        assert!(matches!(
+            start,
+            WorkerRequest::StartDesktopStream {
+                h264: false,
+                display: None,
+                ..
+            }
+        ));
+        let ready: WorkerResponse =
+            serde_json::from_str(r#"{"type":"ready","state":"desktop_ready"}"#).unwrap();
+        assert!(matches!(
+            ready,
+            WorkerResponse::Ready {
+                state: HostConsoleState::DesktopReady,
+                display_switch: false,
+            }
+        ));
+    }
+
     #[test]
     fn only_normalized_browser_key_codes_are_accepted() {
         assert!(is_valid_key_code("KeyA"));
@@ -1117,6 +1202,7 @@ mod tests {
             let response = apply_input(
                 &session,
                 &mut None,
+                None,
                 ConsoleInput::Key {
                     code: "Enter".to_string(),
                     down: true,
