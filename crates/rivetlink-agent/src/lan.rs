@@ -577,6 +577,9 @@ async fn stream_authenticated_desktop(
     // Set when another device took over and the socket is still intact, so
     // this viewer can be told why it was dropped once the stream is released.
     let mut tell_taken_over = false;
+    // Set once a failed display switch left the worker stopped: a second stop
+    // could hit a stream another viewer has started since.
+    let mut stream_stopped = false;
     let result = loop {
         tokio::select! {
             () = claim.taken_over() => {
@@ -646,6 +649,7 @@ async fn stream_authenticated_desktop(
                             tracing::info!(client = %client, error = %error, "physical-console display switch refused");
                         },
                         Err(error) => {
+                            stream_stopped = true;
                             tracing::warn!(client = %client, error = %error, "physical-console display switch failed");
                             let _ = lan::send_response(&mut writer, &channel, &LanResponse::Error {
                                 message: "could not switch display".to_string(),
@@ -711,7 +715,9 @@ async fn stream_authenticated_desktop(
     downloads.abort_all();
     reader_task.abort();
     held.release(&source).await;
-    let _ = desktop.stop().await;
+    if !stream_stopped {
+        let _ = desktop.stop().await;
+    }
     tracing::info!(client = %client, "physical-console handoff: normal desktop engine stopped");
     if tell_taken_over {
         tracing::info!(client = %client, "physical-console viewer taken over by another device");

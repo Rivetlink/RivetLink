@@ -575,6 +575,9 @@ impl ConsoleWorkerClient {
         }
         let frames = self.desktop_frames.subscribe();
         let ended = self.desktop_ended.subscribe();
+        // A keyframe request still being written for a previous stream would
+        // swallow this stream's first one.
+        self.keyframe_in_flight.store(false, Ordering::Release);
         match self
             .request(WorkerRequest::StartDesktopStream { fps, h264, display })
             .await

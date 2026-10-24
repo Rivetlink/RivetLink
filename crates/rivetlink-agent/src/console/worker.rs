@@ -300,7 +300,12 @@ async fn serve_with_session(stream: UnixStream, session: GraphicalSession) -> Ag
     let mut clipboard: Option<ClipboardBridge> = None;
     let mut clipboard_forwarder: Option<tokio::task::JoinHandle<()>> = None;
     let mut shared: Option<SharedFolder> = None;
-    let mut desktop_stream: Option<tokio::task::JoinHandle<()>> = None;
+    // The forwarder task and its stop signal. A stop is only taken between
+    // packets: aborting a write halfway would corrupt the IPC framing.
+    let mut desktop_stream: Option<(
+        tokio::task::JoinHandle<()>,
+        tokio::sync::oneshot::Sender<()>,
+    )> = None;
     let mut video_control: Option<std::sync::Arc<crate::capture::screencast::VideoControl>> = None;
     let desktop_stream_active = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
 
@@ -353,6 +358,7 @@ async fn serve_with_session(stream: UnixStream, session: GraphicalSession) -> Ag
                     let stream_writer = std::sync::Arc::clone(&writer);
                     video_control = h264.then(std::sync::Arc::default);
                     let control = video_control.clone();
+                    let (stop_tx, mut stop_rx) = tokio::sync::oneshot::channel();
                     let handle = tokio::spawn(async move {
                         let capture = tokio::task::spawn_blocking(move || {
                             crate::capture::screencast::stream_blocking(
@@ -363,7 +369,15 @@ async fn serve_with_session(stream: UnixStream, session: GraphicalSession) -> Ag
                                 frames_tx,
                             )
                         });
-                        while let Some(frame) = frames_rx.recv().await {
+                        loop {
+                            let frame = tokio::select! {
+                                frame = frames_rx.recv() => frame,
+                                // Stopped by the broker: dropping `frames_rx`
+                                // ends the capture, and no `DesktopStreamEnded`
+                                // may reach a stream started after this one.
+                                _ = &mut stop_rx => return,
+                            };
+                            let Some(frame) = frame else { break };
                             let response = match frame {
                                 StreamFrame::Tiles(delta) => WorkerResponse::DesktopFrame { delta },
                                 StreamFrame::Video(frame) => WorkerResponse::DesktopVideo { frame },
@@ -393,14 +407,16 @@ async fn serve_with_session(stream: UnixStream, session: GraphicalSession) -> Ag
                         )
                         .await;
                     });
-                    desktop_stream = Some(handle);
+                    desktop_stream = Some((handle, stop_tx));
                     // Start was already sent before the producer was launched.
                     continue;
                 }
             },
             WorkerRequest::StopDesktopStream => {
-                if let Some(handle) = desktop_stream.take() {
-                    handle.abort();
+                if let Some((handle, stop)) = desktop_stream.take() {
+                    // Every frame it sent lands before the stop reply.
+                    let _ = stop.send(());
+                    let _ = handle.await;
                 }
                 desktop_stream_active.store(false, std::sync::atomic::Ordering::Release);
                 video_control = None;
@@ -431,7 +447,7 @@ async fn serve_with_session(stream: UnixStream, session: GraphicalSession) -> Ag
                 shared_folder_request(&session, &mut shared, request)
             },
             WorkerRequest::Stop => {
-                if let Some(handle) = desktop_stream.take() {
+                if let Some((handle, _)) = desktop_stream.take() {
                     handle.abort();
                 }
                 if let Some(handle) = clipboard_forwarder.take() {
