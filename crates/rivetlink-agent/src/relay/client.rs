@@ -41,6 +41,9 @@ enum AuthAck {
         user_id: Option<String>,
         #[serde(default)]
         device_id: Option<String>,
+        /// STUN server for direct peer-to-peer paths, when the relay has one.
+        #[serde(default)]
+        stun: Option<String>,
     },
     #[serde(other)]
     Other,
@@ -82,6 +85,7 @@ enum OutgoingDeviceAuth<'a> {
 pub struct RelayClient {
     stream: WsStream,
     heartbeat_interval: Duration,
+    stun: Option<String>,
 }
 
 impl RelayClient {
@@ -122,11 +126,16 @@ impl RelayClient {
 
         let ack: AuthAck = serde_json::from_str(&text).map_err(AgentError::Serde)?;
         match ack {
-            AuthAck::Authenticated { user_id, device_id } => {
+            AuthAck::Authenticated {
+                user_id,
+                device_id,
+                stun,
+            } => {
                 tracing::info!(?user_id, ?device_id, "relay AUTH accepted");
                 Ok(Self {
                     stream,
                     heartbeat_interval,
+                    stun,
                 })
             },
             AuthAck::Other => Err(AgentError::Relay(format!("AUTH rejected: {text}"))),
@@ -215,11 +224,14 @@ impl RelayClient {
 
         let ack: AuthAck = serde_json::from_str(&ack_text).map_err(AgentError::Serde)?;
         match ack {
-            AuthAck::Authenticated { device_id, .. } => {
+            AuthAck::Authenticated {
+                device_id, stun, ..
+            } => {
                 tracing::info!(?device_id, "device auth accepted");
                 Ok(Self {
                     stream,
                     heartbeat_interval,
+                    stun,
                 })
             },
             AuthAck::Other => Err(AgentError::Relay(format!(
@@ -323,8 +335,10 @@ impl RelayClient {
     ///
     /// Each accepted tunnel becomes a local byte stream handed to `serve`,
     /// which runs the direct-LAN protocol on it; the relay only carries the
-    /// frames. Legacy packets still go to `handler`. Returning (relay gone or
-    /// error) drops every running tunnel.
+    /// frames. A client may also offer a direct peer-to-peer path for a
+    /// tunnel; that gets its own `serve`, and the client uses one of the two.
+    /// Legacy packets still go to `handler`. Returning (relay gone or error)
+    /// drops every running tunnel.
     #[allow(clippy::cognitive_complexity, clippy::too_many_lines)]
     pub async fn run_host_tunnels<H, F, Fut>(
         self,
@@ -345,6 +359,8 @@ impl RelayClient {
         let (out_tx, mut out_rx) = mpsc::channel::<Message>(256);
         let mut inbound: BTreeMap<Uuid, mpsc::Sender<Vec<u8>>> = BTreeMap::new();
         let mut tunnels = tokio::task::JoinSet::new();
+        let stun = self.stun;
+        let mut offered: std::collections::BTreeSet<Uuid> = std::collections::BTreeSet::new();
 
         // Writing runs on its own task. The read loop below may wait on a
         // slow tunnel, and that tunnel may itself wait for the link to drain
@@ -392,12 +408,31 @@ impl RelayClient {
                                     let pump = tunnel_pump(pump_end, sid.0, rx, out_tx.clone());
                                     tunnels.spawn(async move {
                                         tokio::join!(session, pump);
-                                        sid.0
+                                        Some(sid.0)
                                     });
                                     tracing::info!(session = %sid, "relay tunnel accepted");
                                     SignalPacket::SessionAccepted { session_id: sid, role: SessionRole::Controller }
                                 };
                                 vec![serde_json::to_string(&packet)?]
+                            },
+                            // A direct-path offer for a live tunnel, once per
+                            // tunnel. Serving it takes a tunnel slot; without
+                            // one the client just stays on the relay.
+                            Ok(SignalPacket::IceCandidate { session_id: sid, candidate })
+                                if inbound.contains_key(&sid.0) =>
+                            {
+                                if tunnels.len() < max_tunnels && offered.insert(sid.0) {
+                                    let (host_end, direct_end) = tokio::io::duplex(TUNNEL_BUFFER);
+                                    let session = serve(host_end);
+                                    let direct = direct_path(stun.clone(), candidate, sid, out_tx.clone(), direct_end);
+                                    // Ends without touching the relay tunnel,
+                                    // which the client may still be using.
+                                    tunnels.spawn(async move {
+                                        tokio::join!(session, direct);
+                                        None
+                                    });
+                                }
+                                continue;
                             },
                             Ok(SignalPacket::SessionClosed { session_id: SessionId(sid) })
                                 if inbound.contains_key(&sid) =>
@@ -424,8 +459,9 @@ impl RelayClient {
                     return Err(AgentError::WebSocket("relay link write failed".to_string()));
                 },
                 Some(ended) = tunnels.join_next(), if !tunnels.is_empty() => {
-                    if let Ok(sid) = ended {
+                    if let Ok(Some(sid)) = ended {
                         inbound.remove(&sid);
+                        offered.remove(&sid);
                         tracing::info!(session = %sid, "relay tunnel ended");
                     }
                     continue;
@@ -513,6 +549,29 @@ async fn tunnel_pump(
     };
     if let Ok(text) = serde_json::to_string(&closed) {
         let _ = out.send(Message::Text(text)).await;
+    }
+}
+
+/// Answer a client's direct-path `offer` for session `sid` and carry
+/// `stream` over the direct path. Without one, `stream` is simply dropped
+/// and that session ends; the client keeps using the relay tunnel.
+async fn direct_path(
+    stun: Option<String>,
+    offer: String,
+    sid: rivetlink_core::SessionId,
+    out: mpsc::Sender<Message>,
+    stream: DuplexStream,
+) {
+    let send = |candidate: String| {
+        let answer = rivetlink_protocol::SignalPacket::IceCandidate {
+            session_id: sid,
+            candidate,
+        };
+        serde_json::to_string(&answer).is_ok_and(|text| out.try_send(Message::Text(text)).is_ok())
+    };
+    match rivetlink_sdk::p2p::accept(stun.as_deref(), &offer, send, stream).await {
+        Ok(()) => tracing::info!(session = %sid, "direct path closed"),
+        Err(error) => tracing::info!(session = %sid, %error, "no direct path"),
     }
 }
 

@@ -30,7 +30,7 @@ use std::path::{Path, PathBuf};
 use crate::config::ClientConfig;
 use crate::error::{SdkError, SdkResult};
 use crate::identity::Identity;
-use crate::lan;
+use crate::p2p::Transport;
 use crate::relay_tunnel::{self, TunnelParams};
 use crate::rest::{self, Device};
 use crate::session::{self, CaptureParams};
@@ -147,27 +147,29 @@ impl RivetClient {
     }
 
     /// Open an end-to-end encrypted session with `device` through the relay
-    /// (relay protocol v3). The host must prove `device.public_key`, so pin
-    /// that key before calling. The stream then takes the same requests as a
-    /// direct LAN connection (see [`crate::lan`]).
+    /// (relay protocol v3), switched to a direct peer-to-peer path when one
+    /// can be made. The host must prove `device.public_key` either way, so
+    /// pin that key before calling. The stream then takes the same requests
+    /// as a direct LAN connection (see [`crate::lan`]).
     pub async fn connect_tunnel(
         &self,
         device: &Device,
-    ) -> SdkResult<(tokio::io::DuplexStream, SealedChannel)> {
+    ) -> SdkResult<(tokio::io::DuplexStream, SealedChannel, Transport)> {
         let device_id = uuid::Uuid::parse_str(&device.id)
             .map_err(|e| SdkError::Config(format!("invalid device id: {e}")))?;
         let client_public_key = self.identity.public_key_b64();
-        let mut stream = relay_tunnel::open(TunnelParams {
-            relay_ws_url: &self.config.relay_ws_url,
-            token: self.token()?,
-            device_id,
-            client_public_key: &client_public_key,
-            requested_capability: SessionCapability::ConsoleControl,
-        })
-        .await?;
-        let channel =
-            lan::connect_key_over(&mut stream, &self.identity, &device.public_key).await?;
-        Ok((stream, channel))
+        relay_tunnel::connect_best(
+            TunnelParams {
+                relay_ws_url: &self.config.relay_ws_url,
+                token: self.token()?,
+                device_id,
+                client_public_key: &client_public_key,
+                requested_capability: SessionCapability::ConsoleControl,
+            },
+            &self.identity,
+            &device.public_key,
+        )
+        .await
     }
 
     /// As [`Self::capture_screenshot`], retaining the authenticated host

@@ -16,7 +16,7 @@ use rivetlink_protocol::{SessionCapability, SignalPacket};
 use rivetlink_sdk::direct;
 use rivetlink_sdk::lan::{self, LanRequest, LanResponse};
 use rivetlink_sdk::relay_tunnel::{self, TunnelParams};
-use rivetlink_sdk::Identity;
+use rivetlink_sdk::{Identity, Transport};
 use rivetlink_server::config::ServerConfig;
 use rivetlink_server::sessions::manager::SessionManager;
 use rivetlink_server::state::AppState;
@@ -24,7 +24,7 @@ use rivetlink_server::websocket::connection::ConnectionMap;
 use serde_json::{json, Value};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 
-async fn start_relay() -> Option<SocketAddr> {
+async fn start_relay(stun_server: Option<String>) -> Option<SocketAddr> {
     let config = ServerConfig {
         // Same database as the server integration tests (CI service).
         database_url: "postgres://rivet:rivet_dev@localhost/rivet".to_string(),
@@ -38,6 +38,7 @@ async fn start_relay() -> Option<SocketAddr> {
         heartbeat_interval_secs: 10,
         disconnect_timeout_secs: 30,
         reconnect_grace_secs: 15,
+        stun_server,
     };
     let db = sqlx::postgres::PgPoolOptions::new()
         .max_connections(5)
@@ -105,12 +106,14 @@ impl HostHandler for NoLegacy {
     }
 }
 
-#[tokio::test]
-async fn a_relay_tunnel_carries_an_authenticated_lan_session() {
-    let Some(addr) = start_relay().await else {
-        eprintln!("skipping: postgres unavailable");
-        return;
-    };
+/// A relay with a registered device whose agent relay loop serves up to
+/// `max_tunnels` tunnels with a tiny LAN host. Returns (ws url, user token,
+/// device id, host public key).
+async fn start_host(
+    stun_server: Option<String>,
+    max_tunnels: usize,
+) -> Option<(String, String, uuid::Uuid, String)> {
+    let addr = start_relay(stun_server).await?;
     let email = format!("tunnel-{}@test.com", uuid::Uuid::now_v7().simple());
     let registered = post(
         addr,
@@ -164,9 +167,20 @@ async fn a_relay_tunnel_carries_an_authenticated_lan_session() {
                 }
             }
         };
-        let _ = host.run_host_tunnels(&mut NoLegacy, 4, serve).await;
+        let _ = host
+            .run_host_tunnels(&mut NoLegacy, max_tunnels, serve)
+            .await;
     });
     tokio::time::sleep(Duration::from_millis(200)).await;
+    Some((ws_url, token, device_id, host_public))
+}
+
+#[tokio::test]
+async fn a_relay_tunnel_carries_an_authenticated_lan_session() {
+    let Some((ws_url, token, device_id, host_public)) = start_host(None, 4).await else {
+        eprintln!("skipping: postgres unavailable");
+        return;
+    };
 
     // Client: two tunnels at once from the same account, like the app's
     // console view plus a desktop stream.
@@ -201,6 +215,89 @@ async fn a_relay_tunnel_carries_an_authenticated_lan_session() {
     assert!(lan::connect_key_over(&mut third, &client, &wrong)
         .await
         .is_err());
+}
+
+#[tokio::test]
+async fn a_direct_path_replaces_the_relay_when_stun_is_configured() {
+    let stun = stun_server().await.to_string();
+    let Some((ws_url, token, device_id, host_public)) = start_host(Some(stun), 4).await else {
+        eprintln!("skipping: postgres unavailable");
+        return;
+    };
+    let client = Identity::from_signing_key(SigningKey::from_bytes(&rand_seed()));
+    let client_key = client.public_key_b64();
+    let (mut stream, channel, transport) = relay_tunnel::connect_best(
+        TunnelParams {
+            relay_ws_url: &ws_url,
+            token: &token,
+            device_id,
+            client_public_key: &client_key,
+            requested_capability: SessionCapability::ConsoleControl,
+        },
+        &client,
+        &host_public,
+    )
+    .await
+    .unwrap();
+    assert_eq!(transport, Transport::P2p);
+    let (_, features) = lan::list_displays_and_features(&mut stream, &channel)
+        .await
+        .unwrap();
+    assert_eq!(features, vec!["via-relay".to_string()]);
+}
+
+#[tokio::test]
+async fn the_relay_tunnel_stays_usable_when_no_direct_path_opens() {
+    let stun = stun_server().await.to_string();
+    // One slot: the relay tunnel takes it, so the host ignores the offer,
+    // like a host without direct-path support.
+    let Some((ws_url, token, device_id, host_public)) = start_host(Some(stun), 1).await else {
+        eprintln!("skipping: postgres unavailable");
+        return;
+    };
+    let client = Identity::from_signing_key(SigningKey::from_bytes(&rand_seed()));
+    let client_key = client.public_key_b64();
+    let (mut stream, channel, transport) = relay_tunnel::connect_best(
+        TunnelParams {
+            relay_ws_url: &ws_url,
+            token: &token,
+            device_id,
+            client_public_key: &client_key,
+            requested_capability: SessionCapability::ConsoleControl,
+        },
+        &client,
+        &host_public,
+    )
+    .await
+    .unwrap();
+    assert_eq!(transport, Transport::Relay);
+    // Still alive well after every direct-path timeout has passed.
+    tokio::time::sleep(Duration::from_secs(6)).await;
+    let (_, features) = lan::list_displays_and_features(&mut stream, &channel)
+        .await
+        .unwrap();
+    assert_eq!(features, vec!["via-relay".to_string()]);
+}
+
+/// Answers every STUN Binding request with the sender's own address.
+async fn stun_server() -> SocketAddr {
+    let socket = tokio::net::UdpSocket::bind("127.0.0.1:0").await.unwrap();
+    let addr = socket.local_addr().unwrap();
+    tokio::spawn(async move {
+        let mut buf = [0u8; 512];
+        while let Ok((n, from)) = socket.recv_from(&mut buf).await {
+            let (SocketAddr::V4(from), true) = (from, n >= 20) else {
+                continue;
+            };
+            let mut reply = vec![0x01, 0x01, 0x00, 0x0c, 0x21, 0x12, 0xa4, 0x42];
+            reply.extend_from_slice(&buf[8..20]);
+            reply.extend_from_slice(&[0x00, 0x20, 0x00, 0x08, 0x00, 0x01]);
+            reply.extend_from_slice(&(from.port() ^ 0x2112).to_be_bytes());
+            reply.extend_from_slice(&(u32::from(*from.ip()) ^ 0x2112_a442).to_be_bytes());
+            let _ = socket.send_to(&reply, from).await;
+        }
+    });
+    addr
 }
 
 /// Distinct per call; test keys need not be secret.

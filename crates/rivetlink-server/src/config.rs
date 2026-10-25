@@ -16,6 +16,9 @@ pub struct ServerConfig {
     pub heartbeat_interval_secs: u64,
     pub disconnect_timeout_secs: u64,
     pub reconnect_grace_secs: u64,
+    /// `host:port` of a STUN server (e.g. the coturn service). When set,
+    /// clients and hosts try a direct peer-to-peer path before the relay.
+    pub stun_server: Option<String>,
 }
 
 impl ServerConfig {
@@ -41,6 +44,7 @@ impl ServerConfig {
             heartbeat_interval_secs: parse_or("HEARTBEAT_INTERVAL_SECS", 10),
             disconnect_timeout_secs: parse_or("DISCONNECT_TIMEOUT_SECS", 30),
             reconnect_grace_secs: parse_or("RECONNECT_GRACE_SECS", 15),
+            stun_server: Some(optional("STUN_SERVER", "")).filter(|s| !s.is_empty()),
         })
     }
 }

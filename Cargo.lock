@@ -2861,6 +2861,18 @@ dependencies = [
 ]
 
 [[package]]
+name = "rcgen"
+version = "0.13.2"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "75e669e5202259b5314d1ea5397316ad400819437857b90861765f24c4cf80a2"
+dependencies = [
+ "ring",
+ "rustls-pki-types",
+ "time",
+ "yasna",
+]
+
+[[package]]
 name = "redis"
 version = "0.27.6"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -3087,12 +3099,16 @@ dependencies = [
  "base64",
  "ed25519-dalek",
  "futures-util",
+ "if-addrs",
  "mdns-sd",
+ "quinn",
  "rand 0.8.7",
+ "rcgen",
  "reqwest",
  "rivetlink-core",
  "rivetlink-crypto",
  "rivetlink-protocol",
+ "rustls",
  "serde",
  "serde_json",
  "sha2 0.11.0",
@@ -5174,6 +5190,15 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "fe5c30ade05e61656247b2e334a031dfd0cc466fadef865bdcdea8d537951bf1"
 dependencies = [
  "winapi",
+]
+
+[[package]]
+name = "yasna"
+version = "0.5.2"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "e17bb3549cc1321ae1296b9cdc2698e2b6cb1992adfa19a8c72e5b7a738f44cd"
+dependencies = [
+ "time",
 ]
 
 [[package]]

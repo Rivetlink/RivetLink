@@ -130,7 +130,11 @@ async fn handle_socket(socket: WebSocket, state: AppState) {
     );
 
     let _ = ws_sink
-        .send(Message::Text(authenticated_message(kind, principal_id)))
+        .send(Message::Text(authenticated_message(
+            kind,
+            principal_id,
+            state.config.stun_server.as_deref(),
+        )))
         .await;
 
     let heartbeat = HeartbeatTracker::new(state.config.disconnect_timeout_secs);
@@ -208,9 +212,10 @@ async fn write_loop(mut sink: SplitSink<WebSocket, Message>, mut queue: mpsc::Re
     }
 }
 
-/// The `AUTHENTICATED` frame telling a principal who it is.
-fn authenticated_message(kind: PrincipalKind, principal_id: Uuid) -> String {
-    let payload = match kind {
+/// The `AUTHENTICATED` frame telling a principal who it is, and the STUN
+/// server both ends use to try a direct peer-to-peer path (when configured).
+fn authenticated_message(kind: PrincipalKind, principal_id: Uuid, stun: Option<&str>) -> String {
+    let mut payload = match kind {
         PrincipalKind::User => serde_json::json!({
             "type": "AUTHENTICATED",
             "user_id": principal_id.to_string(),
@@ -220,6 +225,9 @@ fn authenticated_message(kind: PrincipalKind, principal_id: Uuid) -> String {
             "device_id": principal_id.to_string(),
         }),
     };
+    if let Some(stun) = stun {
+        payload["stun"] = stun.into();
+    }
     payload.to_string()
 }
 
