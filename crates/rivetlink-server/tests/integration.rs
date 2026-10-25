@@ -28,6 +28,7 @@ fn test_config() -> ServerConfig {
         heartbeat_interval_secs: 10,
         disconnect_timeout_secs: 30,
         reconnect_grace_secs: 15,
+        stun_server: None,
     }
 }
 
