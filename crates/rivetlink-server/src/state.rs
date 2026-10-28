@@ -26,5 +26,6 @@ pub struct AppState {
     pub config: ServerConfig,
     pub connections: ConnectionMap,
     pub sessions: SessionManager,
-    pub signaling_tx: mpsc::UnboundedSender<SignalingMessage>,
+    /// Bounded: see `websocket::gateway::SIGNALING_QUEUE`.
+    pub signaling_tx: mpsc::Sender<SignalingMessage>,
 }

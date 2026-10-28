@@ -39,6 +39,7 @@ async fn start_relay(stun_server: Option<String>) -> Option<SocketAddr> {
         disconnect_timeout_secs: 30,
         reconnect_grace_secs: 15,
         stun_server,
+        audit_retention_days: 90,
     };
     let db = sqlx::postgres::PgPoolOptions::new()
         .max_connections(5)
@@ -48,7 +49,8 @@ async fn start_relay(stun_server: Option<String>) -> Option<SocketAddr> {
         .ok()?;
     sqlx::migrate!("../../migrations").run(&db).await.unwrap();
 
-    let (signaling_tx, signaling_rx) = tokio::sync::mpsc::unbounded_channel();
+    let (signaling_tx, signaling_rx) =
+        tokio::sync::mpsc::channel(rivetlink_server::websocket::gateway::SIGNALING_QUEUE);
     let state = AppState {
         db,
         config,

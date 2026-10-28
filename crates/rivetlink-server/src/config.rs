@@ -2,6 +2,10 @@
 
 use crate::error::{ServerError, ServerResult};
 
+/// The example secret in `.env.example`. It is public, so anyone could sign
+/// tokens for a relay that uses it.
+const PLACEHOLDER_JWT_SECRET: &str = "change-this-to-a-random-32-character-secret";
+
 /// Server runtime configuration for database, Redis, JWT, networking, and timeouts.
 #[derive(Debug, Clone)]
 pub struct ServerConfig {
@@ -19,6 +23,8 @@ pub struct ServerConfig {
     /// `host:port` of a STUN server (e.g. the coturn service). When set,
     /// clients and hosts try a direct peer-to-peer path before the relay.
     pub stun_server: Option<String>,
+    /// Days audit log rows are kept; 0 keeps them forever.
+    pub audit_retention_days: i64,
 }
 
 impl ServerConfig {
@@ -27,15 +33,7 @@ impl ServerConfig {
         Ok(Self {
             database_url: required("DATABASE_URL")?,
             redis_url: optional("REDIS_URL", "redis://127.0.0.1:6379"),
-            jwt_secret: {
-                let secret = required("JWT_SECRET")?;
-                if secret.len() < 32 {
-                    return Err(ServerError::Config(
-                        "JWT_SECRET must be at least 32 characters".to_string(),
-                    ));
-                }
-                secret
-            },
+            jwt_secret: check_jwt_secret(required("JWT_SECRET")?)?,
             bind_addr: optional("BIND_ADDR", "0.0.0.0:8080"),
             access_token_expiry_secs: parse_or("ACCESS_TOKEN_EXPIRY_SECS", 900),
             refresh_token_expiry_secs: parse_or("REFRESH_TOKEN_EXPIRY_SECS", 604800),
@@ -45,8 +43,25 @@ impl ServerConfig {
             disconnect_timeout_secs: parse_or("DISCONNECT_TIMEOUT_SECS", 30),
             reconnect_grace_secs: parse_or("RECONNECT_GRACE_SECS", 15),
             stun_server: Some(optional("STUN_SERVER", "")).filter(|s| !s.is_empty()),
+            audit_retention_days: parse_or("AUDIT_RETENTION_DAYS", 90),
         })
     }
+}
+
+/// Reject a JWT secret that is short or the public example value.
+fn check_jwt_secret(secret: String) -> ServerResult<String> {
+    if secret.len() < 32 {
+        return Err(ServerError::Config(
+            "JWT_SECRET must be at least 32 characters".to_string(),
+        ));
+    }
+    if secret == PLACEHOLDER_JWT_SECRET {
+        return Err(ServerError::Config(
+            "JWT_SECRET is the published example value; generate one with `rivet-relay init`"
+                .to_string(),
+        ));
+    }
+    Ok(secret)
 }
 
 #[allow(clippy::disallowed_methods)]
@@ -121,6 +136,13 @@ mod tests {
         std::env::remove_var("BIND_ADDR");
         std::env::remove_var("ACCESS_TOKEN_EXPIRY_SECS");
         std::env::remove_var("MAX_FAILED_LOGINS");
+    }
+
+    #[test]
+    fn placeholder_and_short_jwt_secrets_are_rejected() {
+        assert!(check_jwt_secret(PLACEHOLDER_JWT_SECRET.to_string()).is_err());
+        assert!(check_jwt_secret("too-short".to_string()).is_err());
+        assert!(check_jwt_secret("a-real-secret-of-at-least-32-chars".to_string()).is_ok());
     }
 
     #[test]

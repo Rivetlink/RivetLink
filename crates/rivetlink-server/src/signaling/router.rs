@@ -21,7 +21,7 @@ use crate::websocket::connection::{ConnectionMap, PrincipalKind};
 /// Run the signaling router loop, reading from the signaling channel
 /// and forwarding packets to the correct peer.
 pub async fn run_signaling_router(
-    mut rx: mpsc::UnboundedReceiver<SignalingMessage>,
+    mut rx: mpsc::Receiver<SignalingMessage>,
     connections: ConnectionMap,
     sessions: SessionManager,
 ) {
@@ -29,7 +29,7 @@ pub async fn run_signaling_router(
 
     while let Some(message) = rx.recv().await {
         let Ok(packet) = serde_json::from_str::<SignalPacket>(&message.text) else {
-            tracing::warn!(sender = %message.principal_id, "invalid signal packet, ignoring");
+            tracing::debug!(sender = %message.principal_id, "invalid signal packet, ignoring");
             continue;
         };
         route_packet(&connections, &sessions, &message, &packet);
@@ -415,12 +415,12 @@ mod tests {
     async fn invalid_and_heartbeat_packets_are_dropped() {
         let (connections, sessions) = (ConnectionMap::new(), SessionManager::new());
         let mut device = connect(&connections, PrincipalKind::Device, org_id());
-        let (tx, rx) = mpsc::unbounded_channel();
+        let (tx, rx) = mpsc::channel(8);
         let router = tokio::spawn(run_signaling_router(rx, connections.clone(), sessions));
         let mut garbage = device.say(&SignalPacket::Heartbeat);
-        tx.send(garbage.clone()).unwrap();
+        tx.send(garbage.clone()).await.unwrap();
         garbage.text = "not valid json!!!".to_string();
-        tx.send(garbage).unwrap();
+        tx.send(garbage).await.unwrap();
         drop(tx);
         router.await.unwrap();
         assert!(device.next().is_none());

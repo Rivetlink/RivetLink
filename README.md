@@ -66,7 +66,7 @@ cd RivetLink
 cargo run --bin rivet-relay -- init
 
 # bring up postgres + redis + relay
-docker compose -f docker/docker-compose.yml --profile relay up -d --build
+docker compose --env-file .env -f docker/docker-compose.yml --profile relay up -d --build
 # (or run the relay natively: cargo run --bin rivet-relay -- serve)
 ```
 
@@ -127,15 +127,11 @@ client (trust on first use). Approve it once and the host remembers your key.
 
 ## Deploying the relay to a VPS
 
-1. Point DNS at the VPS, terminate TLS at nginx (see `docker/nginx/`), proxy to
-   the relay on `:8080` (WebSocket upgrade enabled).
-2. `rivet-relay init` to generate a strong `JWT_SECRET`, or set it via the
-   compose `environment:`.
-3. `docker compose --profile relay up -d --build`.
-4. Clients/hosts use `wss://relay.example.com/ws` and
-   `https://relay.example.com`. (The agent/client REST currently speaks plain
-   HTTP — put them behind the same nginx, or keep them on the LAN until TLS
-   client support lands.)
+Use the [RivetLink-Docker](https://github.com/Rivetlink/RivetLink-Docker)
+bundle: Caddy with automatic HTTPS, the published relay image, Postgres
+without published ports, generated secrets and an optional STUN server.
+`docker/docker-compose.yml` in this repository is for local development only:
+it uses fixed database credentials and serves plain HTTP.
 
 ## Ubuntu unattended physical console
 

@@ -37,8 +37,13 @@ use crate::websocket::connection::{ConnectedClient, ConnectionMap, PrincipalKind
 use crate::websocket::heartbeat::HeartbeatTracker;
 
 /// Largest WebSocket message accepted. Tunnel frames are at most 64 KiB plus
-/// the session id; legacy screenshot chunks are ~65 KiB of JSON.
-const MAX_WS_MESSAGE: usize = 256 * 1024;
+/// the session id; legacy screenshot chunks are ~49 KiB of JSON. Kept close
+/// to that, because every queued message may be this large.
+const MAX_WS_MESSAGE: usize = 80 * 1024;
+/// Text frames waiting for the signaling router, for all connections
+/// together. A full queue makes readers wait, which stops them reading
+/// their sockets, so a flood slows its sender instead of growing memory.
+pub const SIGNALING_QUEUE: usize = 1024;
 /// How long a tunnel frame may wait for room in the receiver's queue before
 /// the session is ended as stuck (matches the agent's LAN frame timeout).
 const TUNNEL_SEND_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(10);
@@ -162,7 +167,7 @@ async fn handle_socket(socket: WebSocket, state: AppState) {
                                 kind,
                                 text,
                             };
-                            if let Err(e) = state.signaling_tx.send(message) {
+                            if let Err(e) = state.signaling_tx.send(message).await {
                                 tracing::error!(error = %e, "signaling channel closed");
                                 break;
                             }

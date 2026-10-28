@@ -14,6 +14,7 @@ use rivetlink_server::router::create_router;
 use rivetlink_server::sessions::manager::SessionManager;
 use rivetlink_server::state::AppState;
 use rivetlink_server::websocket::connection::ConnectionMap;
+use rivetlink_server::websocket::gateway::SIGNALING_QUEUE;
 
 fn test_config() -> ServerConfig {
     ServerConfig {
@@ -29,6 +30,7 @@ fn test_config() -> ServerConfig {
         disconnect_timeout_secs: 30,
         reconnect_grace_secs: 15,
         stun_server: None,
+        audit_retention_days: 90,
     }
 }
 
@@ -47,7 +49,7 @@ async fn setup() -> Option<AppState> {
 
     let connections = ConnectionMap::new();
     let sessions = SessionManager::new();
-    let (signaling_tx, _signaling_rx) = mpsc::unbounded_channel();
+    let (signaling_tx, _signaling_rx) = mpsc::channel(SIGNALING_QUEUE);
 
     Some(AppState {
         db,
@@ -845,6 +847,167 @@ async fn account_lockout_after_max_failed_attempts() {
     cleanup_test_data(&state, &email).await;
 }
 
+/// POST `body` as JSON through a fresh router (fresh rate limiter).
+async fn post_json(
+    state: &AppState,
+    uri: &str,
+    token: Option<&str>,
+    body: serde_json::Value,
+) -> axum::response::Response {
+    let mut req = axum::http::Request::builder()
+        .method("POST")
+        .uri(uri)
+        .header("content-type", "application/json");
+    if let Some(token) = token {
+        req = req.header("authorization", format!("Bearer {token}"));
+    }
+    tower::ServiceExt::oneshot(
+        create_router(state.clone()),
+        req.body(axum::body::Body::from(body.to_string())).unwrap(),
+    )
+    .await
+    .unwrap()
+}
+
+async fn json_body(response: axum::response::Response) -> serde_json::Value {
+    let body = axum::body::to_bytes(response.into_body(), 1024 * 1024)
+        .await
+        .unwrap();
+    serde_json::from_slice(&body).unwrap()
+}
+
+#[tokio::test]
+async fn concurrent_wrong_passwords_cannot_exceed_the_lockout() {
+    let Some(state) = setup().await else {
+        eprintln!("skipping: database not available");
+        return;
+    };
+    let email = unique_email("lockrace");
+    let reg = json!({
+        "email": email,
+        "password": "correct-password",
+        "display_name": "Lock Race",
+        "organization_name": "Lock Race Org"
+    });
+    assert_eq!(
+        post_json(&state, "/auth/register", None, reg)
+            .await
+            .status(),
+        StatusCode::OK
+    );
+
+    let attempts = (0..20).map(|i| {
+        let body = json!({"email": email, "password": format!("wrong-password-{i}")});
+        let state = state.clone();
+        async move { post_json(&state, "/auth/login", None, body).await.status() }
+    });
+    let statuses = futures_util::future::join_all(attempts).await;
+    let checked = statuses
+        .iter()
+        .filter(|s| **s == StatusCode::UNAUTHORIZED)
+        .count();
+    assert!(
+        checked <= usize::try_from(state.config.max_failed_logins).unwrap(),
+        "{checked} passwords were checked, more than the lockout allows"
+    );
+
+    let correct = json!({"email": email, "password": "correct-password"});
+    let response = post_json(&state, "/auth/login", None, correct).await;
+    assert_eq!(response.status(), StatusCode::TOO_MANY_REQUESTS);
+
+    cleanup_test_data(&state, &email).await;
+}
+
+#[tokio::test]
+async fn device_registration_stops_at_the_org_quota() {
+    use rivetlink_server::db::devices::MAX_DEVICES_PER_ORG;
+    let Some(state) = setup().await else {
+        eprintln!("skipping: database not available");
+        return;
+    };
+    let email = unique_email("quota");
+    let reg = json!({
+        "email": email,
+        "password": "test-password-123",
+        "display_name": "Quota Test",
+        "organization_name": "Quota Org"
+    });
+    let auth = json_body(post_json(&state, "/auth/register", None, reg).await).await;
+    let token = auth["access_token"].as_str().unwrap();
+    let org: uuid::Uuid = auth["organization_id"].as_str().unwrap().parse().unwrap();
+
+    // Fill the org up to one below the quota directly.
+    sqlx::query(
+        "INSERT INTO devices (id, organization_id, public_key) \
+         SELECT gen_random_uuid(), $1, 'key-' || g FROM generate_series(1, $2) g",
+    )
+    .bind(org)
+    .bind(MAX_DEVICES_PER_ORG - 1)
+    .execute(&state.db)
+    .await
+    .unwrap();
+
+    let device = json!({"public_key": "last-key", "hostname": "last", "platform": "linux"});
+    let ok = post_json(&state, "/devices/register", Some(token), device.clone()).await;
+    assert_eq!(ok.status(), StatusCode::OK);
+    let full = post_json(&state, "/devices/register", Some(token), device).await;
+    assert_eq!(full.status(), StatusCode::CONFLICT);
+
+    let too_long = json!({"public_key": "k", "platform": "x".repeat(256)});
+    let rejected = post_json(&state, "/devices/register", Some(token), too_long).await;
+    assert_eq!(rejected.status(), StatusCode::BAD_REQUEST);
+
+    cleanup_test_data(&state, &email).await;
+}
+
+#[tokio::test]
+async fn oversized_request_bodies_are_rejected() {
+    let Some(state) = setup().await else {
+        eprintln!("skipping: database not available");
+        return;
+    };
+    let body = json!({"email": "x@test.rivetlink.dev", "password": "p".repeat(100 * 1024)});
+    let response = post_json(&state, "/auth/login", None, body).await;
+    assert_eq!(response.status(), StatusCode::PAYLOAD_TOO_LARGE);
+}
+
+#[tokio::test]
+async fn expired_refresh_tokens_are_pruned() {
+    use rivetlink_server::db::refresh_tokens;
+    let Some(state) = setup().await else {
+        eprintln!("skipping: database not available");
+        return;
+    };
+    let email = unique_email("prune");
+    let reg = json!({
+        "email": email,
+        "password": "test-password-123",
+        "display_name": "Prune Test",
+        "organization_name": "Prune Org"
+    });
+    let auth = json_body(post_json(&state, "/auth/register", None, reg).await).await;
+    let user: uuid::Uuid = auth["user_id"].as_str().unwrap().parse().unwrap();
+    let old = uuid::Uuid::now_v7();
+    refresh_tokens::insert(&state.db, old, user, uuid::Uuid::now_v7(), -2 * 86_400)
+        .await
+        .unwrap();
+
+    refresh_tokens::delete_expired(&state.db).await.unwrap();
+    assert!(refresh_tokens::get_by_jti(&state.db, old)
+        .await
+        .unwrap()
+        .is_none());
+    let live =
+        sqlx::query_scalar::<_, i64>("SELECT count(*) FROM refresh_tokens WHERE user_id = $1")
+            .bind(user)
+            .fetch_one(&state.db)
+            .await
+            .unwrap();
+    assert_eq!(live, 1, "the token issued at registration stays");
+
+    cleanup_test_data(&state, &email).await;
+}
+
 // ─── Login Errors ───────────────────────────────────────
 
 #[tokio::test]
@@ -1629,7 +1792,7 @@ mod device_auth {
             return;
         };
         // setup() leaves the router off; this test needs it.
-        let (signaling_tx, signaling_rx) = mpsc::unbounded_channel();
+        let (signaling_tx, signaling_rx) = mpsc::channel(SIGNALING_QUEUE);
         let state = AppState {
             signaling_tx,
             ..state

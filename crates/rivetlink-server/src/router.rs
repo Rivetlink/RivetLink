@@ -3,6 +3,7 @@
 use std::time::Duration;
 
 use axum::{
+    extract::DefaultBodyLimit,
     middleware,
     routing::{get, post},
     Router,
@@ -21,6 +22,10 @@ use crate::websocket::gateway;
 /// while throttling credential-stuffing and registration spam.
 const AUTH_RATE_LIMIT_MAX: u32 = 10;
 const AUTH_RATE_LIMIT_WINDOW: Duration = Duration::from_secs(60);
+
+/// Largest accepted request body. The biggest real body is a device
+/// registration (a public key of at most 4 KiB plus short metadata).
+const MAX_REQUEST_BODY: usize = 64 * 1024;
 
 /// Create the main Axum router with health, auth, device, session, audit, and WebSocket routes.
 pub fn create_router(state: AppState) -> Router {
@@ -59,6 +64,7 @@ pub fn create_router(state: AppState) -> Router {
         .route("/sessions", get(handlers::sessions::list_sessions))
         .route("/audit-logs", get(handlers::audit::list_audit_logs))
         .route("/ws", get(gateway::ws_upgrade))
+        .layer(DefaultBodyLimit::max(MAX_REQUEST_BODY))
         .layer(RequestIdLayer)
         .layer(cors)
         .layer(TraceLayer::new_for_http())
