@@ -96,7 +96,13 @@ pub async fn login(
         return Err(ServerError::AccountLocked(locked_until));
     };
 
-    let valid = password::verify_password(&req.password, &user.password_hash)?;
+    // argon2 is slow on purpose; keep it off the async workers so a burst of
+    // logins cannot stall WebSocket traffic.
+    let hash = user.password_hash.clone();
+    let valid =
+        tokio::task::spawn_blocking(move || password::verify_password(&req.password, &hash))
+            .await
+            .map_err(|e| ServerError::Internal(format!("password check failed: {e}")))??;
     if !valid {
         if count >= state.config.max_failed_logins {
             audit::create_audit_log(

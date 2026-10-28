@@ -2,9 +2,12 @@
 
 use crate::error::{ServerError, ServerResult};
 
-/// The example secret in `.env.example`. It is public, so anyone could sign
-/// tokens for a relay that uses it.
-const PLACEHOLDER_JWT_SECRET: &str = "change-this-to-a-random-32-character-secret";
+/// Example secrets published in this repository (`.env.example`,
+/// `scripts/e2e-demo.sh`). Anyone could sign tokens for a relay using one.
+const PUBLISHED_JWT_SECRETS: [&str; 2] = [
+    "change-this-to-a-random-32-character-secret",
+    "e2e-demo-secret-key-at-least-32-chars-long",
+];
 
 /// Server runtime configuration for database, Redis, JWT, networking, and timeouts.
 #[derive(Debug, Clone)]
@@ -55,7 +58,7 @@ fn check_jwt_secret(secret: String) -> ServerResult<String> {
             "JWT_SECRET must be at least 32 characters".to_string(),
         ));
     }
-    if secret == PLACEHOLDER_JWT_SECRET {
+    if PUBLISHED_JWT_SECRETS.contains(&secret.trim()) {
         return Err(ServerError::Config(
             "JWT_SECRET is the published example value; generate one with `rivet-relay init`"
                 .to_string(),
@@ -140,7 +143,10 @@ mod tests {
 
     #[test]
     fn placeholder_and_short_jwt_secrets_are_rejected() {
-        assert!(check_jwt_secret(PLACEHOLDER_JWT_SECRET.to_string()).is_err());
+        for published in PUBLISHED_JWT_SECRETS {
+            assert!(check_jwt_secret(published.to_string()).is_err());
+            assert!(check_jwt_secret(format!(" {published}\n")).is_err());
+        }
         assert!(check_jwt_secret("too-short".to_string()).is_err());
         assert!(check_jwt_secret("a-real-secret-of-at-least-32-chars".to_string()).is_ok());
     }

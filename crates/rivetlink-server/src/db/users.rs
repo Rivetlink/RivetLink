@@ -60,8 +60,9 @@ pub async fn get_user_by_id(pool: &PgPool, id: Uuid) -> ServerResult<User> {
 /// Returns the attempt's number, or `None` when the account is locked. The
 /// attempt that reaches `max_attempts` locks the account at once, so
 /// concurrent requests cannot all slip past the check: at most
-/// `max_attempts` passwords are tried per lockout period. A successful login
-/// clears the count and the lock with [`reset_failed_logins`].
+/// `max_attempts` passwords are tried before the first lock, and one per
+/// lockout period after it (the count stays above the limit). A successful
+/// login clears the count and the lock with [`reset_failed_logins`].
 pub async fn reserve_login_attempt(
     pool: &PgPool,
     user_id: Uuid,
