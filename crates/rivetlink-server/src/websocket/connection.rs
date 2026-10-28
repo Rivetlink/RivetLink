@@ -11,9 +11,15 @@ use std::sync::Arc;
 use tokio::sync::mpsc;
 use uuid::Uuid;
 
-/// Outgoing messages queued per connection. Bounded so one slow reader holds
-/// up only the senders writing to it, never the server's memory.
-pub const OUTGOING_QUEUE: usize = 512;
+/// Outgoing messages queued per connection. With messages capped at
+/// `MAX_WS_MESSAGE` (gateway) one queue holds at most 10 MiB, and one slow
+/// reader holds up only the senders writing to it. 128 slots still buffer a
+/// ~6 MB legacy screenshot (49 KiB chunks, dropped when the queue is full)
+/// and 8 MiB of tunnel video.
+/// ponytail: the bound is per connection, not per account; add a
+/// per-principal connection cap if an account opening many slow sockets
+/// ever becomes a problem.
+pub const OUTGOING_QUEUE: usize = 128;
 
 /// Channel feeding a connection's WebSocket writer.
 pub type WsSender = mpsc::Sender<Message>;

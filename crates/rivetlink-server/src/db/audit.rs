@@ -32,6 +32,16 @@ pub async fn create_audit_log(
     Ok(log)
 }
 
+/// Delete audit logs older than `days` days. Returns the number deleted.
+pub async fn delete_older_than(pool: &PgPool, days: i64) -> ServerResult<u64> {
+    let result =
+        sqlx::query("DELETE FROM audit_logs WHERE created_at < now() - make_interval(days => $1)")
+            .bind(i32::try_from(days).unwrap_or(i32::MAX))
+            .execute(pool)
+            .await?;
+    Ok(result.rows_affected())
+}
+
 /// List recent audit logs for an organization with limit.
 pub async fn list_audit_logs(
     pool: &PgPool,

@@ -104,6 +104,17 @@ pub async fn revoke_all_for_user(pool: &PgPool, user_id: Uuid) -> ServerResult<u
     Ok(result.rows_affected())
 }
 
+/// Delete tokens that expired more than a day ago. Their JWTs no longer
+/// decode, so the rows can no longer take part in rotation or theft
+/// detection; the day covers clock leeway. Returns the number deleted.
+pub async fn delete_expired(pool: &PgPool) -> ServerResult<u64> {
+    let result =
+        sqlx::query("DELETE FROM refresh_tokens WHERE expires_at < now() - interval '1 day'")
+            .execute(pool)
+            .await?;
+    Ok(result.rows_affected())
+}
+
 /// Rotation outcome describing why a refresh attempt was rejected, if any.
 #[derive(Debug)]
 pub enum RotationError {

@@ -55,29 +55,34 @@ pub async fn get_user_by_id(pool: &PgPool, id: Uuid) -> ServerResult<User> {
         .ok_or_else(|| ServerError::NotFound("user not found".to_string()))
 }
 
-/// Increment failed login counter; returns new count.
-pub async fn increment_failed_logins(pool: &PgPool, user_id: Uuid) -> ServerResult<i32> {
-    let row = sqlx::query_scalar::<_, i32>(
-        "UPDATE users SET failed_login_count = failed_login_count + 1 \
-         WHERE id = $1 RETURNING failed_login_count",
+/// Count a login attempt before its password is checked, in one statement.
+///
+/// Returns the attempt's number, or `None` when the account is locked. The
+/// attempt that reaches `max_attempts` locks the account at once, so
+/// concurrent requests cannot all slip past the check: at most
+/// `max_attempts` passwords are tried before the first lock, and one per
+/// lockout period after it (the count stays above the limit). A successful
+/// login clears the count and the lock with [`reset_failed_logins`].
+pub async fn reserve_login_attempt(
+    pool: &PgPool,
+    user_id: Uuid,
+    max_attempts: i32,
+    lockout_secs: i64,
+) -> ServerResult<Option<i32>> {
+    let locked_until = Utc::now() + Duration::seconds(lockout_secs);
+    let count = sqlx::query_scalar::<_, i32>(
+        "UPDATE users SET failed_login_count = failed_login_count + 1, \
+             locked_until = CASE WHEN failed_login_count + 1 >= $2 THEN $3 ELSE locked_until END \
+         WHERE id = $1 AND (locked_until IS NULL OR locked_until <= now()) \
+         RETURNING failed_login_count",
     )
     .bind(user_id)
-    .fetch_one(pool)
+    .bind(max_attempts)
+    .bind(locked_until)
+    .fetch_optional(pool)
     .await?;
 
-    Ok(row)
-}
-
-/// Lock user account for specified duration (set locked_until timestamp).
-pub async fn lock_user(pool: &PgPool, user_id: Uuid, lockout_secs: i64) -> ServerResult<()> {
-    let locked_until = Utc::now() + Duration::seconds(lockout_secs);
-    sqlx::query("UPDATE users SET locked_until = $1 WHERE id = $2")
-        .bind(locked_until)
-        .bind(user_id)
-        .execute(pool)
-        .await?;
-
-    Ok(())
+    Ok(count)
 }
 
 /// Clear failed login counter and lock status after successful authentication.
@@ -88,11 +93,4 @@ pub async fn reset_failed_logins(pool: &PgPool, user_id: Uuid) -> ServerResult<(
         .await?;
 
     Ok(())
-}
-
-/// Check if user account is currently locked.
-pub async fn is_locked(user: &User) -> bool {
-    user.locked_until
-        .map(|until| Utc::now() < until)
-        .unwrap_or(false)
 }

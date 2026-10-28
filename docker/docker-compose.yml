@@ -9,8 +9,9 @@ services:
       POSTGRES_USER: rivet
       POSTGRES_PASSWORD: rivet_dev
       POSTGRES_DB: rivet
+    # Loopback only: these are fixed development credentials.
     ports:
-      - "5432:5432"
+      - "127.0.0.1:5432:5432"
     volumes:
       - postgres_data:/var/lib/postgresql/data
 
@@ -19,7 +20,7 @@ services:
     container_name: rivet-redis
     restart: "no"
     ports:
-      - "6379:6379"
+      - "127.0.0.1:6379:6379"
 
   # The relay/signaling server. Build with the `relay` profile so the default
   # `docker compose up -d postgres redis` (used in dev/tests) stays lightweight:
@@ -37,8 +38,8 @@ services:
     environment:
       DATABASE_URL: postgres://rivet:rivet_dev@postgres/rivet
       REDIS_URL: redis://redis:6379
-      # CHANGE THIS for any non-local deployment. Generate with:
-      #   rivet-relay init   (prints a random 32-byte base64 secret into .env)
+      # Generate with `rivet-relay init`. The relay refuses to start with
+      # this placeholder.
       JWT_SECRET: ${JWT_SECRET:-change-this-to-a-random-32-character-secret}
       BIND_ADDR: 0.0.0.0:8080
       RUST_LOG: info

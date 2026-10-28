@@ -75,19 +75,36 @@ pub async fn login(
 ) -> ServerResult<Json<AuthResponse>> {
     let user = users::get_user_by_email(&state.db, &req.email).await?;
 
-    if users::is_locked(&user).await {
-        let locked_until = user.locked_until.ok_or(ServerError::Internal(
-            "locked user without locked_until".to_string(),
-        ))?;
+    // Counting the attempt before the password check makes the lockout hold
+    // under concurrent requests.
+    let Some(count) = users::reserve_login_attempt(
+        &state.db,
+        user.id,
+        state.config.max_failed_logins,
+        state.config.lockout_duration_secs,
+    )
+    .await?
+    else {
+        // The lock may have been set after `user` was read; then the full
+        // lockout period is the best estimate.
+        let locked_until = user
+            .locked_until
+            .filter(|until| *until > chrono::Utc::now())
+            .unwrap_or_else(|| {
+                chrono::Utc::now() + chrono::Duration::seconds(state.config.lockout_duration_secs)
+            });
         return Err(ServerError::AccountLocked(locked_until));
-    }
+    };
 
-    let valid = password::verify_password(&req.password, &user.password_hash)?;
+    // argon2 is slow on purpose; keep it off the async workers so a burst of
+    // logins cannot stall WebSocket traffic.
+    let hash = user.password_hash.clone();
+    let valid =
+        tokio::task::spawn_blocking(move || password::verify_password(&req.password, &hash))
+            .await
+            .map_err(|e| ServerError::Internal(format!("password check failed: {e}")))??;
     if !valid {
-        let count = users::increment_failed_logins(&state.db, user.id).await?;
         if count >= state.config.max_failed_logins {
-            users::lock_user(&state.db, user.id, state.config.lockout_duration_secs).await?;
-
             audit::create_audit_log(
                 &state.db,
                 user.organization_id,
@@ -154,17 +171,21 @@ pub async fn refresh(
     let row = match refresh_tokens::validate_for_rotation(&state.db, claims.jti).await {
         Ok(row) => row,
         Err(refresh_tokens::RotationError::Reused { family_id }) => {
-            // Theft detected: revoke the entire family and audit.
+            // Theft detected: revoke the entire family and audit. Replays of
+            // an already revoked family are not audited again, so a stolen
+            // token cannot be used to fill the audit log.
             let count = refresh_tokens::revoke_family(&state.db, family_id).await?;
-            audit::create_audit_log(
-                &state.db,
-                claims.org,
-                Some(claims.sub),
-                None,
-                "auth.refresh_token_theft_detected",
-                Some(serde_json::json!({"family_id": family_id, "revoked_count": count})),
-            )
-            .await?;
+            if count > 0 {
+                audit::create_audit_log(
+                    &state.db,
+                    claims.org,
+                    Some(claims.sub),
+                    None,
+                    "auth.refresh_token_theft_detected",
+                    Some(serde_json::json!({"family_id": family_id, "revoked_count": count})),
+                )
+                .await?;
+            }
             return Err(ServerError::InvalidToken(
                 "refresh token reused — family revoked".to_string(),
             ));

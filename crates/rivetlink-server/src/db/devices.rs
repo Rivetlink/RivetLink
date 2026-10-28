@@ -7,7 +7,12 @@ use uuid::Uuid;
 use super::models::Device;
 use crate::error::{ServerError, ServerResult};
 
+/// Most active devices one organization may register. Bounds the rows one
+/// account can add and the size of every device list.
+pub const MAX_DEVICES_PER_ORG: i64 = 500;
+
 /// Register new device with public key and optional platform metadata.
+/// Returns `Conflict` once the organization holds `MAX_DEVICES_PER_ORG`.
 pub async fn register_device(
     pool: &PgPool,
     organization_id: Uuid,
@@ -16,31 +21,39 @@ pub async fn register_device(
     platform: Option<&str>,
 ) -> ServerResult<Device> {
     let id = Uuid::now_v7();
+    // The count and the insert are one statement; concurrent registrations
+    // can overshoot the quota by at most their own number.
     let device = sqlx::query_as::<_, Device>(
         "INSERT INTO devices (id, organization_id, public_key, hostname, platform) \
-         VALUES ($1, $2, $3, $4, $5) RETURNING *",
+         SELECT $1, $2, $3, $4, $5 \
+         WHERE (SELECT count(*) FROM devices \
+                WHERE organization_id = $2 AND deleted_at IS NULL) < $6 \
+         RETURNING *",
     )
     .bind(id)
     .bind(organization_id)
     .bind(public_key)
     .bind(hostname)
     .bind(platform)
-    .fetch_one(pool)
+    .bind(MAX_DEVICES_PER_ORG)
+    .fetch_optional(pool)
     .await?;
 
-    Ok(device)
+    device.ok_or_else(|| ServerError::Conflict("device limit reached".to_string()))
 }
 
-/// List all active devices for an organization, newest first.
+/// List the active devices of an organization, newest first, at most
+/// `MAX_DEVICES_PER_ORG`.
 pub async fn list_devices_by_org(
     pool: &PgPool,
     organization_id: Uuid,
 ) -> ServerResult<Vec<Device>> {
     let devices = sqlx::query_as::<_, Device>(
         "SELECT * FROM devices WHERE organization_id = $1 AND deleted_at IS NULL \
-         ORDER BY created_at DESC",
+         ORDER BY created_at DESC LIMIT $2",
     )
     .bind(organization_id)
+    .bind(MAX_DEVICES_PER_ORG)
     .fetch_all(pool)
     .await?;
 

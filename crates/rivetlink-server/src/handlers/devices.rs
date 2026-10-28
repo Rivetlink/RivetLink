@@ -92,6 +92,11 @@ fn validate_device_request(req: &RegisterDeviceRequest) -> ServerResult<()> {
             return Err(ServerError::Validation("hostname too long".to_string()));
         }
     }
+    if let Some(ref platform) = req.platform {
+        if platform.len() > 255 {
+            return Err(ServerError::Validation("platform too long".to_string()));
+        }
+    }
     Ok(())
 }
 
@@ -110,4 +115,24 @@ pub async fn list_devices(
         })
         .collect();
     Ok(Json(response))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn request(platform: Option<String>) -> RegisterDeviceRequest {
+        RegisterDeviceRequest {
+            public_key: "key".to_string(),
+            hostname: Some("host".to_string()),
+            platform,
+        }
+    }
+
+    #[test]
+    fn platform_length_is_bounded() {
+        assert!(validate_device_request(&request(Some("linux".to_string()))).is_ok());
+        assert!(validate_device_request(&request(None)).is_ok());
+        assert!(validate_device_request(&request(Some("x".repeat(256)))).is_err());
+    }
 }

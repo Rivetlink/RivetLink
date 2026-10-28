@@ -9,6 +9,7 @@ use tracing_subscriber::EnvFilter;
 
 use rivetlink_server::cli::{Cli, Command};
 use rivetlink_server::config::ServerConfig;
+use rivetlink_server::db::{audit, refresh_tokens};
 use rivetlink_server::router::create_router;
 use rivetlink_server::sessions::manager::SessionManager;
 use rivetlink_server::signaling::router::run_signaling_router;
@@ -41,6 +42,23 @@ async fn shutdown_signal() {
         }
         () = sigterm => {
             tracing::info!("received SIGTERM, shutting down gracefully");
+        }
+    }
+}
+
+/// Hourly, delete expired refresh tokens and audit rows past retention, so
+/// neither table grows without bound.
+async fn prune_old_rows(db: sqlx::PgPool, audit_retention_days: i64) {
+    let mut tick = tokio::time::interval(std::time::Duration::from_secs(3600));
+    loop {
+        tick.tick().await;
+        if let Err(e) = refresh_tokens::delete_expired(&db).await {
+            tracing::warn!(error = %e, "pruning refresh tokens failed");
+        }
+        if audit_retention_days > 0 {
+            if let Err(e) = audit::delete_older_than(&db, audit_retention_days).await {
+                tracing::warn!(error = %e, "pruning audit logs failed");
+            }
         }
     }
 }
@@ -86,7 +104,8 @@ async fn serve() -> std::process::ExitCode {
 
     let connections = ConnectionMap::new();
     let sessions = SessionManager::new();
-    let (signaling_tx, signaling_rx) = tokio::sync::mpsc::unbounded_channel();
+    let (signaling_tx, signaling_rx) =
+        tokio::sync::mpsc::channel(rivetlink_server::websocket::gateway::SIGNALING_QUEUE);
 
     let state = AppState {
         db,
@@ -97,6 +116,10 @@ async fn serve() -> std::process::ExitCode {
     };
 
     tokio::spawn(run_signaling_router(signaling_rx, connections, sessions));
+    tokio::spawn(prune_old_rows(
+        state.db.clone(),
+        config.audit_retention_days,
+    ));
 
     let router = create_router(state);
 
