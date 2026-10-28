@@ -351,4 +351,23 @@ mod tests {
         assert!(require_secure_ws("ws://127.0.0.1:80@evil.com:80/ws").is_err());
         assert!(require_secure_ws("ws://evil.com/127.0.0.1:80").is_err());
     }
+
+    #[tokio::test]
+    async fn wss_urls_get_as_far_as_the_tls_handshake() {
+        use tokio_tungstenite::tungstenite::{error::UrlError, Error};
+        // A peer that hangs up: the client must fail in the TLS handshake,
+        // not before it because TLS support is not compiled in.
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        tokio::spawn(async move {
+            let _ = listener.accept().await;
+        });
+        let err = tokio_tungstenite::connect_async(format!("wss://{addr}/ws"))
+            .await
+            .unwrap_err();
+        assert!(
+            !matches!(err, Error::Url(UrlError::TlsFeatureNotEnabled)),
+            "{err}"
+        );
+    }
 }
