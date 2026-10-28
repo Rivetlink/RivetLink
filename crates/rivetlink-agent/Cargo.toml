@@ -25,7 +25,7 @@ tracing-subscriber = { workspace = true }
 thiserror = { workspace = true }
 uuid = { workspace = true }
 clap = { workspace = true }
-tokio-tungstenite = "0.24"
+tokio-tungstenite = { version = "0.24", features = ["rustls-tls-webpki-roots"] }
 futures-util = "0.3"
 async-trait = { workspace = true }
 ed25519-dalek = { workspace = true }
