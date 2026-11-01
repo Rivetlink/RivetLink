@@ -36,7 +36,9 @@ const MIN_BPS: u32 = 1_000_000;
 /// client can tell a static screen from a stalled link (like tile heartbeats).
 const HEARTBEAT: Duration = Duration::from_millis(1000);
 /// Wait this long without congestion before raising the bitrate again. Each
-/// change rebuilds the encoder (one keyframe), so it must stay rare.
+/// change rebuilds the encoder (one keyframe), so it must stay rare, and a
+/// raise waits for a new captured frame: a keyframe re-encoding a static
+/// screen shows as a visible flash.
 const RAISE_AFTER: Duration = Duration::from_secs(10);
 /// Ignore further congestion this soon after lowering the bitrate: frames that
 /// were already in flight would otherwise push it straight to the minimum.
@@ -104,6 +106,11 @@ impl H264Encoder {
     /// Encode one I420 frame (`i420_len(w, h)` bytes) and queue it. Returns
     /// `false` when the consumer is gone (caller should stop capturing).
     pub(crate) fn push(&mut self, data: Vec<u8>, tx: &Sender<StreamFrame>) -> bool {
+        self.send(data, tx, true)
+    }
+
+    /// `fresh` is false for heartbeat re-sends, which never raise the bitrate.
+    fn send(&mut self, data: Vec<u8>, tx: &Sender<StreamFrame>, fresh: bool) -> bool {
         if data.len() != i420_len(self.w, self.h) {
             return true; // skip a malformed frame, keep going
         }
@@ -119,7 +126,7 @@ impl H264Encoder {
             self.control.congested.store(true, Ordering::Release);
             return true;
         }
-        self.adapt();
+        self.adapt(fresh);
         let frame = match self.encode(&data) {
             Ok(Some(frame)) => frame,
             Ok(None) => {
@@ -164,19 +171,22 @@ impl H264Encoder {
             return true;
         }
         match self.last.take() {
-            Some(last) => self.push(last, tx),
+            Some(last) => self.send(last, tx, false),
             None => !tx.is_closed(),
         }
     }
 
     /// Apply keyframe requests and bitrate changes before encoding a frame.
-    fn adapt(&mut self) {
+    /// Lowering may happen on any frame (congestion asks for a keyframe
+    /// anyway); raising only on a fresh one.
+    fn adapt(&mut self, fresh: bool) {
         if self.control.congested.swap(false, Ordering::AcqRel) {
             self.last_congestion = Instant::now();
             if self.last_rate_change.elapsed() >= LOWER_HOLDOFF {
                 self.set_bitrate((self.bitrate / 3 * 2).max(MIN_BPS));
             }
-        } else if self.last_congestion.elapsed() >= RAISE_AFTER
+        } else if fresh
+            && self.last_congestion.elapsed() >= RAISE_AFTER
             && self.last_rate_change.elapsed() >= RAISE_AFTER
         {
             self.set_bitrate((self.bitrate / 4 * 5).min(MAX_BPS));
@@ -326,6 +336,34 @@ mod tests {
         assert!(enc.heartbeat(&tx));
         assert!(rx.try_recv().is_ok());
         assert!(enc.bitrate < MAX_BPS);
+    }
+
+    #[test]
+    fn only_a_fresh_frame_raises_the_bitrate() {
+        let control = Arc::new(VideoControl::default());
+        let mut enc = H264Encoder::new(W, H, 30, Arc::clone(&control)).unwrap();
+        let (tx, mut rx) = tokio::sync::mpsc::channel(4);
+        assert!(enc.push(frame(0), &tx));
+        rx.try_recv().unwrap();
+        enc.set_bitrate(MIN_BPS);
+        assert!(enc.push(frame(10), &tx));
+        rx.try_recv().unwrap();
+        enc.last_rate_change -= RAISE_AFTER;
+        enc.last_congestion -= RAISE_AFTER;
+
+        // A static screen: heartbeats re-send cheap deltas at the same rate,
+        // never a keyframe from an encoder rebuild.
+        for _ in 0..3 {
+            enc.last_sent -= HEARTBEAT;
+            assert!(enc.heartbeat(&tx));
+            assert!(matches!(rx.try_recv().unwrap(), StreamFrame::Video(v) if !v.keyframe));
+            assert_eq!(enc.bitrate, MIN_BPS);
+        }
+
+        // The screen changes: now the bitrate steps up.
+        assert!(enc.push(frame(20), &tx));
+        rx.try_recv().unwrap();
+        assert!(enc.bitrate > MIN_BPS);
     }
 
     #[test]
