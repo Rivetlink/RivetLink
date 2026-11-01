@@ -65,7 +65,7 @@ cd RivetLink
 # generates .env with a random JWT_SECRET
 cargo run --bin rivet-relay -- init
 
-# bring up postgres + redis + relay
+# bring up postgres + relay
 docker compose --env-file .env -f docker/docker-compose.yml --profile relay up -d --build
 # (or run the relay natively: cargo run --bin rivet-relay -- serve)
 ```

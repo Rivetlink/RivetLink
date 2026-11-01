@@ -40,7 +40,6 @@ target/llvm-cov/
 
 # Docker volumes
 docker/postgres_data/
-docker/redis_data/
 
 # Logs
 *.log

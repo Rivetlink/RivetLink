@@ -6,7 +6,7 @@
 # challenge-response, host consent, signed ephemeral key exchange, and an
 # E2E-encrypted screenshot — without needing a display (RIVET_FAKE_CAPTURE).
 #
-# Requires: postgres + redis reachable (docker compose up -d postgres redis),
+# Requires: postgres reachable (docker compose up -d postgres),
 # and the three binaries built (cargo build).
 #
 # Usage:  ./scripts/e2e-demo.sh
@@ -19,7 +19,6 @@ RELAY_LOG="$WORK/relay.log"
 AGENT_LOG="$WORK/agent.log"
 
 export DATABASE_URL="${DATABASE_URL:-postgres://rivet:rivet_dev@localhost/rivet}"
-export REDIS_URL="${REDIS_URL:-redis://127.0.0.1:6379}"
 export JWT_SECRET="${JWT_SECRET:-e2e-demo-secret-key-at-least-32-chars-long}"
 export BIND_ADDR="${BIND_ADDR:-127.0.0.1:8080}"
 export RUST_LOG="${RUST_LOG:-info}"

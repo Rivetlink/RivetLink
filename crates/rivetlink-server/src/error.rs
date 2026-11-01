@@ -41,9 +41,6 @@ pub enum ServerError {
     #[error("database error: {0}")]
     Database(#[from] sqlx::Error),
 
-    #[error("redis error: {0}")]
-    Redis(#[from] redis::RedisError),
-
     #[error("configuration error: {0}")]
     Config(String),
 
@@ -69,7 +66,7 @@ impl ServerError {
             Self::Validation(_) => StatusCode::BAD_REQUEST,
             Self::Forbidden(_) => StatusCode::FORBIDDEN,
             Self::Conflict(_) => StatusCode::CONFLICT,
-            Self::Database(_) | Self::Redis(_) | Self::Config(_) | Self::Internal(_) => {
+            Self::Database(_) | Self::Config(_) | Self::Internal(_) => {
                 StatusCode::INTERNAL_SERVER_ERROR
             },
         }
@@ -88,9 +85,7 @@ impl ServerError {
             Self::AccountLocked(_) => "account locked".to_string(),
             Self::TokenExpired => "token expired".to_string(),
             Self::RateLimited => "rate limited".to_string(),
-            Self::Database(_) | Self::Redis(_) | Self::Config(_) | Self::Internal(_) => {
-                "internal error".to_string()
-            },
+            Self::Database(_) | Self::Config(_) | Self::Internal(_) => "internal error".to_string(),
         }
     }
 }
@@ -99,7 +94,6 @@ impl IntoResponse for ServerError {
     fn into_response(self) -> Response {
         match &self {
             ServerError::Database(e) => tracing::error!(error = %e, "database error"),
-            ServerError::Redis(e) => tracing::error!(error = %e, "redis error"),
             ServerError::Config(e) | ServerError::Internal(e) => {
                 tracing::error!(error = %e, "server error");
             },
