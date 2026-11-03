@@ -10,7 +10,6 @@ pub mod db;
 pub mod error;
 pub mod handlers;
 pub mod middleware;
-pub mod redis;
 pub mod router;
 pub mod sessions;
 pub mod signaling;

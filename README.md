@@ -23,7 +23,7 @@ decides who connects**, never the server.
 
 | Binary         | Crate                | Role                                                        |
 | -------------- | -------------------- | ----------------------------------------------------------- |
-| `rivet-relay` | `rivetlink-server`  | Signaling/relay server (Axum + Postgres + Redis). Untrusted. |
+| `rivet-relay` | `rivetlink-server`  | Signaling/relay server (Axum + Postgres). Untrusted.         |
 | `rivet-agent` | `rivetlink-agent`   | Runs on the **host** (the machine being viewed).            |
 | `rivet-client`| `rivetlink-client`  | The **support client** (the machine doing the viewing).     |
 
@@ -65,7 +65,7 @@ cd RivetLink
 # generates .env with a random JWT_SECRET
 cargo run --bin rivet-relay -- init
 
-# bring up postgres + redis + relay
+# bring up postgres + relay
 docker compose --env-file .env -f docker/docker-compose.yml --profile relay up -d --build
 # (or run the relay natively: cargo run --bin rivet-relay -- serve)
 ```
@@ -190,7 +190,7 @@ performs the same fixed rollback; it does not remove LightDM packages.
 ## Development
 
 ```bash
-cargo test --workspace -- --test-threads=1   # all tests (needs docker pg+redis for integration)
+cargo test --workspace -- --test-threads=1   # all tests (needs docker postgres for integration)
 cargo clippy --workspace --all-targets        # lints (must be clean)
 ./scripts/e2e-demo.sh                          # full pipeline on one machine (headless)
 ```

@@ -28,7 +28,6 @@ async fn start_relay(stun_server: Option<String>) -> Option<SocketAddr> {
     let config = ServerConfig {
         // Same database as the server integration tests (CI service).
         database_url: "postgres://rivet:rivet_dev@localhost/rivet".to_string(),
-        redis_url: "redis://127.0.0.1:6379".to_string(),
         jwt_secret: "relay-tunnel-test-secret-key-32chars!".to_string(),
         bind_addr: "127.0.0.1:0".to_string(),
         access_token_expiry_secs: 900,

@@ -9,11 +9,10 @@ const PUBLISHED_JWT_SECRETS: [&str; 2] = [
     "e2e-demo-secret-key-at-least-32-chars-long",
 ];
 
-/// Server runtime configuration for database, Redis, JWT, networking, and timeouts.
+/// Server runtime configuration for database, JWT, networking, and timeouts.
 #[derive(Debug, Clone)]
 pub struct ServerConfig {
     pub database_url: String,
-    pub redis_url: String,
     pub jwt_secret: String,
     pub bind_addr: String,
     pub access_token_expiry_secs: i64,
@@ -35,7 +34,6 @@ impl ServerConfig {
     pub fn from_env() -> ServerResult<Self> {
         Ok(Self {
             database_url: required("DATABASE_URL")?,
-            redis_url: optional("REDIS_URL", "redis://127.0.0.1:6379"),
             jwt_secret: check_jwt_secret(required("JWT_SECRET")?)?,
             bind_addr: optional("BIND_ADDR", "0.0.0.0:8080"),
             access_token_expiry_secs: parse_or("ACCESS_TOKEN_EXPIRY_SECS", 900),
