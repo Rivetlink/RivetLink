@@ -144,11 +144,7 @@ async fn run(
                     continue;
                 }
                 offered = None;
-                let mime_types: Vec<String> = options
-                    .get("mime-types")
-                    .and_then(|value| value.try_clone().ok())
-                    .and_then(|value| Vec::<String>::try_from(value).ok())
-                    .unwrap_or_default();
+                let mime_types = options.get("mime-types").map(mime_type_list).unwrap_or_default();
                 let Some(mime) = READ_MIME_TYPES
                     .iter()
                     .find(|wanted| mime_types.iter().any(|offered| offered == *wanted))
@@ -222,6 +218,35 @@ async fn read_selection(session: &Proxy<'_>, mime: &str) -> Option<String> {
         .filter(|text| !text.is_empty())
 }
 
+/// The `mime-types` option of `SelectionOwnerChanged`. Mutter wraps the list
+/// in a one-field tuple, `(as)`; a bare `as` is accepted too.
+fn mime_type_list(value: &OwnedValue) -> Vec<String> {
+    let list = match &**value {
+        Value::Structure(tuple) => tuple.fields().first(),
+        other => Some(other),
+    };
+    list.and_then(|list| list.try_clone().ok())
+        .and_then(|list| Vec::<String>::try_from(list).ok())
+        .unwrap_or_default()
+}
+
 fn dbus_err(error: impl std::fmt::Display) -> AgentError {
     AgentError::Input(format!("Mutter clipboard D-Bus error: {error}"))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn owned(value: Value<'_>) -> OwnedValue {
+        OwnedValue::try_from(value).unwrap()
+    }
+
+    #[test]
+    fn mime_types_are_read_from_mutters_tuple() {
+        let list = vec!["text/plain".to_string(), "UTF8_STRING".to_string()];
+        assert_eq!(mime_type_list(&owned(Value::from((list.clone(),)))), list);
+        assert_eq!(mime_type_list(&owned(Value::from(list.clone()))), list);
+        assert!(mime_type_list(&owned(Value::from(true))).is_empty());
+    }
 }
